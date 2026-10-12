@@ -1,0 +1,4 @@
+python-telegram-bot[job-queue]>=21.0,<23
+requests>=2.32
+flask>=3.0
+waitress>=3.0
