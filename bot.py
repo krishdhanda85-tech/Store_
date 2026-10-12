@@ -314,7 +314,7 @@ async def paymentcenter(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Revenue: {stats['revenue']:.2f} USDT"
     )
 
-async def main():
+def main():
     if not BOT_TOKEN or not OWNER_ID:
         raise RuntimeError("Set BOT_TOKEN and OWNER_ID environment variables.")
     db.init()
@@ -334,7 +334,7 @@ async def main():
     app.add_handler(CallbackQueryHandler(check_cb, pattern=r"^check:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, quantity_msg))
     app.job_queue.run_repeating(expiry_job, interval=20, first=10)
-    await app.run_polling()
+    app.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
