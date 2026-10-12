@@ -134,7 +134,7 @@ class Database:
     def create_order(self,uid,pid,qty,unit,amount,expires):
         import secrets
         oid="ORD-"+secrets.token_hex(5).upper()
-        c=self.conn(); c.execute("INSERT INTO orders(id,user_id,product_id,quantity,unit_price,amount,status,binance_order_id,checkout_url,expires_at,created_at,paid_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?))",
+        c=self.conn(); c.execute("INSERT INTO orders(id,user_id,product_id,quantity,unit_price,amount,status,binance_order_id,checkout_url,expires_at,created_at,paid_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
             (oid,uid,pid,qty,unit,amount,"pending",None,None,expires.isoformat(),datetime.now(timezone.utc).isoformat(),None))
         c.commit(); c.close(); return oid
 
