@@ -9,7 +9,7 @@ Common:         AMOUNT_DECIMALS=3, DB_PATH=shop.db
 
 A method is offered only if its variables are set. Never put a wallet seed phrase anywhere.
 """
-import hashlib, hmac, logging, os, random, sqlite3, time
+import hashlib, hmac, logging, os, sqlite3, time
 from decimal import Decimal, InvalidOperation
 from urllib.parse import urlencode
 import requests
@@ -36,8 +36,8 @@ BPAY_WINDOW_MS = 60 * 60 * 1000  # look back 1 hour
 
 # ---- common ----
 DB_PATH = os.getenv("DB_PATH", "shop.db")
-DECIMALS = int(os.getenv("AMOUNT_DECIMALS", "3"))
-MAX_SLOTS = 49 if DECIMALS >= 3 else 20
+DECIMALS = int(os.getenv("AMOUNT_DECIMALS", "2"))
+MAX_SLOTS = 49 if DECIMALS >= 2 else 20
 
 BSC_ENABLED = bool(RPC_URL and DEPOSIT_ADDRESS and USDT_CONTRACT_ADDRESS)
 BINANCE_ENABLED = bool(BINANCE_API_KEY and BINANCE_SECRET and PAY_ID)
