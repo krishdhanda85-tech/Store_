@@ -1,3 +1,5 @@
+import os
+print("FILES:", os.getcwd(), sorted(os.listdir(".")), flush=True)
 import asyncio
 import inspect
 import logging
