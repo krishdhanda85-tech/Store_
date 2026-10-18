@@ -3,10 +3,11 @@ import os
 import hmac
 import hashlib
 import time
+from datetime import datetime, timedelta, timezone
 
 import requests
 
-from flask import Flask, request, session, redirect, url_for, render_template, flash
+from flask import Flask, request, session, redirect, url_for, render_template, render_template_string, flash
 from jinja2 import DictLoader
 
 from db import Database
@@ -42,78 +43,227 @@ TEMPLATES = {
     "base.html": """<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1a24">
 <title>{{ shop }} Admin</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
+:root{--bg:#f2f4f7;--surface:#fff;--ink:#121b26;--muted:#667085;--line:#e3e7ee;--line2:#cfd6e0;--field:#fff;--accent:#0b7a75;--accent2:#096560;--accent-soft:#e3f3f1;--link:#0b6b67;--paid:#12805c;--pend:#a86a0a;--fail:#c0352b;--errbg:#fdeceb;--grey:#e7ebf1;--greyink:#223042;--side:#0f1a24;--sidetxt:#a9b6c6;--sideon:#ffffff14;--bar:#bfe3df;--shadow:0 1px 2px #10203010,0 4px 14px #10203008}
+@media(prefers-color-scheme:dark){:root{--bg:#0b121a;--surface:#131d28;--ink:#e8eef5;--muted:#8b99ab;--line:#213040;--line2:#2c3e52;--field:#0d1620;--accent:#12968c;--accent2:#0f8077;--accent-soft:#12312f;--link:#5fd6cb;--paid:#3ccf91;--pend:#f0b84a;--fail:#ff7b72;--errbg:#3a1d1f;--grey:#223245;--greyink:#dbe5f0;--side:#0a1119;--bar:#1d4a46;--shadow:none}}
 *{box-sizing:border-box}
-body{margin:0;font-family:Inter,ui-sans-serif,system-ui,-apple-system,Arial,sans-serif;background:radial-gradient(ellipse at top,#18243a 0%,#0b1020 52%,#090d16 100%);color:#edf2ff;line-height:1.5}
-a{color:#8bb8ff;text-decoration:none}a:hover{color:#c2d8ff}
-nav{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:14px 18px;background:rgba(15,23,42,.94);border-bottom:1px solid #263550;position:sticky;top:0;z-index:5;backdrop-filter:blur(14px);box-shadow:0 8px 30px #0003}
-nav b{margin-right:auto;font-size:18px;letter-spacing:.3px;color:#fff}
-nav a{padding:8px 10px;border-radius:9px;font-size:13px;font-weight:650}nav a:hover{background:#1e3150}
-main{max-width:1180px;margin:0 auto;padding:24px 18px}
-.card{background:linear-gradient(145deg,#172238,#111a2b);border:1px solid #293a58;border-radius:18px;padding:20px;margin-bottom:18px;box-shadow:0 12px 32px #0002}
-.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}
-.stat{background:linear-gradient(145deg,#1c2b43,#142034);border:1px solid #2a3e5e;border-radius:16px;padding:18px;box-shadow:0 8px 24px #0002}
-.stat small{color:#9aa3b5;display:block}
-.stat span{font-size:25px;font-weight:800;letter-spacing:-.5px}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;font-family:Manrope,ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:var(--bg);color:var(--ink);line-height:1.55;font-size:15px}
+a{color:var(--link);text-decoration:none}a:hover{text-decoration:underline}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+h2{font-size:26px;letter-spacing:-.02em;font-weight:800;margin:0 0 18px;line-height:1.2}
+h3{font-size:16px;font-weight:700;margin:0 0 8px;letter-spacing:-.01em}
+p{margin:0 0 10px}
+code{background:var(--accent-soft);padding:2px 6px;border-radius:6px;font-size:13px;overflow-wrap:anywhere}
+
+/* layout */
+body.app{display:grid;grid-template-columns:248px minmax(0,1fr);min-height:100vh}
+body.bare{display:grid;place-items:center;min-height:100vh;padding:20px}
+main{width:100%;max-width:1120px;margin:0 auto;padding:30px 28px 70px}
+body.bare main{max-width:420px;padding:0}
+.side{position:sticky;top:0;height:100vh;overflow-y:auto;background:var(--side);padding:18px 12px 16px;display:flex;flex-direction:column}
+.brand{display:flex;align-items:center;gap:10px;padding:4px 8px 14px;color:#fff;font-weight:800;font-size:16px;letter-spacing:-.01em}
+.mark{width:32px;height:32px;border-radius:9px;background:var(--accent);color:#fff;display:grid;place-items:center;font-weight:800;flex:none}
+.grp{margin:16px 10px 6px;font-size:12px;font-weight:600;color:#6f8096}
+.side a.nl{display:flex;align-items:center;gap:11px;padding:9px 10px;border-radius:9px;color:var(--sidetxt);font-weight:600;font-size:14px;text-decoration:none}
+.side a.nl:hover{background:var(--sideon);color:#fff}
+.side a.nl.on{background:var(--sideon);color:#fff;box-shadow:inset 3px 0 0 #3fd0c4}
+.side svg,.topbar svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;flex:none}
+.side .badge{margin-left:auto}
+.side .out{margin-top:auto;padding-top:14px}
+.topbar{display:none}
+.scrim{display:none}
+
+/* surfaces */
+.card{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:20px;margin-bottom:16px;box-shadow:var(--shadow)}
+.stats,.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-bottom:18px}
+@media(min-width:760px){.stats,.grid{grid-template-columns:repeat(5,1fr)}}
+.stat{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:16px 18px;box-shadow:var(--shadow)}
+.stat small{display:block;color:var(--muted);font-weight:600;font-size:13px}
+.stat span{display:block;margin-top:4px;font-size:26px;font-weight:800;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+.stat.lead{grid-column:1/-1;background:var(--side);border-color:var(--side);padding:24px 26px;border-radius:16px}
+.stat.lead small{color:#9fb0c3}
+.stat.lead span{font-size:44px;color:#fff}
+
+/* tables */
+.scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
 table{width:100%;border-collapse:collapse;font-size:14px}
-th,td{text-align:left;padding:8px 6px;border-bottom:1px solid #2a3b56;vertical-align:top}
-.scroll{overflow-x:auto}
-input,textarea,button{width:100%;padding:10px;margin:6px 0;border-radius:10px;border:1px solid #34445f;background:#0d1524;color:#e8eaf0;font-size:15px}
-button{background:linear-gradient(135deg,#1677ff,#315cf5);border:0;font-weight:750;cursor:pointer;box-shadow:0 5px 14px #2563eb30;transition:transform .15s,filter .15s}
-.inline{display:flex;gap:6px;align-items:center}
-button:hover{filter:brightness(1.12);transform:translateY(-1px)}.inline input{margin:0}.inline button{width:auto;margin:0}
-.msg{padding:12px 14px;border-radius:12px;background:#1d3559;border:1px solid #31517d;margin-bottom:14px}
-.err{background:#4f2630}
-.paid{color:#4cd38a}.pending,.processing{color:#f2c14e}.failed,.refunded{color:#ff6b6b}
-label{display:block;color:#9aa3b5;font-size:13px;margin-top:8px}
-select{width:100%;padding:10px;margin:6px 0;border-radius:10px;border:1px solid #34445f;background:#0d1524;color:#e8eaf0;font-size:15px}
-.two{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+th,td{text-align:left;padding:11px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--muted);font-weight:600;font-size:12.5px;white-space:nowrap}
+td{font-variant-numeric:tabular-nums}
+tr:last-child td{border-bottom:0}
+tr:hover td{background:var(--bg)}
+td form{margin:0 0 6px}
+td input{min-width:92px;margin:0 0 6px}
+td button{width:auto;padding:8px 14px;margin:0}
+.paid{color:var(--paid)}.pending,.processing{color:var(--pend)}.failed,.refunded{color:var(--fail)}
+td.paid,td.pending,td.processing,td.failed,td.refunded{font-weight:700}
+td.paid::before,td.pending::before,td.processing::before,td.failed::before,td.refunded::before{content:'';display:inline-block;width:7px;height:7px;border-radius:50%;background:currentColor;margin-right:7px;vertical-align:1px}
+
+/* forms */
+input,textarea,select,button{width:100%;padding:10px 12px;margin:6px 0;border-radius:9px;border:1px solid var(--line2);background:var(--field);color:var(--ink);font:inherit;font-size:15px}
+input:focus,textarea:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft);outline:0}
+input::placeholder,textarea::placeholder{color:var(--muted);opacity:.8}
+label{display:block;color:var(--muted);font-size:13px;font-weight:600;margin-top:10px}
+button{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:700;cursor:pointer;transition:background .15s}
+button:hover{background:var(--accent2);border-color:var(--accent2)}
+button:active{transform:translateY(1px)}
+.red{background:var(--fail);border-color:var(--fail)}.red:hover{background:var(--fail);filter:brightness(.92);border-color:var(--fail)}
+.green{background:#17845b;border-color:#17845b}.green:hover{background:#126f4d;border-color:#126f4d}
+.grey{background:var(--grey);border-color:var(--grey);color:var(--greyink)}.grey:hover{background:var(--line2);border-color:var(--line2)}
+.sm{width:auto;padding:7px 12px;font-size:13px;margin:0}
+.inline{display:flex;gap:8px;align-items:center}.inline input{margin:0}.inline button{width:auto;margin:0;white-space:nowrap}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 .row{display:flex;gap:8px;flex-wrap:wrap}.row button{flex:1;min-width:110px}
-.red{background:#c0392b}.green{background:#1f9d57}.grey{background:#3a4152}
-.muted{color:#9aa3b5;font-size:13px}.mono{font-family:ui-monospace,monospace;word-break:break-all}
-.badge{display:inline-block;background:#f2c14e;color:#12141a;border-radius:10px;padding:0 7px;font-size:12px;font-weight:700}
-@media(min-width:700px){.grid{grid-template-columns:repeat(5,1fr)}}@media(max-width:600px){main{padding:14px 10px}nav{gap:4px;padding:10px}nav a{font-size:12px;padding:7px}.card{padding:14px;border-radius:14px}.grid{gap:9px}.stat{padding:12px}.stat span{font-size:21px}.two{grid-template-columns:1fr}}
-</style></head><body>
+
+/* misc */
+.msg{padding:12px 14px;border-radius:10px;background:var(--accent-soft);border:1px solid var(--line);border-left:4px solid var(--accent);margin-bottom:16px;overflow-wrap:anywhere}
+.msg.err,.err{background:var(--errbg);border-left-color:var(--fail)}
+.muted{color:var(--muted);font-size:13px}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all;font-size:13.5px}
+.badge{display:inline-block;background:#f0b84a;color:#1b1405;border-radius:99px;padding:1px 8px;font-size:12px;font-weight:800;line-height:1.5}
+.login{padding:30px 26px}
+.login .mark{width:44px;height:44px;border-radius:12px;font-size:20px;margin-bottom:14px}
+.login h2{font-size:22px;margin-bottom:4px}
+.login button{margin-top:14px;padding:12px}
+
+.page-head{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18px}
+.page-head h2{margin:0}
+.seg{display:inline-flex;background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:3px}
+.seg a{padding:6px 13px;border-radius:7px;font-size:13px;font-weight:700;color:var(--muted);text-decoration:none}
+.seg a:hover{color:var(--ink);text-decoration:none}
+.seg a.on{background:var(--side);color:#fff}
+.lead2{background:var(--side);color:#fff;border-radius:16px;padding:26px 28px;margin-bottom:12px;display:grid;grid-template-columns:1.2fr 1.2fr 1fr;gap:24px;align-items:start}
+.lead2 small{color:#9fb0c3;font-weight:600;font-size:13px;display:block}
+.lead2 .big{font-size:42px;font-weight:800;letter-spacing:-.02em;font-variant-numeric:tabular-nums;line-height:1.15;margin-top:2px}
+.lead2 .big.profit{color:#4fe0a6}.lead2 .big.loss{color:#ff8a82}
+.lead2 .sub{color:#9fb0c3;font-size:13px;margin-top:4px}
+.lead2 .mini{display:grid;gap:9px;font-size:14px}
+.lead2 .mini div{display:flex;justify-content:space-between;gap:12px;border-bottom:1px solid #ffffff1a;padding-bottom:9px}
+.lead2 .mini div:last-child{border-bottom:0;padding-bottom:0}
+.lead2 .mini span{color:#9fb0c3}.lead2 .mini b{font-variant-numeric:tabular-nums}
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.chart{display:flex;align-items:flex-end;gap:4px;height:170px;margin-top:16px}
+.chart .col{flex:1;min-width:0;height:100%;display:flex;flex-direction:column;justify-content:flex-end}
+.chart .bar{background:var(--bar);border-radius:4px 4px 0 0;display:flex;align-items:flex-end;min-height:2px}
+.chart .bar i{display:block;width:100%;background:var(--accent);border-radius:4px 4px 0 0}
+.xl{display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-top:8px}
+.dot{display:inline-block;width:9px;height:9px;border-radius:3px;margin:0 5px 0 12px;vertical-align:0}
+.dot.rev{background:var(--bar)}.dot.prof{background:var(--accent)}
+.hint{font-weight:500;color:var(--muted);font-size:12.5px}
+@media(max-width:900px){
+body.app{display:block}
+.side{position:fixed;top:0;bottom:0;left:0;width:274px;height:auto;transform:translateX(-102%);transition:transform .22s ease;z-index:40}
+body.nav-open .side{transform:none}
+.scrim{position:fixed;inset:0;background:#0008;z-index:30}
+body.nav-open .scrim{display:block}
+.topbar{display:flex;align-items:center;gap:12px;position:sticky;top:0;z-index:20;background:var(--side);color:#fff;padding:10px 14px;font-weight:800}
+.topbar button{width:auto;margin:0;padding:7px 9px;background:transparent;border-color:#ffffff30;line-height:0}
+.topbar .mark{width:28px;height:28px;border-radius:8px;font-size:14px}
+main{padding:20px 14px 60px}
+h2{font-size:22px}
+.card{padding:16px;border-radius:12px}
+.stat.lead span{font-size:34px}
+.lead2{grid-template-columns:1fr;padding:20px;gap:18px}
+.lead2 .big{font-size:34px}
+.cols{grid-template-columns:1fr}
+.chart{height:140px}
+.stat span{font-size:22px}
+.stats .stat:last-child:nth-child(odd){grid-column:1/-1}
+.two{grid-template-columns:1fr}
+}
+@media(prefers-reduced-motion:reduce){*{transition:none!important}}
+</style></head><body class="{{ 'app' if session.get('ok') else 'bare' }}">
+{% macro ico(n) %}<svg viewBox="0 0 24 24" aria-hidden="true">{% if n=='home' %}<path d="M3 11l9-8 9 8"/><path d="M5 10v10h14V10"/>{% elif n=='box' %}<path d="M21 8l-9-5-9 5 9 5 9-5z"/><path d="M3 8v8l9 5 9-5V8"/><path d="M12 13v8"/>{% elif n=='list' %}<path d="M8 6h13M8 12h13M8 18h13"/><path d="M3 6h.01M3 12h.01M3 18h.01"/>{% elif n=='clock' %}<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>{% elif n=='card' %}<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18"/>{% elif n=='qr' %}<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3zM20 14v.01M20 20v.01M17 20h-3"/>{% elif n=='users' %}<circle cx="9" cy="8" r="4"/><path d="M2 21c0-4 3-7 7-7s7 3 7 7"/><path d="M17 4a4 4 0 010 8M22 21c0-3-2-5.5-5-6.5"/>{% elif n=='help' %}<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3.5"/><path d="M5.6 5.6l3.9 3.9M14.5 14.5l3.9 3.9M18.4 5.6l-3.9 3.9M9.5 14.5l-3.9 3.9"/>{% elif n=='tag' %}<path d="M3 12V3h9l9 9-9 9-9-9z"/><circle cx="7.5" cy="7.5" r="1.2"/>{% elif n=='key' %}<circle cx="8" cy="15" r="4"/><path d="M11 12l9-9M16 7l3 3"/>{% elif n=='shield' %}<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/>{% elif n=='sliders' %}<path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/>{% elif n=='out' %}<path d="M9 21H5V3h4"/><path d="M16 17l5-5-5-5M21 12H9"/>{% elif n=='menu' %}<path d="M4 6h16M4 12h16M4 18h16"/>{% endif %}</svg>{% endmacro %}
+{% macro nl(ep, label, icon, count=0, alt='') %}<a class="nl {{ 'on' if request.endpoint == ep or request.endpoint == alt }}" href="{{ url_for(ep) }}">{{ ico(icon) }}<span>{{ label }}</span>{% if count %}<span class="badge">{{ count }}</span>{% endif %}</a>{% endmacro %}
 {% if session.get('ok') %}
-<nav><b>{{ shop }}</b><a href="{{ url_for('dashboard') }}">Dashboard</a>
-<a href="{{ url_for('products') }}">Products</a>
-<a href="{{ url_for('manual') }}">Pending orders{% if pending_count %} <span class="badge">{{ pending_count }}</span>{% endif %}</a>
-<a href="{{ url_for('upipay') }}">UPI payments{% if upi_pending %} <span class="badge">{{ upi_pending }}</span>{% endif %}</a>
-<a href="{{ url_for('upi') }}">UPI setup</a>
-<a href="{{ url_for('orders') }}">Orders</a>
-<a href="{{ url_for('users') }}">Users</a>
-<a href="{{ url_for('tickets') }}">Support{% if open_tickets %} <span class="badge">{{ open_tickets }}</span>{% endif %}</a>
-<a href="{{ url_for('settings') }}">Settings</a>
-<a href="{{ url_for('userprices') }}">User prices</a>
-<a href="{{ url_for('admins') }}">Admins</a><a href="{{ url_for('reseller_admin.resellers') }}">Resellers API</a>
-<a href="{{ url_for('logout') }}">Logout</a></nav>
+<div class="topbar"><button type="button" onclick="document.body.classList.toggle('nav-open')" aria-label="Open menu">{{ ico('menu') }}</button><span class="mark">{{ shop[:1]|upper }}</span><span>{{ shop }}</span></div>
+<div class="scrim" onclick="document.body.classList.remove('nav-open')"></div>
+<aside class="side">
+<div class="brand"><span class="mark">{{ shop[:1]|upper }}</span><span>{{ shop }}</span></div>
+{{ nl('dashboard','Dashboard','home') }}
+<div class="grp">Sales</div>
+{{ nl('orders','Orders','list') }}
+{{ nl('manual','Pending orders','clock',pending_count) }}
+{{ nl('products','Products','box') }}
+<div class="grp">Payments</div>
+{{ nl('upipay','UPI payments','card',upi_pending) }}
+{{ nl('upi','UPI setup','qr') }}
+<div class="grp">Customers</div>
+{{ nl('users','Users','users') }}
+{{ nl('tickets','Support','help',open_tickets,'ticket') }}
+{{ nl('userprices','User prices','tag') }}
+<div class="grp">System</div>
+{{ nl('reseller_admin.resellers','Resellers API','key') }}
+{{ nl('admins','Admins','shield') }}
+{{ nl('settings','Settings','sliders') }}
+<div class="out">{{ nl('logout','Log out','out') }}</div>
+</aside>
 {% endif %}
-<main>
+<div class="content"><main>
 {% with m = get_flashed_messages(with_categories=true) %}
 {% for cat, text in m %}<div class="msg {{ 'err' if cat == 'err' else '' }}">{{ text }}</div>{% endfor %}
 {% endwith %}
 {% block body %}{% endblock %}
-</main></body></html>""",
+</main></div></body></html>""",
     "login.html": """{% extends 'base.html' %}{% block body %}
-<div class="card" style="max-width:380px;margin:60px auto">
-<h2>{{ shop }} Admin</h2>
+<div class="card login">
+<div class="mark">{{ shop[:1]|upper }}</div>
+<h2>{{ shop }}</h2>
+<p class="muted">Sign in to manage your store.</p>
 <form method="post">
-<input type="password" name="password" placeholder="Password" autofocus required>
-<button type="submit">Login</button>
+<label for="pw">Password</label>
+<input id="pw" type="password" name="password" placeholder="Enter admin password" autofocus required>
+<button type="submit">Sign in</button>
 </form></div>{% endblock %}""",
     "dashboard.html": """{% extends 'base.html' %}{% block body %}
-<h2>Dashboard</h2>
-<div class="grid">
-<div class="stat"><small>Total orders</small><span>{{ s.total }}</span></div>
-<div class="stat"><small>Paid</small><span class="paid">{{ s.paid }}</span></div>
-<div class="stat"><small>Pending</small><span class="pending">{{ s.pending }}</span></div>
-<div class="stat"><small>Failed</small><span class="failed">{{ s.failed }}</span></div>
-<div class="stat"><small>To deliver</small><span class="processing">{{ pending_count }}</span></div>
-<div class="stat"><small>Revenue (USDT)</small><span>{{ '%.2f'|format(s.revenue) }}</span></div>
+<div class="page-head"><h2>Dashboard</h2>
+<div class="seg">{% for k, lbl in ranges %}<a href="{{ url_for('dashboard', range=k) }}" class="{{ 'on' if k == rng }}">{{ lbl }}</a>{% endfor %}</div></div>
+{% if d.nocost %}<div class="msg">{{ d.nocost }} sale{{ '' if d.nocost == 1 else 's' }} in this period {{ 'has' if d.nocost == 1 else 'have' }} no cost price, so the full amount is counted as profit. <a href="{{ url_for('products') }}">Add cost prices</a> to see the real profit.</div>{% endif %}
+<div class="lead2">
+<div><small>Revenue (USDT)</small><div class="big">{{ '%.2f'|format(d.rev) }}</div><div class="sub">{{ d.n }} paid order{{ '' if d.n == 1 else 's' }}, {{ d.units }} item{{ '' if d.units == 1 else 's' }} sold</div></div>
+<div><small>Profit (USDT)</small><div class="big {{ 'profit' if d.profit >= 0 else 'loss' }}">{{ '%.2f'|format(d.profit) }}</div><div class="sub">{{ '%.1f'|format(d.margin) }}% margin{% if d.net is not none %}, {{ '%.2f'|format(d.net) }} after referral payouts{% endif %}</div></div>
+<div class="mini">
+<div><span>Cost of goods</span><b>{{ '%.2f'|format(d.cost) }}</b></div>
+<div><span>Bot sales</span><b>{{ '%.2f'|format(d.bot.rev) }}</b></div>
+<div><span>Reseller API sales</span><b>{{ '%.2f'|format(d.api.rev) }}</b></div>
+</div></div>
+<div class="stats">
+<div class="stat"><small>Paid orders</small><span>{{ d.n }}</span></div>
+<div class="stat"><small>Items sold</small><span>{{ d.units }}</span></div>
+<div class="stat"><small>To deliver</small><span class="processing">{{ d.processing }}</span></div>
+<div class="stat"><small>Waiting for payment</small><span class="pending">{{ d.pending }}</span></div>
+<div class="stat"><small>Failed</small><span class="failed">{{ d.failed }}</span></div>
+<div class="stat"><small>Customers</small><span>{{ d.users }}</span></div>
+<div class="stat"><small>New customers</small><span>{{ d.new_users }}</span></div>
+<div class="stat"><small>Wallet balances held</small><span>{{ '%.2f'|format(d.wallets) }}</span></div>
+<div class="stat"><small>Deposits received</small><span>{{ '%.2f'|format(d.dep_amt) }}</span></div>
+<div class="stat"><small>Referral paid (all time)</small><span>{{ '%.2f'|format(d.ref) }}</span></div>
 </div>
-<div class="card" style="margin-top:16px"><h3>Latest orders</h3>
+<div class="card"><div class="page-head" style="margin-bottom:0"><h3 style="margin:0">Daily sales, last {{ d.days|length }} days</h3>
+<span class="muted"><i class="dot rev"></i>Revenue <i class="dot prof"></i>Profit</span></div>
+<div class="chart">{% for x in d.days %}<div class="col" title="{{ x.label }}: revenue ${{ '%.2f'|format(x.rev) }}, profit ${{ '%.2f'|format(x.profit) }}"><div class="bar" style="height:{{ x.h }}%"><i style="height:{{ x.ph }}%"></i></div></div>{% endfor %}</div>
+<div class="xl"><span>{{ d.days[0].label }}</span><span>{{ d.days[-1].label }}</span></div></div>
+<div class="cols">
+<div class="card"><h3>Best sellers</h3><div class="scroll"><table>
+<tr><th>Product</th><th>Sold</th><th>Revenue</th><th>Profit</th></tr>
+{% for t in d.top %}<tr><td>{{ t.name }}</td><td>{{ t.units }}</td><td>{{ '%.2f'|format(t.rev) }}</td><td><span class="{{ 'paid' if t.profit >= 0 else 'failed' }}">{{ '%.2f'|format(t.profit) }}</span></td></tr>
+{% else %}<tr><td colspan="4">No sales in this period yet.</td></tr>{% endfor %}
+</table></div></div>
+<div class="card"><h3>Where sales come from</h3><div class="scroll"><table>
+<tr><th>Source</th><th>Orders</th><th>Revenue</th><th>Cost</th><th>Profit</th></tr>
+{% for name, r in [('Telegram bot', d.bot), ('Reseller API', d.api)] %}<tr><td>{{ name }}</td><td>{{ r.n }}</td><td>{{ '%.2f'|format(r.rev) }}</td><td>{{ '%.2f'|format(r.cost) }}</td><td><span class="{{ 'paid' if r.profit >= 0 else 'failed' }}">{{ '%.2f'|format(r.profit) }}</span></td></tr>{% endfor %}
+</table></div>
+{% if d.low %}<h3 style="margin-top:18px">Running low on stock</h3><div class="scroll"><table>
+{% for p in d.low %}<tr><td>{{ p.name }}</td><td class="{{ 'failed' if p.stock == 0 else 'pending' }}">{{ 'Out of stock' if p.stock == 0 else (p.stock ~ ' left') }}</td></tr>{% endfor %}
+</table></div><p class="muted" style="margin:10px 0 0"><a href="{{ url_for('products') }}">Add stock</a></p>{% endif %}</div>
+</div>
+<div class="card"><h3>Latest orders</h3>
 {% include 'orders_table.html' %}</div>{% endblock %}""",
     "orders.html": """{% extends 'base.html' %}{% block body %}
 <h2>Orders</h2>
@@ -137,7 +287,7 @@ select{width:100%;padding:10px;margin:6px 0;border-radius:10px;border:1px solid 
 {% for a in rows %}<tr><td>{{ a.user_id }}</td>
 <td>{{ (a.added_at or '')[:16].replace('T',' ') }}</td>
 <td><form method="post" action="{{ url_for('remove_admin', uid=a.user_id) }}" onsubmit="return confirm('Remove this admin?')">
-<button type="submit" style="width:auto;margin:0;background:#c0392b">Remove</button></form></td></tr>
+<button type="submit" class="red sm">Remove</button></form></td></tr>
 {% else %}<tr><td colspan="3">No extra admins. (The owner always has access.)</td></tr>{% endfor %}
 </table></div></div>
 <div class="card"><h3>Add admin</h3>
@@ -153,13 +303,13 @@ select{width:100%;padding:10px;margin:6px 0;border-radius:10px;border:1px solid 
 <td><form method="post" action="{{ url_for('delete_user_price') }}">
 <input type="hidden" name="username" value="{{ r.username }}">
 <input type="hidden" name="pid" value="{{ r.product_id }}">
-<button type="submit" style="width:auto;margin:0;background:#c0392b">Delete</button></form></td></tr>
+<button type="submit" class="red sm">Delete</button></form></td></tr>
 {% else %}<tr><td colspan="4">No user-specific prices set.</td></tr>{% endfor %}
 </table></div></div>
 <div class="card"><h3>Set user price</h3>
 <form method="post" action="{{ url_for('set_user_price') }}">
 <input name="username" placeholder="Telegram username (without @)" required>
-<select name="pid" required style="width:100%;padding:10px;margin:6px 0;border-radius:10px;border:1px solid #34445f;background:#0d1524;color:#e8eaf0;font-size:15px">
+<select name="pid" required>
 {% for p in products %}<option value="{{ p.id }}">{{ p.id }} - {{ p.name }} (default {{ p.price }})</option>{% endfor %}
 </select>
 <input name="price" type="number" step="0.01" min="0" placeholder="Price (USDT)" required>
@@ -169,13 +319,15 @@ select{width:100%;padding:10px;margin:6px 0;border-radius:10px;border:1px solid 
 {% for p in products %}
 <div class="card">
 <b>#{{ p.id }} · {{ p.name }}</b>
-<span class="muted"> · {{ 'Made to order' if p.kind == 'manual' else ('Stock: ' ~ p.stock) }}</span>
+<span class="muted"> · {{ 'Made to order' if p.kind == 'manual' else ('Stock: ' ~ p.stock) }}{% set uc = p.cost if p.cost is not none else p.api_cost %}{% if uc is number %} · Profit ${{ '%.2f'|format(p.price - uc) }} per item{% endif %}</span>
 <form method="post" action="{{ url_for('edit_product', pid=p.id) }}">
 <label>Name</label><input name="name" value="{{ p.name }}" required>
 <div class="two">
 <div><label>Price (USDT)</label><input name="price" type="number" step="0.01" min="0" value="{{ p.price }}" required></div>
 <div><label>Old price (optional - shows a % discount)</label><input name="old_price" type="number" step="0.01" min="0" value="{{ p.old_price or '' }}"></div>
 </div>
+<label>Cost price (USDT) <span class="hint">what one item costs you; used for the profit on the dashboard. Linked API products use the provider cost when this is empty.</span></label>
+<input name="cost" type="number" step="0.01" min="0" value="{{ p.cost if p.cost is not none else '' }}" placeholder="e.g. 1.20">
 <label>Category (same category = grouped under one blue button; empty = listed directly)</label>
 <input name="category" value="{{ p.category or '' }}">
 <label>Type</label>
@@ -196,7 +348,7 @@ select{width:100%;padding:10px;margin:6px 0;border-radius:10px;border:1px solid 
 {% if api_enabled and p.kind != 'manual' %}
 <form method="post" action="{{ url_for('api_link', pid=p.id) }}">
 <label>Provider API link {% if p.api_key %}<span class="muted">· cost ${{ '%.2f' % p.api_cost }} · provider stock {{ p.api_stock }} · your profit ${{ '%.2f' % (p.price - p.api_cost) }}/item</span>{% endif %}</label>
-<select name="provider_key" style="width:100%;padding:10px;margin:6px 0;border-radius:10px;border:1px solid #34445f;background:#0d1524;color:#e8eaf0;font-size:15px">
+<select name="provider_key">
 <option value="">- not linked (own stock only) -</option>
 {% for a in api_items %}<option value="{{ a.key }}" {{ 'selected' if p.api_key == a.key }}>{{ a.name }} · cost ${{ a.price_usdt_from }} · stock {{ a.stock }}</option>{% endfor %}
 </select>
@@ -272,9 +424,9 @@ If the product name already exists, items are added to it.</p>
     "ticket.html": """{% extends 'base.html' %}{% block body %}
 <h2>Ticket #{{ t.id }} <span class="muted">· {{ t.kind }} · {{ t.status }}</span></h2>
 <p class="muted">Customer: {{ ('@' ~ t.username) if t.username else t.user_id }} ({{ t.user_id }})</p>
-{% for m in msgs %}<div class="card" style="{{ 'border-left:3px solid #3b6cff' if m.sender == 'admin' else '' }}">
+{% for m in msgs %}<div class="card" style="{{ 'border-left:4px solid var(--accent)' if m.sender == 'admin' else '' }}">
 <small class="muted">{{ 'You' if m.sender == 'admin' else 'Customer' }} · {{ (m.created_at or '')[:16].replace('T',' ') }}</small><br>
-{{ m.text }}{% if m.photo_id %}<div style="margin-top:10px"><a href="{{ url_for('ticket_photo', mid=m.id) }}" target="_blank"><img src="{{ url_for('ticket_photo', mid=m.id) }}" alt="photo" loading="lazy" style="max-width:100%;max-height:420px;border-radius:8px"></a></div>{% endif %}</div>{% endfor %}
+{{ m.text }}{% if m.photo_id %}<div style="margin-top:10px"><a href="{{ url_for('ticket_photo', mid=m.id) }}" target="_blank"><img src="{{ url_for('ticket_photo', mid=m.id) }}" alt="photo" loading="lazy" style="max-width:100%;max-height:420px;border-radius:8px;border:1px solid var(--line)"></a></div>{% endif %}</div>{% endfor %}
 <div class="card"><form method="post" action="{{ url_for('ticket_reply', tid=t.id) }}">
 <textarea name="text" rows="4" placeholder="Your reply (sent to the customer in the bot)" required></textarea>
 <button type="submit">Send reply</button></form>
@@ -338,6 +490,14 @@ If the product name already exists, items are added to it.</p>
 {% else %}<div class="card">Nothing here.</div>{% endfor %}{% endblock %}""",
 }
 app.jinja_loader = DictLoader(TEMPLATES)
+
+
+def render_str(source, **kw):
+    if session.get("ok"):
+        kw.setdefault("pending_count", len(db.pending_manual()))
+        kw.setdefault("open_tickets", len(db.all_tickets("open")))
+        kw.setdefault("upi_pending", db.upi_review_count())
+    return render_template_string(source, shop=SHOP_NAME, **kw)
 
 
 def render(name, **kw):
@@ -408,9 +568,105 @@ def fetch_orders(limit):
     return rows
 
 
+RANGES = [("today", "Today"), ("7d", "7 days"), ("30d", "30 days"), ("all", "All time")]
+
+# paid sales from the bot and from the reseller API, with the cost per item
+# (product cost price, else the provider cost for API-linked products)
+_SALES = """WITH s AS (
+SELECT product_id, quantity q, amount a, COALESCE(paid_at, created_at) ts, 'bot' src FROM orders WHERE status='paid'
+UNION ALL
+SELECT product_id, quantity, amount, created_at, 'api' FROM api_reseller_orders WHERE status='paid'
+), x AS (
+SELECT s.*, p.name pname, COALESCE(p.cost, pm.cost) ucost FROM s
+LEFT JOIN products p ON p.id = s.product_id
+LEFT JOIN provider_map pm ON pm.product_id = s.product_id
+) """
+
+
+def _since(rng):
+    now = datetime.now(timezone.utc)
+    if rng == "today":
+        return now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    if rng == "7d":
+        return (now - timedelta(days=7)).isoformat()
+    if rng == "30d":
+        return (now - timedelta(days=30)).isoformat()
+    return None
+
+
+def dashboard_data(rng):
+    since = _since(rng)
+    w = " WHERE ts >= ?" if since else ""
+    a = (since,) if since else ()
+    now = datetime.now(timezone.utc)
+    c = db.conn()
+    try:
+        d = {}
+        src = {r["src"]: dict(r) for r in c.execute(
+            _SALES + "SELECT src, COUNT(*) n, COALESCE(SUM(q),0) units, COALESCE(SUM(a),0) rev, "
+            "COALESCE(SUM(q*COALESCE(ucost,0)),0) cost, "
+            "COALESCE(SUM(CASE WHEN ucost IS NULL THEN 1 ELSE 0 END),0) nocost FROM x" + w + " GROUP BY src", a)}
+        for k in ("bot", "api"):
+            r = src.get(k) or dict(n=0, units=0, rev=0.0, cost=0.0, nocost=0)
+            r["profit"] = r["rev"] - r["cost"]
+            d[k] = r
+        d["n"] = d["bot"]["n"] + d["api"]["n"]
+        d["units"] = d["bot"]["units"] + d["api"]["units"]
+        d["rev"] = d["bot"]["rev"] + d["api"]["rev"]
+        d["cost"] = d["bot"]["cost"] + d["api"]["cost"]
+        d["nocost"] = d["bot"]["nocost"] + d["api"]["nocost"]
+        d["profit"] = d["rev"] - d["cost"]
+        d["margin"] = (d["profit"] / d["rev"] * 100) if d["rev"] else 0.0
+
+        d["top"] = [dict(r) for r in c.execute(
+            _SALES + "SELECT product_id, COALESCE(MAX(pname), 'Deleted product') name, COALESCE(SUM(q),0) units, "
+            "SUM(a) rev, SUM(a - q*COALESCE(ucost,0)) profit FROM x" + w +
+            " GROUP BY product_id ORDER BY rev DESC LIMIT 5", a)]
+
+        ndays = 7 if rng in ("today", "7d") else 30
+        start = (now - timedelta(days=ndays - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        got = {r["d"]: r for r in c.execute(
+            _SALES + "SELECT substr(ts,1,10) d, SUM(a) rev, SUM(a - q*COALESCE(ucost,0)) profit FROM x "
+            "WHERE ts >= ? GROUP BY d", (start.isoformat(),))}
+        days = []
+        for i in range(ndays):
+            day = start + timedelta(days=i)
+            r = got.get(day.strftime("%Y-%m-%d"))
+            days.append(dict(label=day.strftime("%d %b"), rev=(r["rev"] if r else 0.0),
+                             profit=(r["profit"] if r else 0.0)))
+        mx = max([x["rev"] for x in days] + [0.01])
+        for x in days:
+            x["h"] = round(x["rev"] / mx * 100, 1)
+            x["ph"] = round(max(0.0, min(100.0, x["profit"] / x["rev"] * 100)), 1) if x["rev"] > 0 else 0
+        d["days"] = days
+
+        o = c.execute("SELECT COALESCE(SUM(status='pending'),0) pending, COALESCE(SUM(status='processing'),0) processing FROM orders").fetchone()
+        d["pending"], d["processing"] = o["pending"], o["processing"]
+        f = "SELECT COUNT(*) n FROM orders WHERE status='failed'" + (" AND created_at >= ?" if since else "")
+        d["failed"] = c.execute(f, a).fetchone()["n"]
+
+        u = c.execute("SELECT COUNT(*) n, COALESCE(SUM(balance),0) bal, COALESCE(SUM(ref_earned),0) ref FROM users").fetchone()
+        d["users"], d["wallets"], d["ref"] = u["n"], u["bal"], u["ref"]
+        nu = "SELECT COUNT(*) n FROM users" + (" WHERE created_at >= ?" if since else "")
+        d["new_users"] = c.execute(nu, a).fetchone()["n"]
+
+        dep = ("SELECT COALESCE(SUM(amount),0) amt FROM deposits WHERE status='paid' AND COALESCE(method,'') != 'admin'"
+               + (" AND COALESCE(paid_at, created_at) >= ?" if since else ""))
+        d["dep_amt"] = c.execute(dep, a).fetchone()["amt"]
+    finally:
+        c.close()
+    d["net"] = (d["profit"] - d["ref"]) if rng == "all" else None
+    d["low"] = [dict(name=p["name"], stock=int(p["stock"] or 0)) for p in db.list_products()
+                if p["kind"] != "manual" and int(p["stock"] or 0) <= 3][:8]
+    return d
+
+
 @app.route("/")
 def dashboard():
-    return render("dashboard.html", s=db.payment_stats(), rows=fetch_orders(15))
+    rng = request.args.get("range", "30d")
+    if rng not in dict(RANGES):
+        rng = "30d"
+    return render("dashboard.html", d=dashboard_data(rng), rng=rng, ranges=RANGES, rows=fetch_orders(10))
 
 
 @app.route("/orders")
@@ -579,6 +835,7 @@ def edit_product(pid):
             name=f.get("name", "").strip(),
             price=_num(f.get("price")),
             old_price=_num(f.get("old_price"), allow_empty=True),
+            cost=_num(f.get("cost"), allow_empty=True),
             category=(f.get("category", "").strip() or None),
             kind=f.get("kind", "auto"),
             delivery=(f.get("delivery", "").strip() or None),

@@ -129,7 +129,7 @@ class Database:
                       ("created_at", "TEXT"), ("ref_code", "TEXT")],
             "products": [("description", "TEXT"), ("delivery", "TEXT"), ("warranty", "TEXT"),
                          ("category", "TEXT"), ("old_price", "REAL"), ("kind", "TEXT DEFAULT 'auto'"),
-                         ("prompt", "TEXT")],
+                         ("prompt", "TEXT"), ("cost", "REAL")],
             "orders": [("paid_with", "TEXT DEFAULT 'crypto'"), ("contact", "TEXT"), ("admin_note", "TEXT")],
             "deposits": [("inr_amount", "REAL"), ("rate", "REAL"), ("upi_id", "TEXT"), ("utr", "TEXT"),
                          ("utr_at", "TEXT"), ("reviewed_by", "TEXT")],
@@ -189,7 +189,7 @@ class Database:
 
     def list_products(self):
         c=self.conn()
-        rows=c.execute(f"""SELECT p.id,p.name,p.price,p.description,p.delivery,p.warranty,p.category,p.old_price,p.kind,p.prompt,
+        rows=c.execute(f"""SELECT p.id,p.name,p.price,p.description,p.delivery,p.warranty,p.category,p.old_price,p.kind,p.prompt,p.cost,
         (SELECT COUNT(*) FROM stock s WHERE s.product_id=p.id AND s.sold=0) stock
         FROM products p WHERE p.active=1 ORDER BY p.id""").fetchall()
         c.close(); return rows
@@ -540,7 +540,7 @@ class Database:
         return r["user_id"] if r else None
 
     # ------------------------------------------------------------ products (admin)
-    PRODUCT_FIELDS = ("name", "price", "old_price", "category", "description", "delivery", "warranty", "kind", "prompt")
+    PRODUCT_FIELDS = ("name", "price", "old_price", "category", "description", "delivery", "warranty", "kind", "prompt", "cost")
 
     def add_product(self, name, price, kind="auto"):
         c=self.conn()
