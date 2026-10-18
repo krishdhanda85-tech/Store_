@@ -221,7 +221,7 @@ TEXT = {
 LANG_NAMES = {"en": "English", "zh": "中文"}
 
 
-def tt(language: str, key: str, **kw) -> str:
+def tt(language: str, key: str, /, **kw) -> str:
     s = TEXT.get(language, {}).get(key)
     if s is None:
         s = TEXT["en"][key]
