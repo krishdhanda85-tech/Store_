@@ -360,7 +360,7 @@ def _blocked(ip):
 
 @app.before_request
 def guard():
-    if request.path.startswith("/api/v1/"):
+    if request.path.startswith("/api"):
         return None
     if request.endpoint in ("login", "static"):
         return None

@@ -111,12 +111,46 @@ def _error(message, status):
     return jsonify({"ok": False, "error": message}), status
 
 
+def _params():
+    """Merge query string, form fields and JSON body, so any client style works."""
+    data = {}
+    data.update(request.args.to_dict())
+    data.update(request.form.to_dict())
+    body = request.get_json(silent=True)
+    if isinstance(body, dict):
+        data.update(body)
+    return data
+
+
+def _extract_key():
+    raw = request.headers.get("Authorization", "").strip()
+    if raw.lower().startswith("bearer "):
+        return raw[7:].strip()
+    if raw:
+        return raw          # "Authorization: KEY" without the word Bearer
+    for h in ("X-API-Key", "X-Api-Key", "Api-Key", "apikey"):
+        v = request.headers.get(h, "").strip()
+        if v:
+            return v
+    p = _params()
+    for k in ("api_key", "apikey", "key", "token"):
+        if p.get(k):
+            return str(p[k]).strip()
+    return ""
+
+
+PUBLIC_PATHS = {"/api/v1/health", "/api/docs", "/api", "/api/"}
+
+
 @api.before_app_request
 def auth_reseller():
-    if not request.path.startswith("/api/v1/"):
+    if not request.path.startswith("/api"):
         return None
-    raw = request.headers.get("Authorization", "")
-    key = raw[7:].strip() if raw.lower().startswith("bearer ") else request.headers.get("X-API-Key", "").strip()
+    if request.method == "OPTIONS":
+        return ("", 204)
+    if request.path in PUBLIC_PATHS:
+        return None
+    key = _extract_key()
     if not key:
         return _error("missing_api_key", 401)
     digest = hashlib.sha256(key.encode()).hexdigest()
@@ -127,6 +161,36 @@ def auth_reseller():
         return _error("invalid_api_key", 401)
     g.reseller = dict(row)
     return None
+
+
+@api.after_app_request
+def cors(resp):
+    if request.path.startswith("/api"):
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Headers"] = "Authorization, X-API-Key, Content-Type, Idempotency-Key"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return resp
+
+
+@api.app_errorhandler(404)
+def _nf(e):
+    if request.path.startswith("/api"):
+        return _error("not_found", 404)
+    return e
+
+
+@api.app_errorhandler(405)
+def _mna(e):
+    if request.path.startswith("/api"):
+        return _error("method_not_allowed", 405)
+    return e
+
+
+@api.app_errorhandler(500)
+def _ise(e):
+    if request.path.startswith("/api"):
+        return _error("server_error", 500)
+    return e
 
 
 @api.get("/api/v1/health")
@@ -160,10 +224,10 @@ def products():
 
 @api.post("/api/v1/orders")
 def create_order():
-    body = request.get_json(silent=True) or {}
+    body = _params()
     try:
-        pid = int(body.get("product_id"))
-        qty = int(body.get("quantity", 1))
+        pid = int(body.get("product_id") or body.get("id") or body.get("product"))
+        qty = int(body.get("quantity") or body.get("qty") or 1)
     except (TypeError, ValueError):
         return _error("product_id_and_quantity_must_be_integers", 400)
     if pid < 1 or qty < 1 or qty > MAX_QTY:
@@ -236,3 +300,53 @@ def get_order(order_id):
     c.close()
     if not row: return _error("order_not_found", 404)
     return jsonify({"ok": True, "order": _order_json(dict(row))})
+
+
+# ---------- Easy mode: ONE URL for panels like Goatsell ----------
+# URL:  https://YOUR-DOMAIN/api/v1/index.php   (also /api/v1 and /api/v1/)
+# Key:  header, ?api_key=..., or form/json field "api_key"
+# action = balance | products | buy | order | orders | health
+@api.route("/api/v1/index.php", methods=["GET", "POST"])
+@api.route("/api/v1", methods=["GET", "POST"])
+@api.route("/api/v1/", methods=["GET", "POST"])
+def single_endpoint():
+    p = _params()
+    action = str(p.get("action") or p.get("cmd") or p.get("method") or "products").lower()
+    if action in ("balance", "profile", "me"):
+        return balance()
+    if action in ("products", "services", "list", "stock", "items"):
+        return products()
+    if action in ("buy", "order_create", "create_order", "add", "purchase", "neworder"):
+        return create_order()
+    if action in ("orders", "history"):
+        return list_orders()
+    if action in ("order", "status", "get_order", "check"):
+        oid = str(p.get("order_id") or p.get("id") or "")
+        return get_order(oid)
+    if action == "health":
+        return health()
+    return _error("unknown_action", 400)
+
+
+@api.get("/api/docs")
+@api.get("/api")
+def docs():
+    base = request.url_root.rstrip("/")
+    html = f"""<!doctype html><meta name=viewport content="width=device-width,initial-scale=1"><title>Reseller API</title>
+<style>body{{font:16px system-ui;max-width:760px;margin:20px auto;padding:0 14px;line-height:1.5}}code,pre{{background:#eef;padding:2px 6px;border-radius:6px;overflow-wrap:anywhere}}pre{{padding:10px;overflow-x:auto}}</style>
+<h2>Reseller API</h2>
+<p><b>URL:</b> <code>{base}/api/v1/index.php</code></p>
+<p><b>API key:</b> get it from the bot (Reseller API). Send as <code>Authorization: Bearer KEY</code>, <code>X-API-Key: KEY</code> or <code>?api_key=KEY</code>.</p>
+<h3>Quick test</h3><pre>curl "{base}/api/v1/index.php?action=balance&amp;api_key=YOUR_KEY"</pre>
+<h3>Actions</h3>
+<ul>
+<li><code>action=products</code> list, price, stock</li>
+<li><code>action=balance</code> wallet balance</li>
+<li><code>action=buy&amp;product_id=1&amp;quantity=2</code> place order (max 20). Add <code>idempotency_key</code> so retries never double-charge</li>
+<li><code>action=order&amp;order_id=RSL-XXXX</code> order status and items</li>
+<li><code>action=orders</code> last 100 orders</li>
+</ul>
+<p>Every reply is JSON: <code>{{"ok": true, ...}}</code> or <code>{{"ok": false, "error": "..."}}</code>.
+Errors: 401 bad key, 402 low balance, 409 no stock, 404 not found.</p>
+<p>Classic REST also works: <code>GET /api/v1/products</code>, <code>GET /api/v1/balance</code>, <code>POST /api/v1/orders</code>.</p>"""
+    return html, 200, {"Content-Type": "text/html; charset=utf-8"}

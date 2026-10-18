@@ -1,6 +1,7 @@
 import asyncio
 import html
 import logging
+import io
 import os
 import re
 import zlib
@@ -135,11 +136,16 @@ TEXT = {
         "btn_orders": "🧾 My Orders",
         "btn_tx": "🧾 Transactions",
         "btn_api": "🔑 API",
+        "btn_api_docs": "📖 API Docs",
+        "btn_docs_dl": "📄 Download docs",
+        "api_docs_1": "📖 <b>API Docs · 1/3 · Quick start</b>\n\n1️⃣ Create your key: <b>🔑 Reseller API → Create API key</b>\n2️⃣ Top up your wallet with <b>Add Funds</b>\n3️⃣ Paste this in your panel or bot:\n\n<b>API URL</b>\n<code>{url}/api/v1/index.php</code>\n<b>API key</b>\n<code>YOUR_API_KEY</code> (starts with rs_live_)\n\n4️⃣ Test it in your browser:\n<code>{url}/api/v1/index.php?action=balance&amp;api_key=YOUR_API_KEY</code>\n\nYou can send the key as header <code>Authorization: Bearer YOUR_API_KEY</code>, header <code>X-API-Key</code>, or field <code>api_key</code>.\n\nUse https:// and the full path, not only the domain.",
+        "api_docs_2": "📖 <b>API Docs · 2/3 · Actions</b>\n\nOne URL, choose with <code>action</code>:\n\n<code>action=products</code> products, price, stock\n<code>action=balance</code> wallet balance\n<code>action=buy</code> place an order\n<code>action=order</code> one order (<code>order_id</code>)\n<code>action=orders</code> last 100 orders\n\n<b>Buy example</b>\n<code>{url}/api/v1/index.php?action=buy&amp;product_id=1&amp;quantity=2&amp;idempotency_key=order-1001&amp;api_key=YOUR_API_KEY</code>\n\nMax 20 per order. Always send a unique <code>idempotency_key</code>: if you retry after a timeout you get the same order back and are not charged twice.\n\nREST also works: <code>GET /api/v1/products</code>, <code>GET /api/v1/balance</code>, <code>POST /api/v1/orders</code>.",
+        "api_docs_3": "📖 <b>API Docs · 3/3 · Replies and errors</b>\n\nEvery reply is JSON.\nSuccess: <code>{{\"ok\": true, ...}}</code>\nError: <code>{{\"ok\": false, \"error\": \"code\"}}</code>\n\nBuy reply has <code>order.items</code> = your delivered accounts and <code>balance</code> = wallet left.\n\n<b>Errors</b>\n401 <code>missing_api_key</code> / <code>invalid_api_key</code>\n402 <code>insufficient_balance</code> (top up)\n409 <code>insufficient_stock</code>\n404 <code>product_not_found</code> / <code>not_found</code>\n400 bad quantity or unknown action\n403 <code>reseller_disabled</code> (contact Support)\n\nPress <b>📄 Download docs</b> for the full guide with curl, Python and PHP examples.",
         "btn_api_new": "🔑 Create API key",
         "btn_api_regen": "🔄 New API key",
         "btn_api_regen_ok": "Yes, replace my key",
         "api_intro": "🔑 <b>Reseller API</b>\n\nSell our products from your own website or bot. Orders are paid from your wallet balance at the normal shop price (your discount, if any, is set by the admin).\n\nTap below to create your API key.",
-        "api_home": "🔑 <b>Reseller API</b>\n\n💰 Wallet: <b>${bal}</b> (top up with Add Funds)\n🏷 Discount: <b>{disc}%</b>\n🌐 Base URL: <code>{url}</code>\n\nSend the header <code>Authorization: Bearer YOUR_API_KEY</code>\n\n<code>GET /api/v1/products</code> — products, price, stock\n<code>GET /api/v1/balance</code> — wallet balance\n<code>POST /api/v1/orders</code> — body: product_id, quantity (max 20)\n<code>GET /api/v1/orders</code> — your orders\n\nSend a unique <code>Idempotency-Key</code> header with every order. Only auto-delivery products are available. Not enough balance gives error 402.",
+        "api_home": "🔑 <b>Reseller API</b>\n\n💰 Wallet: <b>${bal}</b> (top up with Add Funds)\n🏷 Discount: <b>{disc}%</b>\n🌐 API URL (paste this in your panel): <code>{url}/api/v1/index.php</code>\n📖 Docs: <code>{url}/api/docs</code>\n\nKey goes in header <code>Authorization: Bearer YOUR_API_KEY</code> (or <code>?api_key=YOUR_API_KEY</code>)\n\nQuick test: <code>{url}/api/v1/index.php?action=balance&amp;api_key=YOUR_API_KEY</code>\n\nREST also works:\n<code>GET /api/v1/products</code> — products, price, stock\n<code>GET /api/v1/balance</code> — wallet balance\n<code>POST /api/v1/orders</code> — body: product_id, quantity (max 20)\n<code>GET /api/v1/orders</code> — your orders\n\nSend a unique <code>Idempotency-Key</code> header with every order. Only auto-delivery products are available. Not enough balance gives error 402.",
         "api_key_new": "✅ <b>Your API key</b>\n\n<code>{key}</code>\n\n⚠️ Copy it now. It is shown only once. Never share it.",
         "api_regen_ask": "Replace your API key? The old key stops working immediately.",
         "api_disabled": "⛔ Your API access is disabled. Please open Support.",
@@ -238,6 +244,7 @@ def Btn(text, callback_data=None, style=None, url=None):
 MENU = {
     "shop": "🛍 Shop", "funds": "💳 Add Funds", "profile": "👤 Profile", "orders": "🧾 My Orders",
     "ref": "🎁 Referral", "support": "🎧 Support", "settings": "⚙️ Settings",
+    "api": "🔑 Reseller API",
 }
 MENU_BY_LABEL = {v: k for k, v in MENU.items()}
 MENU_RE = "^(" + "|".join(re.escape(v) for v in MENU.values()) + ")$"
@@ -246,7 +253,7 @@ MENU_RE = "^(" + "|".join(re.escape(v) for v in MENU.values()) + ")$"
 def main_keyboard():
     return ReplyKeyboardMarkup(
         [[MENU["shop"]], [MENU["funds"], MENU["profile"]], [MENU["orders"], MENU["ref"]],
-         [MENU["support"], MENU["settings"]]],
+         [MENU["support"], MENU["settings"]], [MENU["api"]]],
         resize_keyboard=True, is_persistent=True)
 
 
@@ -684,6 +691,8 @@ async def show_menu(update, context, key):
         text, markup = support_view(uid, language)
     elif key == "settings":
         text, markup = settings_view(uid, language)
+    elif key == "api":
+        text, markup = api_view(uid, language)
     else:
         return
     await respond(update, text, markup)
@@ -1021,12 +1030,14 @@ def api_view(uid: int, language: str):
     r = reseller_api.get_reseller_by_user(uid)
     if not r:
         return tt(language, "api_intro"), Markup([[Btn(tt(language, "btn_api_new"), callback_data="api:new", style="success")],
+                                                  [Btn(tt(language, "btn_api_docs"), callback_data="api:docs1")],
                                                   main_menu_row(language)])
     if not r["active"]:
         return tt(language, "api_disabled"), Markup([main_menu_row(language)])
     text = tt(language, "api_home", bal=money(reseller_api.wallet_balance(uid)), disc=f"{float(r['price_discount'] or 0):g}",
               url=esc(API_BASE_URL or "(ask the admin for the site link)"))
-    return text, Markup([[Btn(MENU["funds"], callback_data="menu:funds", style="success"),
+    return text, Markup([[Btn(tt(language, "btn_api_docs"), callback_data="api:docs1", style="primary")],
+                         [Btn(MENU["funds"], callback_data="menu:funds", style="success"),
                           Btn(tt(language, "btn_api_regen"), callback_data="api:regen")],
                          main_menu_row(language)])
 
@@ -1042,6 +1053,23 @@ async def cb_api(update, context, arg):
         if arg == "home":
             text, markup = api_view(uid, language)
             await edit(q, text, markup)
+        elif arg in ("docs1", "docs2", "docs3"):
+            n = int(arg[-1])
+            nav = []
+            if n > 1:
+                nav.append(Btn("◀️", callback_data=f"api:docs{n - 1}"))
+            if n < 3:
+                nav.append(Btn("▶️", callback_data=f"api:docs{n + 1}"))
+            await edit(q, tt(language, f"api_docs_{n}", url=esc(API_BASE_URL or "https://YOUR-DOMAIN")),
+                       Markup([nav, [Btn(tt(language, "btn_docs_dl"), callback_data="api:dl")],
+                               [Btn(tt(language, "btn_api"), callback_data="api:home")]]))
+        elif arg == "dl":
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "API_DOCS.md")
+            with open(path, "r", encoding="utf-8") as fh:
+                body = fh.read().replace("https://YOUR-DOMAIN", API_BASE_URL or "https://YOUR-DOMAIN")
+            bio = io.BytesIO(body.encode("utf-8"))
+            bio.name = "API_DOCS.md"
+            await chat.send_document(bio, caption="📄 Reseller API docs")
         elif arg == "new":
             key = await asyncio.to_thread(reseller_api.create_for_user, uid, q.from_user.full_name)
             if not key:   # already has an account
@@ -1488,6 +1516,96 @@ async def reopen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ {order_id} reopened for 15 minutes. The bot will verify the payment automatically."
     )
 
+
+# ---------------------------------------------------------------- backup / restore (owner only)
+def _make_backup_file() -> str:
+    import sqlite3, tempfile
+    tmp = os.path.join(tempfile.gettempdir(), "shop_backup.db")
+    if os.path.exists(tmp):
+        os.remove(tmp)
+    src = sqlite3.connect(DB_PATH)
+    dst = sqlite3.connect(tmp)
+    with dst:
+        src.backup(dst)
+    dst.close(); src.close()
+    return tmp
+
+
+async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner only: /backup - send a safe copy of the database to this chat."""
+    if not is_owner(update.effective_user.id):
+        return
+    try:
+        path = await asyncio.to_thread(_make_backup_file)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
+        with open(path, "rb") as fh:
+            await update.message.reply_document(fh, filename=f"shop_{stamp}.db",
+                                                caption="✅ Backup. Keep this file safe (it contains user data and API key hashes).")
+    except Exception as e:
+        log.exception("backup failed")
+        await update.message.reply_text(f"Backup failed: {str(e)[:300]}")
+
+
+async def backup_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        path = await asyncio.to_thread(_make_backup_file)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
+        with open(path, "rb") as fh:
+            await context.bot.send_document(OWNER_ID, fh, filename=f"shop_{stamp}.db", caption="🗂 Daily backup")
+    except Exception:
+        log.exception("daily backup failed")
+
+
+async def restore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner only: /restore - then send the backup .db file."""
+    if not is_owner(update.effective_user.id):
+        return
+    context.bot_data["await_restore"] = True
+    await update.message.reply_text("♻️ Restore mode ON.\nNow send your backup file (.db) as a document.\n"
+                                    "⚠️ It will REPLACE the current database. A copy of the current one is kept as .pre_restore.\n"
+                                    "Send /cancelrestore to cancel.")
+
+
+async def cancel_restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        return
+    context.bot_data.pop("await_restore", None)
+    await update.message.reply_text("Restore cancelled.")
+
+
+async def restore_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    import sqlite3, shutil, tempfile
+    if not is_owner(update.effective_user.id) or not context.bot_data.get("await_restore"):
+        return
+    doc = update.message.document
+    tmp = os.path.join(tempfile.gettempdir(), "restore_in.db")
+    try:
+        f = await context.bot.get_file(doc.file_id)
+        await f.download_to_drive(tmp)
+        chk = sqlite3.connect(tmp)
+        ok = chk.execute("PRAGMA integrity_check").fetchone()[0]
+        tables = {r[0] for r in chk.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        chk.close()
+        if ok != "ok" or not {"users", "products", "stock"} <= tables:
+            await update.message.reply_text("❌ This file is not a valid shop database. Nothing changed.")
+            return
+        d = os.path.dirname(os.path.abspath(DB_PATH))
+        os.makedirs(d, exist_ok=True)
+        if os.path.exists(DB_PATH):
+            shutil.copy2(DB_PATH, DB_PATH + ".pre_restore")
+        for ext in ("-wal", "-shm"):
+            if os.path.exists(DB_PATH + ext):
+                os.remove(DB_PATH + ext)
+        shutil.copy2(tmp, DB_PATH + ".new")
+        os.replace(DB_PATH + ".new", DB_PATH)
+        context.bot_data.pop("await_restore", None)
+        await update.message.reply_text("✅ Database restored. Restarting the bot now (if it does not come back in a minute, press Restart in Railway).")
+        await asyncio.sleep(1)
+        os._exit(1)   # non-zero exit so Railway restarts the service with the restored data
+    except Exception as e:
+        log.exception("restore failed")
+        await update.message.reply_text(f"❌ Restore failed: {str(e)[:300]}")
+
 async def apitest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Owner only: /apitest - check Binance Pay API and BSC RPC connectivity."""
     if not is_owner(update.effective_user.id):
@@ -1636,6 +1754,10 @@ def main():
     app.add_handler(CommandHandler("paymentcenter", paymentcenter))
     app.add_handler(CommandHandler("reopen", reopen))
     app.add_handler(CommandHandler("apitest", apitest))
+    app.add_handler(CommandHandler("backup", backup_cmd))
+    app.add_handler(CommandHandler("restore", restore_cmd))
+    app.add_handler(CommandHandler("cancelrestore", cancel_restore))
+    app.add_handler(MessageHandler(filters.Document.ALL, restore_doc))
     app.add_handler(CommandHandler("apiproducts", apiproducts))
     app.add_handler(CommandHandler("linkapi", linkapi))
     app.add_handler(CommandHandler("unlinkapi", unlinkapi))
@@ -1647,6 +1769,7 @@ def main():
     app.job_queue.run_repeating(expiry_job, interval=20, first=10)
     app.job_queue.run_repeating(outbox_job, interval=10, first=5)
     app.job_queue.run_repeating(provider_job, interval=120, first=15)
+    app.job_queue.run_repeating(backup_job, interval=86400, first=600)
     app.run_polling()
 
 if __name__ == "__main__":
