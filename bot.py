@@ -692,7 +692,14 @@ async def show_menu(update, context, key):
     elif key == "settings":
         text, markup = settings_view(uid, language)
     elif key == "api":
-        text, markup = api_view(uid, language)
+        try:
+            text, markup = api_view(uid, language)
+        except Exception as e:   # never stay silent: log it and tell the owner the real reason
+            log.exception("Reseller API menu failed for user %s", uid)
+            text = tt(language, "api_error")
+            if is_owner(uid):
+                text += "\n\nDebug (owner only): " + esc(f"{type(e).__name__}: {str(e)[:300]}")
+            markup = Markup([main_menu_row(language)])
     else:
         return
     await respond(update, text, markup)
