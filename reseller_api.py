@@ -273,20 +273,26 @@ def balance():
 
 @api.get("/api/v1/products")
 def products():
+    # Show live stock: local ready stock + linked upstream provider stock.
     c = connect()
     rows = c.execute("""SELECT p.id,p.name,p.description,p.category,p.kind,p.price,
-      (SELECT COUNT(*) FROM stock s WHERE s.product_id=p.id AND s.sold=0) AS stock
+      (SELECT COUNT(*) FROM stock s WHERE s.product_id=p.id AND s.sold=0) AS local_stock
       FROM products p WHERE p.active=1 ORDER BY p.id""").fetchall()
+    try:
+        provider_rows = c.execute("SELECT product_id, provider_stock FROM provider_map").fetchall()
+        provider_stock = {int(r["product_id"]): int(r["provider_stock"] or 0) for r in provider_rows}
+    except sqlite3.OperationalError:
+        provider_stock = {}
     c.close()
     discount = max(0.0, min(90.0, float(g.reseller.get("price_discount") or 0)))
     out = []
     for r in rows:
+        stock = int(r["local_stock"] or 0) + provider_stock.get(int(r["id"]), 0)
         unit = round(float(r["price"]) * (1 - discount / 100), 2)
         out.append({"id": r["id"], "name": r["name"], "description": r["description"],
                     "category": r["category"], "kind": r["kind"], "price": unit,
-                    "stock": int(r["stock"]), "available": bool(r["stock"] > 0)})
+                    "stock": stock, "available": bool(stock > 0)})
     return jsonify({"ok": True, "currency": "shop_balance_units", "products": out})
-
 
 @api.post("/api/v1/orders")
 def create_order():
@@ -300,6 +306,52 @@ def create_order():
         return _error(f"quantity_must_be_between_1_and_{MAX_QTY}", 400)
     customer_ref = str(body.get("customer_ref", ""))[:100] or None
     idem = request.headers.get("Idempotency-Key", "").strip()[:128] or str(body.get("idempotency_key", "")).strip()[:128] or None
+    # Return an existing idempotent order before doing any upstream purchase.
+    if idem:
+        check = connect()
+        prior = check.execute(
+            "SELECT * FROM api_reseller_orders WHERE reseller_id=? AND idempotency_key=?",
+            (g.reseller["id"], idem)
+        ).fetchone()
+        check.close()
+        if prior:
+            return jsonify({"ok": True, "order": _order_json(dict(prior)), "replayed": True})
+
+    # If a linked product needs more than the local stock, fetch the missing
+    # quantity from the configured upstream provider before fulfilling the API order.
+    try:
+        from provider import ShopDB, ENABLED as PROVIDER_ENABLED
+        if PROVIDER_ENABLED:
+            shop = ShopDB(DB_PATH)
+            link = shop._link(pid)
+            if link:
+                local = connect()
+                p_row = local.execute(
+                    "SELECT id,name,price,active,kind FROM products WHERE id=? AND active=1", (pid,)
+                ).fetchone()
+                local_count = local.execute(
+                    "SELECT COUNT(*) n FROM stock WHERE product_id=? AND sold=0", (pid,)
+                ).fetchone()["n"]
+                local.close()
+                if p_row and p_row["kind"] == "auto":
+                    need = max(0, qty - int(local_count or 0))
+                    if need:
+                        # Do not spend upstream funds if this reseller cannot pay.
+                        discount_check = max(0.0, min(90.0, float(g.reseller.get("price_discount") or 0)))
+                        unit_check = round(float(p_row["price"]) * (1 - discount_check / 100), 2)
+                        amount_check = round(unit_check * qty, 2)
+                        linked_user = g.reseller.get("user_id")
+                        available_check = wallet_balance(linked_user) if linked_user else float(g.reseller["balance"])
+                        if available_check + 1e-9 < amount_check:
+                            return jsonify({"ok": False, "error": "insufficient_balance",
+                                            "required": amount_check, "balance": round(available_check, 2)}), 402
+                        if need > int(link["provider_stock"] or 0):
+                            return _error("insufficient_stock", 409)
+                        shop._fetch_from_provider(p_row, link, need)
+    except Exception:
+        log.exception("Upstream provider fulfillment failed for reseller API order")
+        return _error("upstream_provider_unavailable", 502)
+
     c = connect()
     c.execute("BEGIN IMMEDIATE")
     if idem:
