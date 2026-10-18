@@ -194,6 +194,32 @@ class Database:
         FROM products p WHERE p.active=1 ORDER BY p.id""").fetchall()
         c.close(); return rows
 
+    # ---- stock management for the admin site
+    def stock_items(self, pid, limit=500):
+        """Unsold stock lines of a product (oldest first)."""
+        c=self.conn()
+        rows=c.execute("SELECT id,link FROM stock WHERE product_id=? AND sold=0 ORDER BY id LIMIT ?",(pid,limit)).fetchall()
+        c.close(); return rows
+
+    def add_stock_lines(self, pid, lines, added_by=0):
+        now=datetime.now(timezone.utc).isoformat()
+        c=self.conn()
+        for line in lines:
+            c.execute("INSERT INTO stock(product_id,link,added_by,added_at) VALUES(?,?,?,?)",(pid,line,added_by,now))
+        c.commit(); c.close(); return len(lines)
+
+    def delete_stock_item(self, pid, sid):
+        """Remove one UNSOLD stock line. Sold lines are never touched."""
+        c=self.conn()
+        cur=c.execute("DELETE FROM stock WHERE id=? AND product_id=? AND sold=0",(sid,pid))
+        c.commit(); c.close(); return cur.rowcount
+
+    def clear_stock(self, pid):
+        """Remove all UNSOLD stock lines of a product."""
+        c=self.conn()
+        cur=c.execute("DELETE FROM stock WHERE product_id=? AND sold=0",(pid,))
+        c.commit(); c.close(); return cur.rowcount
+
     def get_product(self,pid):
         c=self.conn(); r=c.execute("""SELECT p.id,p.name,p.price,p.description,p.delivery,p.warranty,p.category,p.old_price,p.kind,p.prompt,
         (SELECT COUNT(*) FROM stock s WHERE s.product_id=p.id AND s.sold=0) stock
@@ -520,6 +546,31 @@ class Database:
                   (key, str(value)))
         c.commit(); c.close()
 
+    def del_settings(self, keys):
+        c=self.conn()
+        for k in keys:
+            c.execute("DELETE FROM settings WHERE key=?", (k,))
+        c.commit(); c.close()
+
+    # ---- users page
+    def users_list(self, q="", sort="new", limit=50):
+        order={"new":"u.created_at DESC","spent":"COALESCE(u.spent,0) DESC","balance":"COALESCE(u.balance,0) DESC"}.get(sort,"u.created_at DESC")
+        q=(q or "").strip().lstrip("@")
+        sql=("SELECT u.*, (SELECT COUNT(*) FROM orders o WHERE o.user_id=u.user_id AND o.status='paid') n_orders FROM users u")
+        args=[]
+        if q.isdigit():
+            sql+=" WHERE u.user_id=?"; args.append(int(q))
+        elif q:
+            sql+=" WHERE u.username LIKE ?"; args.append("%"+q+"%")
+        c=self.conn()
+        rows=c.execute(sql+" ORDER BY "+order+" LIMIT ?", args+[limit]).fetchall()
+        c.close(); return rows
+
+    def user_totals(self):
+        c=self.conn()
+        r=c.execute("SELECT COUNT(*) n, COALESCE(SUM(balance),0) bal, COALESCE(SUM(spent),0) spent FROM users").fetchone()
+        c.close(); return r
+
     def referral_percent(self):
         return self.get_setting("referral_percent", DEFAULT_REFERRAL_PERCENT)
 
@@ -709,6 +760,33 @@ class Database:
             sql+=" WHERE t.status=?"; args=(status,)
         rows=c.execute(sql+" ORDER BY t.id DESC LIMIT ?", (*args, limit)).fetchall()
         c.close(); return rows
+
+    def tickets_overview(self, status="open", q="", limit=100):
+        """Ticket list for the admin site: last message, who wrote it, message count."""
+        last = "(SELECT {f} FROM ticket_msgs m WHERE m.ticket_id=t.id ORDER BY m.id DESC LIMIT 1)"
+        sql=("SELECT t.*, u.username, "+last.format(f="text")+" last_text, "+last.format(f="sender")+" last_sender, "
+             +last.format(f="created_at")+" last_at, "
+             "(SELECT COUNT(*) FROM ticket_msgs m WHERE m.ticket_id=t.id) n_msgs, "
+             "(SELECT COUNT(*) FROM ticket_msgs m WHERE m.ticket_id=t.id AND m.photo_id IS NOT NULL) n_photos "
+             "FROM tickets t LEFT JOIN users u ON u.user_id=t.user_id WHERE 1=1")
+        args=[]
+        if status in ("open","closed"):
+            sql+=" AND t.status=?"; args.append(status)
+        q=(q or "").strip().lstrip("@").lstrip("#")
+        if q.isdigit():
+            sql+=" AND (t.id=? OR t.user_id=?)"; args+= [int(q), int(q)]
+        elif q:
+            sql+=" AND u.username LIKE ?"; args.append("%"+q+"%")
+        c=self.conn()
+        rows=c.execute(sql+" ORDER BY (last_sender='user' AND t.status='open') DESC, last_at DESC LIMIT ?", args+[limit]).fetchall()
+        c.close(); return rows
+
+    def ticket_counts(self):
+        c=self.conn()
+        r=c.execute("""SELECT COALESCE(SUM(status='open'),0) open_n, COALESCE(SUM(status='closed'),0) closed_n, COUNT(*) all_n FROM tickets""").fetchone()
+        waiting=c.execute("""SELECT COUNT(*) n FROM tickets t WHERE t.status='open' AND
+            (SELECT sender FROM ticket_msgs m WHERE m.ticket_id=t.id ORDER BY m.id DESC LIMIT 1)='user'""").fetchone()["n"]
+        c.close(); return dict(open=r["open_n"], closed=r["closed_n"], all=r["all_n"], waiting=waiting)
 
     def set_ticket_status(self, tid, status):
         c=self.conn(); c.execute("UPDATE tickets SET status=? WHERE id=?", (status, tid)); c.commit(); c.close()

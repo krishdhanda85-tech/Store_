@@ -48,9 +48,11 @@ TEMPLATES = {
 <title>{{ shop }} Admin</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<script>try{var t=localStorage.getItem("theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
 <style>
 :root{--bg:#f2f4f7;--surface:#fff;--ink:#121b26;--muted:#667085;--line:#e3e7ee;--line2:#cfd6e0;--field:#fff;--accent:#0b7a75;--accent2:#096560;--accent-soft:#e3f3f1;--link:#0b6b67;--paid:#12805c;--pend:#a86a0a;--fail:#c0352b;--errbg:#fdeceb;--grey:#e7ebf1;--greyink:#223042;--side:#0f1a24;--sidetxt:#a9b6c6;--sideon:#ffffff14;--bar:#bfe3df;--shadow:0 1px 2px #10203010,0 4px 14px #10203008}
-@media(prefers-color-scheme:dark){:root{--bg:#0b121a;--surface:#131d28;--ink:#e8eef5;--muted:#8b99ab;--line:#213040;--line2:#2c3e52;--field:#0d1620;--accent:#12968c;--accent2:#0f8077;--accent-soft:#12312f;--link:#5fd6cb;--paid:#3ccf91;--pend:#f0b84a;--fail:#ff7b72;--errbg:#3a1d1f;--grey:#223245;--greyink:#dbe5f0;--side:#0a1119;--bar:#1d4a46;--shadow:none}}
+@media(prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#0b121a;--surface:#131d28;--ink:#e8eef5;--muted:#8b99ab;--line:#213040;--line2:#2c3e52;--field:#0d1620;--accent:#12968c;--accent2:#0f8077;--accent-soft:#12312f;--link:#5fd6cb;--paid:#3ccf91;--pend:#f0b84a;--fail:#ff7b72;--errbg:#3a1d1f;--grey:#223245;--greyink:#dbe5f0;--side:#0a1119;--bar:#1d4a46;--shadow:none}}
+:root[data-theme=dark]{--bg:#0b121a;--surface:#131d28;--ink:#e8eef5;--muted:#8b99ab;--line:#213040;--line2:#2c3e52;--field:#0d1620;--accent:#12968c;--accent2:#0f8077;--accent-soft:#12312f;--link:#5fd6cb;--paid:#3ccf91;--pend:#f0b84a;--fail:#ff7b72;--errbg:#3a1d1f;--grey:#223245;--greyink:#dbe5f0;--side:#0a1119;--bar:#1d4a46;--shadow:none}
 *{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
 body{margin:0;font-family:Manrope,ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:var(--bg);color:var(--ink);line-height:1.55;font-size:15px}
@@ -209,6 +211,8 @@ h2{font-size:22px}
 {% with m = get_flashed_messages(with_categories=true) %}
 {% for cat, text in m %}<div class="msg {{ 'err' if cat == 'err' else '' }}">{{ text }}</div>{% endfor %}
 {% endwith %}
+{% if session.get('ok') and shop_closed %}<div class="msg err"><b>The shop is CLOSED.</b> Customers cannot use the bot.
+<form method="post" action="{{ url_for('shop_toggle') }}" style="margin:8px 0 0"><input type="hidden" name="state" value="open"><input type="hidden" name="back" value="{{ request.path }}"><button type="submit" class="green sm">Open the shop</button></form></div>{% endif %}
 {% block body %}{% endblock %}
 </main></div></body></html>""",
     "login.html": """{% extends 'base.html' %}{% block body %}
@@ -224,7 +228,7 @@ h2{font-size:22px}
     "dashboard.html": """{% extends 'base.html' %}{% block body %}
 <div class="page-head"><h2>Dashboard</h2>
 <div class="seg">{% for k, lbl in ranges %}<a href="{{ url_for('dashboard', range=k) }}" class="{{ 'on' if k == rng }}">{{ lbl }}</a>{% endfor %}</div></div>
-{% if d.nocost %}<div class="msg">{{ d.nocost }} sale{{ '' if d.nocost == 1 else 's' }} in this period {{ 'has' if d.nocost == 1 else 'have' }} no cost price, so the full amount is counted as profit. <a href="{{ url_for('products') }}">Add cost prices</a> to see the real profit.</div>{% endif %}
+{% if d.nocost %}<div class="msg">{{ d.nocost }} sale{{ '' if d.nocost == 1 else 's' }} in this period {{ 'has' if d.nocost == 1 else 'have' }} no cost price, so the full sale amount is counted as profit (this is why profit looks too high). <a href="{{ url_for('products') }}">Set the cost price</a> on the product and the real profit shows up, old sales included.</div>{% endif %}
 <div class="lead2">
 <div><small>Revenue (USDT)</small><div class="big">{{ '%.2f'|format(d.rev) }}</div><div class="sub">{{ d.n }} paid order{{ '' if d.n == 1 else 's' }}, {{ d.units }} item{{ '' if d.units == 1 else 's' }} sold</div></div>
 <div><small>Profit (USDT)</small><div class="big {{ 'profit' if d.profit >= 0 else 'loss' }}">{{ '%.2f'|format(d.profit) }}</div><div class="sub">{{ '%.1f'|format(d.margin) }}% margin{% if d.net is not none %}, {{ '%.2f'|format(d.net) }} after referral payouts{% endif %}</div></div>
@@ -315,68 +319,201 @@ h2{font-size:22px}
 <input name="price" type="number" step="0.01" min="0" placeholder="Price (USDT)" required>
 <button type="submit">Save</button></form></div>{% endblock %}""",
     "products.html": """{% extends 'base.html' %}{% block body %}
-<h2>Products</h2>
-{% for p in products %}
-<div class="card">
-<b>#{{ p.id }} · {{ p.name }}</b>
-<span class="muted"> · {{ 'Made to order' if p.kind == 'manual' else ('Stock: ' ~ p.stock) }}{% set uc = p.cost if p.cost is not none else p.api_cost %}{% if uc is number %} · Profit ${{ '%.2f'|format(p.price - uc) }} per item{% endif %}</span>
-<form method="post" action="{{ url_for('edit_product', pid=p.id) }}">
-<label>Name</label><input name="name" value="{{ p.name }}" required>
+<style>
+[hidden]{display:none!important}
+.pbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
+.pbar input{margin:0;flex:1;min-width:160px}
+.sumline{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+.sumline span{background:var(--surface);border:1px solid var(--line);border-radius:99px;padding:5px 12px;font-size:13px;font-weight:700;color:var(--muted)}
+.sumline span.w{color:var(--pend);border-color:var(--pend)}
+.sumline span.b{color:var(--fail);border-color:var(--fail)}
+.prod{background:var(--surface);border:1px solid var(--line);border-radius:14px;margin-bottom:10px;box-shadow:var(--shadow)}
+.prod>summary{list-style:none;cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:12px;padding:14px 16px;flex-wrap:wrap}
+.prod>summary::-webkit-details-marker{display:none}
+.prod[open]>summary{border-bottom:1px solid var(--line)}
+.pn{min-width:0;flex:1 1 200px}
+.pn b{display:block;font-size:15.5px;overflow-wrap:anywhere}
+.pn small{color:var(--muted);font-size:12.5px}
+.pm{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.pill{border-radius:99px;padding:3px 10px;font-size:12.5px;font-weight:700;background:var(--grey);color:var(--greyink)}
+.pill.ok{background:var(--accent-soft);color:var(--paid)}
+.pill.low{background:#f0b84a33;color:var(--pend)}
+.pill.out{background:var(--errbg);color:var(--fail)}
+.pr{font-weight:800;font-variant-numeric:tabular-nums}
+.pf{font-weight:800;font-size:13px;border-radius:8px;padding:3px 9px}
+.pf.good{background:var(--accent-soft);color:var(--paid)}
+.pf.bad{background:var(--errbg);color:var(--fail)}
+.pf.warn{background:#f0b84a33;color:var(--pend)}
+.pbody{padding:6px 16px 16px}
+.sec{margin-top:16px;padding-top:14px;border-top:1px dashed var(--line2)}
+.sec:first-child{margin-top:8px;padding-top:0;border-top:0}
+.sec h4{margin:0 0 4px;font-size:14px;font-weight:800}
+.profit{margin:10px 0 4px;padding:10px 12px;border-radius:10px;background:var(--grey);color:var(--greyink);font-weight:800;font-size:14px}
+.profit.good{background:var(--accent-soft);color:var(--paid)}
+.profit.bad{background:var(--errbg);color:var(--fail)}
+.chips{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:6px 0 2px}
+.chips small{color:var(--muted);font-weight:600;font-size:12.5px}
+.chip{width:auto;margin:0;padding:5px 11px;font-size:13px;border-radius:99px;background:var(--grey);border-color:var(--grey);color:var(--greyink)}
+.chip:hover{background:var(--line2);border-color:var(--line2)}
+.seg2{display:flex;gap:8px;margin:6px 0}
+.seg2 label{flex:1;margin:0;display:flex;align-items:center;gap:8px;padding:10px 12px;border:1px solid var(--line2);border-radius:10px;cursor:pointer;color:var(--ink);font-size:14px}
+.seg2 input{width:auto;margin:0}
+.sub{margin-top:12px;border:1px solid var(--line);border-radius:10px;background:var(--bg)}
+.sub>summary{cursor:pointer;padding:10px 12px;font-weight:700;font-size:13.5px;color:var(--muted)}
+.sub>div{padding:0 12px 12px}
+.srow{display:flex;gap:8px;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);padding:6px 0}
+.srow .mono{font-size:12.5px;min-width:0;flex:1}
+.srow form{margin:0}
+.srow button{margin:0}
+.note{background:#f0b84a22;border:1px solid #f0b84a77;border-radius:10px;padding:10px 12px;margin-bottom:14px;font-size:14px}
+</style>
+{% set ns = namespace(out=0, nc=0) %}
+{% for p in products %}{% set u0 = p.cost if p.cost is not none else p.api_cost %}{% if u0 is not number %}{% set ns.nc = ns.nc + 1 %}{% endif %}{% if p.kind != 'manual' and p.stock == 0 %}{% set ns.out = ns.out + 1 %}{% endif %}{% endfor %}
+{% set cats = products|map(attribute='category')|select|unique|list %}
+<datalist id="cats">{% for c in cats %}<option value="{{ c }}">{% endfor %}</datalist>
+
+<div class="page-head"><h2>Products</h2>
+<button class="sm" type="button" onclick="var b=document.getElementById('addbox');b.hidden=!b.hidden;if(!b.hidden){b.scrollIntoView({behavior:'smooth'});}">+ Add product</button></div>
+
+<div class="sumline"><span>{{ products|length }} products</span>
+{% if ns.out %}<span class="b">{{ ns.out }} out of stock</span>{% endif %}
+{% if ns.nc %}<span class="w">{{ ns.nc }} without cost</span>{% endif %}</div>
+
+{% if ns.nc %}<div class="note"><b>{{ ns.nc }} product{{ '' if ns.nc == 1 else 's' }} without a cost price.</b> Their sales are counted as 100% profit on the dashboard. Open the product marked <b>Set cost</b> and enter what you paid.</div>{% endif %}
+
+<div class="card" id="addbox" {% if products %}hidden{% endif %}>
+<h3>Add new product</h3>
+<form method="post" action="{{ url_for('create_product') }}" data-pf oninput="calc(this)">
+<label>Product name</label>
+<input name="name" placeholder="e.g. Netflix 1 month" required>
 <div class="two">
-<div><label>Price (USDT)</label><input name="price" type="number" step="0.01" min="0" value="{{ p.price }}" required></div>
-<div><label>Old price (optional - shows a % discount)</label><input name="old_price" type="number" step="0.01" min="0" value="{{ p.old_price or '' }}"></div>
+<div><label>Cost - what you paid (USDT)</label><input name="cost" type="number" step="0.01" min="0" inputmode="decimal" placeholder="0.90" required></div>
+<div><label>Selling price (USDT)</label><input name="price" type="number" step="0.01" min="0" inputmode="decimal" placeholder="1.10" required></div>
 </div>
-<label>Cost price (USDT) <span class="hint">what one item costs you; used for the profit on the dashboard. Linked API products use the provider cost when this is empty.</span></label>
-<input name="cost" type="number" step="0.01" min="0" value="{{ p.cost if p.cost is not none else '' }}" placeholder="e.g. 1.20">
-<label>Category (same category = grouped under one blue button; empty = listed directly)</label>
-<input name="category" value="{{ p.category or '' }}">
+<div class="chips"><small>Profit:</small>{% for x in ['0.10','0.20','0.50','1.00'] %}<button type="button" class="chip" data-add="{{ x }}" onclick="chip(this)">+{{ x }}</button>{% endfor %}</div>
+<div class="profit">Profit per item: enter cost and price</div>
+<label>Type</label>
+<div class="seg2">
+<label><input type="radio" name="kind" value="auto" checked onchange="document.getElementById('newstock').hidden=false"> Auto delivery</label>
+<label><input type="radio" name="kind" value="manual" onchange="document.getElementById('newstock').hidden=true"> Made to order</label>
+</div>
+<div id="newstock"><label>Stock - one item per line (login / key / link) <span class="hint">optional now, you can add later</span></label>
+<textarea name="links" rows="5" placeholder="email:password&#10;email:password"></textarea></div>
+<label>Category <span class="hint">optional, same category = one button group in the bot</span></label>
+<input name="category" list="cats" placeholder="e.g. Streaming">
+<button type="submit">Add product</button>
+</form></div>
+
+{% if products|length > 6 %}<div class="pbar"><input type="search" placeholder="Search products..." oninput="filt(this.value)"></div>{% endif %}
+
+{% for p in products %}
+{% set u = p.cost if p.cost is not none else p.api_cost %}
+{% set its = items.get(p.id, []) %}
+<details class="prod" id="p{{ p.id }}" data-name="{{ (p.name ~ ' ' ~ (p.category or ''))|lower }}" {% if open_id == p.id %}open{% endif %}>
+<summary>
+<div class="pn"><b>{{ p.name }}</b><small>{{ p.category or 'No category' }} · {{ 'Made to order' if p.kind == 'manual' else 'Auto delivery' }}</small></div>
+<div class="pm">
+{% if p.kind != 'manual' %}<span class="pill {{ 'out' if p.stock == 0 else ('low' if p.stock <= 3 else 'ok') }}">{{ 'Out of stock' if p.stock == 0 else (p.stock ~ ' in stock') }}</span>{% endif %}
+<span class="pr">${{ '%.2f'|format(p.price) }}</span>
+{% if u is number %}<span class="pf {{ 'good' if p.price - u > 0 else 'bad' }}">{{ '+' if p.price - u >= 0 else '-' }}${{ '%.2f'|format((p.price - u)|abs) }}</span>{% else %}<span class="pf warn">Set cost</span>{% endif %}
+</div>
+</summary>
+<div class="pbody">
+
+<div class="sec">
+<h4>Price and cost</h4>
+<form method="post" action="{{ url_for('quick_product', pid=p.id) }}" data-pf oninput="calc(this)">
+<div class="two">
+<div><label>Cost - what you paid (USDT)</label><input name="cost" type="number" step="0.01" min="0" inputmode="decimal" value="{{ p.cost if p.cost is not none else '' }}" placeholder="{{ ('%.2f' % p.api_cost) if p.api_key else '0.90' }}" {{ '' if p.api_key else 'required' }}></div>
+<div><label>Selling price (USDT)</label><input name="price" type="number" step="0.01" min="0" inputmode="decimal" value="{{ p.price }}" required></div>
+</div>
+<div class="chips"><small>Profit:</small>{% for x in ['0.10','0.20','0.50','1.00'] %}<button type="button" class="chip" data-add="{{ x }}" onclick="chip(this)">+{{ x }}</button>{% endfor %}</div>
+<div class="profit">Profit per item</div>
+<button type="submit">Save price</button>
+</form>
+</div>
+
+{% if p.kind != 'manual' %}
+<div class="sec">
+<h4>Add stock</h4>
+<form method="post" action="{{ url_for('stock_add', pid=p.id) }}">
+<textarea name="links" rows="4" placeholder="One item per line (login / key / link)" required></textarea>
+<button type="submit">Add stock</button>
+</form>
+{% if its %}
+<details class="sub"><summary>View or remove stock ({{ p.stock if not p.api_key else (p.stock - p.api_stock) }} own items)</summary><div>
+{% for it in its %}<div class="srow"><span class="mono">{{ it.link[:70] }}{{ '…' if it.link|length > 70 }}</span>
+<form method="post" action="{{ url_for('stock_delete', pid=p.id, sid=it.id) }}"><button class="red sm" type="submit">Remove</button></form></div>{% endfor %}
+<form method="post" action="{{ url_for('stock_clear', pid=p.id) }}" onsubmit="return confirm('Remove ALL unsold stock of this product? Sold items stay in order history.')" style="margin-top:12px">
+<button class="red" type="submit">Remove all unsold stock</button></form>
+</div></details>
+{% endif %}
+</div>
+{% endif %}
+
+<details class="sub"><summary>More settings (name, category, description, delivery...)</summary><div>
+<form method="post" action="{{ url_for('edit_product', pid=p.id) }}">
+<input type="hidden" name="price" value="{{ p.price }}"><input type="hidden" name="cost" value="{{ p.cost if p.cost is not none else '' }}">
+<label>Name</label><input name="name" value="{{ p.name }}" required>
+<label>Old price <span class="hint">optional, shows a % discount in the bot</span></label>
+<input name="old_price" type="number" step="0.01" min="0" value="{{ p.old_price or '' }}">
+<label>Category <span class="hint">same category = grouped under one button, empty = listed directly</span></label>
+<input name="category" list="cats" value="{{ p.category or '' }}">
 <label>Type</label>
 <select name="kind">
 <option value="auto" {{ 'selected' if p.kind != 'manual' }}>Automatic delivery (from stock)</option>
 <option value="manual" {{ 'selected' if p.kind == 'manual' }}>Made to order (customer sends an email, you deliver by hand)</option>
 </select>
-<label>Delivery time (shown to the customer, e.g. by hand - within 24 hours)</label>
+<label>Delivery time <span class="hint">shown to the customer</span></label>
 <input name="delivery" value="{{ p.delivery or '' }}">
-<label>Warranty (e.g. 90 days - empty shows None)</label>
+<label>Warranty <span class="hint">e.g. 90 days, empty shows None</span></label>
 <input name="warranty" value="{{ p.warranty or '' }}">
-<label>Question asked before buying (made-to-order only)</label>
+<label>Question asked before buying <span class="hint">made-to-order only</span></label>
 <input name="prompt" value="{{ p.prompt or '' }}" placeholder="Send an email that you haven't linked to Spotify before.">
-<label>Description (one point per line)</label>
+<label>Description <span class="hint">one point per line</span></label>
 <textarea name="description" rows="4">{{ p.description or '' }}</textarea>
-<button type="submit">Save product</button>
+<button type="submit">Save changes</button>
 </form>
 {% if api_enabled and p.kind != 'manual' %}
-<form method="post" action="{{ url_for('api_link', pid=p.id) }}">
-<label>Provider API link {% if p.api_key %}<span class="muted">· cost ${{ '%.2f' % p.api_cost }} · provider stock {{ p.api_stock }} · your profit ${{ '%.2f' % (p.price - p.api_cost) }}/item</span>{% endif %}</label>
+<form method="post" action="{{ url_for('api_link', pid=p.id) }}" style="margin-top:14px">
+<label>Provider API link {% if p.api_key %}<span class="muted">· cost ${{ '%.2f' % p.api_cost }} · provider stock {{ p.api_stock }} · profit ${{ '%.2f' % (p.price - p.api_cost) }}/item</span>{% endif %}</label>
 <select name="provider_key">
 <option value="">- not linked (own stock only) -</option>
 {% for a in api_items %}<option value="{{ a.key }}" {{ 'selected' if p.api_key == a.key }}>{{ a.name }} · cost ${{ a.price_usdt_from }} · stock {{ a.stock }}</option>{% endfor %}
 </select>
 <button type="submit">Save API link</button></form>
 {% endif %}
-<form method="post" action="{{ url_for('delete_product', pid=p.id) }}" onsubmit="return confirm('Delete this product? It disappears from the shop. Old orders keep their history.')">
-<button class="red" type="submit">Delete product</button></form></div>
-{% else %}<div class="card">No products yet. Add one below.</div>{% endfor %}
+</div></details>
 
-<div class="card"><h3>Add product</h3>
-<form method="post" action="{{ url_for('add_product') }}">
-<input name="name" placeholder="Product name" required>
-<input name="price" type="number" step="0.01" min="0" placeholder="Price (USDT)" required>
-<select name="kind">
-<option value="auto">Automatic delivery (add stock below)</option>
-<option value="manual">Made to order (you deliver by hand)</option>
-</select>
-<button type="submit">Add product</button></form></div>
+<form method="post" action="{{ url_for('delete_product', pid=p.id) }}" onsubmit="return confirm('Delete this product? It disappears from the shop. Old orders keep their history.')" style="margin-top:14px">
+<button class="red" type="submit">Delete product</button></form>
+</div>
+</details>
+{% else %}<div class="card">No products yet. Use the form above to add your first one.</div>{% endfor %}
 
-<div class="card"><h3>Add stock</h3>
-<p class="muted">One item per line (link / code / key). Each line becomes one stock item.
-If the product name already exists, items are added to it.</p>
-<form method="post" action="{{ url_for('add_stock') }}">
-<input name="name" placeholder="Product name" required>
-<input name="price" type="number" step="0.01" min="0" placeholder="Price (USDT)" required>
-<textarea name="links" rows="6" placeholder="One item per line" required></textarea>
-<button type="submit">Add stock</button>
-</form></div>{% endblock %}""",
+<script>
+function calc(f){
+  var o=f.querySelector('.profit');if(!o)return;
+  var c=parseFloat(f.cost.value),p=parseFloat(f.price.value);
+  if(isNaN(p)){o.textContent='Profit per item: enter the price';o.className='profit';return;}
+  if(isNaN(c)){o.textContent='Profit per item: enter the cost to see it';o.className='profit';return;}
+  var d=p-c,m=p>0?Math.round(d/p*100):0;
+  o.textContent='Profit per item: '+(d<0?'-':'')+'$'+Math.abs(d).toFixed(2)+' ('+m+'% margin)';
+  o.className='profit '+(d>0?'good':(d<0?'bad':''));
+}
+function chip(b){
+  var f=b.form,c=parseFloat(f.cost.value);
+  if(isNaN(c)){f.cost.focus();return;}
+  f.price.value=(c+parseFloat(b.dataset.add)).toFixed(2);calc(f);
+}
+function filt(q){
+  q=q.toLowerCase();
+  document.querySelectorAll('details.prod').forEach(function(d){d.hidden=q&&d.dataset.name.indexOf(q)<0;});
+}
+document.querySelectorAll('form[data-pf]').forEach(calc);
+if(location.hash){var t=document.querySelector(location.hash);if(t&&t.tagName==='DETAILS'){t.open=true;t.scrollIntoView();}}
+</script>
+{% endblock %}""",
     "manual.html": """{% extends 'base.html' %}{% block body %}
 <h2>Pending orders</h2>
 <p class="muted">Made-to-order items to deliver by hand. Marking an order done (or refunding it) tells the customer in the bot - once.</p>
@@ -397,50 +534,224 @@ If the product name already exists, items are added to it.</p>
 </div></form></div>
 {% else %}<div class="card">Nothing to deliver right now.</div>{% endfor %}{% endblock %}""",
     "users.html": """{% extends 'base.html' %}{% block body %}
-<h2>Users</h2>
-<div class="card"><form method="get"><div class="inline">
-<input name="q" value="{{ q }}" placeholder="Telegram ID or username (empty = newest)">
-<button type="submit">Search</button></div></form></div>
+<style>
+[hidden]{display:none!important}
+.pbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
+.pbar input{margin:0;flex:1;min-width:160px}
+.pbar select{width:auto;margin:0}
+.sumline{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+.sumline span{background:var(--surface);border:1px solid var(--line);border-radius:99px;padding:5px 12px;font-size:13px;font-weight:700;color:var(--muted)}
+.prod{background:var(--surface);border:1px solid var(--line);border-radius:14px;margin-bottom:10px;box-shadow:var(--shadow)}
+.prod>summary{list-style:none;cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:12px;padding:14px 16px;flex-wrap:wrap}
+.prod>summary::-webkit-details-marker{display:none}
+.prod[open]>summary{border-bottom:1px solid var(--line)}
+.pn{min-width:0;flex:1 1 200px}
+.pn b{display:block;font-size:15.5px;overflow-wrap:anywhere}
+.pn small{color:var(--muted);font-size:12.5px}
+.pm{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.pill{border-radius:99px;padding:3px 10px;font-size:12.5px;font-weight:700;background:var(--grey);color:var(--greyink)}
+.pill.ok{background:var(--accent-soft);color:var(--paid)}
+.pill.zero{background:var(--grey);color:var(--muted)}
+.pr{font-weight:800;font-size:13px;color:var(--muted);font-variant-numeric:tabular-nums}
+.pbody{padding:6px 16px 16px}
+.facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin:10px 0 4px}
+.facts div{background:var(--bg);border-radius:10px;padding:9px 12px}
+.facts small{display:block;color:var(--muted);font-weight:600;font-size:12px}
+.facts b{font-size:16px;font-variant-numeric:tabular-nums}
+.sec{margin-top:14px;padding-top:12px;border-top:1px dashed var(--line2)}
+.sec h4{margin:0 0 4px;font-size:14px;font-weight:800}
+.chips{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:6px 0 2px}
+.chip{width:auto;margin:0;padding:5px 11px;font-size:13px;border-radius:99px;background:var(--grey);border-color:var(--grey);color:var(--greyink)}
+.chip:hover{background:var(--line2);border-color:var(--line2)}
+.btns{display:flex;gap:8px}.btns button{flex:1}
+</style>
+<div class="page-head"><h2>Users</h2></div>
+<div class="sumline"><span>{{ tot.n }} users</span><span>Wallets hold ${{ '%.2f'|format(tot.bal or 0) }}</span><span>Total spent ${{ '%.2f'|format(tot.spent or 0) }}</span></div>
+<form method="get" class="pbar">
+<input name="q" value="{{ q }}" placeholder="Search @username or Telegram ID" type="search">
+<select name="sort" onchange="this.form.submit()">
+{% for k, lbl in [('new','Newest'),('spent','Top spenders'),('balance','Highest balance')] %}<option value="{{ k }}" {{ 'selected' if sort == k }}>{{ lbl }}</option>{% endfor %}
+</select>
+<button type="submit" class="sm">Search</button>
+</form>
 {% for u in rows %}
-<div class="card">
-<b>{{ ('@' ~ u.username) if u.username else 'No username' }}</b> <span class="muted">· ID {{ u.user_id }} · joined {{ (u.created_at or '')[:10] }}</span><br>
-<span class="muted">Balance ${{ '%.2f'|format(u.balance or 0) }} · Spent ${{ '%.2f'|format(u.spent or 0) }} · Referral earned ${{ '%.2f'|format(u.ref_earned or 0) }}</span>
+<details class="prod" {% if rows|length == 1 %}open{% endif %}>
+<summary>
+<div class="pn"><b>{{ ('@' ~ u.username) if u.username else 'No username' }}</b><small>ID {{ u.user_id }} · joined {{ (u.created_at or '')[:10] }}</small></div>
+<div class="pm"><span class="pill {{ 'ok' if (u.balance or 0) > 0 else 'zero' }}">Balance ${{ '%.2f'|format(u.balance or 0) }}</span><span class="pr">Spent ${{ '%.2f'|format(u.spent or 0) }}</span></div>
+</summary>
+<div class="pbody">
+<div class="facts">
+<div><small>Balance</small><b>${{ '%.2f'|format(u.balance or 0) }}</b></div>
+<div><small>Total spent</small><b>${{ '%.2f'|format(u.spent or 0) }}</b></div>
+<div><small>Paid orders</small><b>{{ u.n_orders }}</b></div>
+<div><small>Referral earned</small><b>${{ '%.2f'|format(u.ref_earned or 0) }}</b></div>
+</div>
+<div class="sec">
+<h4>Add or remove wallet money</h4>
 <form method="post" action="{{ url_for('topup', uid=u.user_id) }}">
-<div class="two"><input name="amount" type="number" step="0.01" placeholder="Amount (negative removes)" required>
-<input name="note" placeholder="Note to the customer (optional)"></div>
-<button type="submit">Change wallet balance</button></form></div>
-{% else %}<div class="card">No users found.</div>{% endfor %}{% endblock %}""",
+<input name="amount" type="number" step="0.01" min="0.01" inputmode="decimal" placeholder="Amount (USDT)" required>
+<div class="chips">{% for x in ['1','5','10','20','50'] %}<button type="button" class="chip" onclick="this.form.amount.value='{{ x }}'">${{ x }}</button>{% endfor %}</div>
+<input name="note" placeholder="Note to the customer (optional)">
+<div class="btns"><button type="submit" name="dir" value="add" class="green">Add money</button>
+<button type="submit" name="dir" value="remove" class="red">Remove money</button></div>
+</form>
+</div>
+<div class="sec"><button type="button" class="chip" onclick="navigator.clipboard&&navigator.clipboard.writeText('{{ u.user_id }}');this.textContent='Copied'">Copy Telegram ID</button></div>
+</div>
+</details>
+{% else %}<div class="card">No users found.</div>{% endfor %}
+{% if rows|length >= 50 %}<p class="muted">Showing the first 50. Use search to find someone specific.</p>{% endif %}
+{% endblock %}""",
     "tickets.html": """{% extends 'base.html' %}{% block body %}
-<h2>Support tickets</h2>
-<div class="card"><div class="scroll"><table>
-<tr><th>#</th><th>User</th><th>Type</th><th>Status</th><th>Opened</th></tr>
-{% for t in rows %}<tr>
-<td><a href="{{ url_for('ticket', tid=t.id) }}">#{{ t.id }}</a></td>
-<td>{{ ('@' ~ t.username) if t.username else t.user_id }}</td><td>{{ t.kind }}</td>
-<td class="{{ 'pending' if t.status == 'open' else 'paid' }}">{{ t.status }}</td>
-<td>{{ (t.created_at or '')[:16].replace('T',' ') }}</td></tr>
-{% else %}<tr><td colspan="5">No tickets yet.</td></tr>{% endfor %}
-</table></div></div>{% endblock %}""",
+<style>
+.pbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
+.pbar input{margin:0;flex:1;min-width:160px}
+.tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}
+.tabs a{padding:7px 14px;border-radius:99px;font-size:13.5px;font-weight:700;color:var(--muted);background:var(--surface);border:1px solid var(--line);text-decoration:none}
+.tabs a.on{background:var(--side);border-color:var(--side);color:#fff}
+.tabs a b{margin-left:5px;font-variant-numeric:tabular-nums}
+.tk{display:block;background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:14px 16px;margin-bottom:10px;box-shadow:var(--shadow);color:var(--ink);text-decoration:none}
+.tk:hover{border-color:var(--accent);text-decoration:none}
+.tk.wait{border-left:4px solid var(--pend)}
+.tk .top{display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap}
+.tk .who{font-weight:800;overflow-wrap:anywhere}
+.tk .who span{color:var(--muted);font-weight:600;font-size:12.5px;margin-left:6px}
+.tk .prev{color:var(--muted);font-size:14px;margin-top:6px;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow-wrap:anywhere}
+.tk .meta{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;align-items:center}
+.pill{border-radius:99px;padding:3px 10px;font-size:12px;font-weight:700;background:var(--grey);color:var(--greyink)}
+.pill.wait{background:#f0b84a33;color:var(--pend)}
+.pill.ok{background:var(--accent-soft);color:var(--paid)}
+.pill.done{background:var(--grey);color:var(--muted)}
+</style>
+<div class="page-head"><h2>Support</h2></div>
+<div class="tabs">
+{% for k, lbl, n in [('open','Open',cnt.open),('closed','Closed',cnt.closed),('all','All',cnt.all)] %}<a href="{{ url_for('tickets', status=k) }}" class="{{ 'on' if st == k }}">{{ lbl }}<b>{{ n }}</b></a>{% endfor %}
+</div>
+{% if cnt.waiting %}<div class="msg"><b>{{ cnt.waiting }}</b> customer{{ ' is' if cnt.waiting == 1 else 's are' }} waiting for your reply. They are listed first.</div>{% endif %}
+<form method="get" class="pbar"><input type="hidden" name="status" value="{{ st }}">
+<input name="q" value="{{ q }}" type="search" placeholder="Search @username, Telegram ID or ticket number">
+<button type="submit" class="sm">Search</button></form>
+{% for t in rows %}
+<a class="tk {{ 'wait' if t.status == 'open' and t.last_sender == 'user' }}" href="{{ url_for('ticket', tid=t.id) }}">
+<div class="top"><div class="who">{{ ('@' ~ t.username) if t.username else t.user_id }}<span>#{{ t.id }} · {{ t.kind or 'Question' }}</span></div>
+<span class="muted">{{ (t.last_at or t.created_at or '')[5:16].replace('T',' ') }}</span></div>
+<div class="prev">{{ 'You: ' if t.last_sender == 'admin' else '' }}{{ t.last_text or ('Photo' if t.n_photos else '') }}</div>
+<div class="meta">
+{% if t.status == 'closed' %}<span class="pill done">Closed</span>{% elif t.last_sender == 'user' %}<span class="pill wait">Needs reply</span>{% else %}<span class="pill ok">You replied</span>{% endif %}
+<span class="pill">{{ t.n_msgs }} message{{ '' if t.n_msgs == 1 else 's' }}</span>
+{% if t.n_photos %}<span class="pill">{{ t.n_photos }} photo{{ '' if t.n_photos == 1 else 's' }}</span>{% endif %}
+</div></a>
+{% else %}<div class="card">{{ 'No tickets found.' if q else 'No tickets here. All caught up!' }}</div>{% endfor %}
+{% endblock %}""",
     "ticket.html": """{% extends 'base.html' %}{% block body %}
-<h2>Ticket #{{ t.id }} <span class="muted">· {{ t.kind }} · {{ t.status }}</span></h2>
-<p class="muted">Customer: {{ ('@' ~ t.username) if t.username else t.user_id }} ({{ t.user_id }})</p>
-{% for m in msgs %}<div class="card" style="{{ 'border-left:4px solid var(--accent)' if m.sender == 'admin' else '' }}">
-<small class="muted">{{ 'You' if m.sender == 'admin' else 'Customer' }} · {{ (m.created_at or '')[:16].replace('T',' ') }}</small><br>
-{{ m.text }}{% if m.photo_id %}<div style="margin-top:10px"><a href="{{ url_for('ticket_photo', mid=m.id) }}" target="_blank"><img src="{{ url_for('ticket_photo', mid=m.id) }}" alt="photo" loading="lazy" style="max-width:100%;max-height:420px;border-radius:8px;border:1px solid var(--line)"></a></div>{% endif %}</div>{% endfor %}
-<div class="card"><form method="post" action="{{ url_for('ticket_reply', tid=t.id) }}">
-<textarea name="text" rows="4" placeholder="Your reply (sent to the customer in the bot)" required></textarea>
-<button type="submit">Send reply</button></form>
-<form method="post" action="{{ url_for('ticket_status', tid=t.id) }}">
+<style>
+.thead{display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
+.thead h2{margin:0}
+.thead .sub{color:var(--muted);font-size:13.5px;margin-top:2px}
+.pill{border-radius:99px;padding:3px 10px;font-size:12px;font-weight:700;background:var(--grey);color:var(--greyink);vertical-align:2px;margin-left:6px}
+.pill.ok{background:var(--accent-soft);color:var(--paid)}
+.chat{display:flex;flex-direction:column;gap:10px;margin-bottom:16px}
+.bub{max-width:min(560px,88%);padding:10px 14px;border-radius:16px;overflow-wrap:anywhere;white-space:pre-wrap;line-height:1.5}
+.bub small{display:block;font-size:11.5px;font-weight:600;opacity:.7;margin-bottom:3px;white-space:normal}
+.bub.u{align-self:flex-start;background:var(--surface);border:1px solid var(--line);border-bottom-left-radius:4px}
+.bub.a{align-self:flex-end;background:var(--accent);color:#fff;border-bottom-right-radius:4px}
+.bub img{max-width:100%;max-height:360px;border-radius:10px;margin-top:8px;display:block}
+.qr{display:flex;gap:6px;flex-wrap:wrap;margin:2px 0 8px}
+.chip{width:auto;margin:0;padding:6px 12px;font-size:13px;border-radius:99px;background:var(--grey);border-color:var(--grey);color:var(--greyink);text-align:left}
+.chip:hover{background:var(--line2);border-color:var(--line2)}
+.btns{display:flex;gap:8px;flex-wrap:wrap}.btns button{flex:1;min-width:130px;margin:0}
+</style>
+<p style="margin:0 0 10px"><a href="{{ url_for('tickets') }}">&larr; All tickets</a></p>
+<div class="thead"><div>
+<h2>{{ ('@' ~ t.username) if t.username else t.user_id }} <span class="pill {{ 'ok' if t.status == 'open' else '' }}">{{ 'Open' if t.status == 'open' else 'Closed' }}</span></h2>
+<div class="sub">Ticket #{{ t.id }} · {{ t.kind or 'Question' }} · ID {{ t.user_id }} · <a href="{{ url_for('users', q=t.user_id) }}">Open customer</a></div></div>
+<form method="post" action="{{ url_for('ticket_status', tid=t.id) }}" style="margin:0">
 <input type="hidden" name="status" value="{{ 'closed' if t.status == 'open' else 'open' }}">
-<button class="grey" type="submit">{{ 'Close ticket' if t.status == 'open' else 'Reopen ticket' }}</button></form></div>
+<button class="grey sm" type="submit">{{ 'Close ticket' if t.status == 'open' else 'Reopen ticket' }}</button></form></div>
+<div class="chat">
+{% for m in msgs %}<div class="bub {{ 'a' if m.sender == 'admin' else 'u' }}"><small>{{ 'You' if m.sender == 'admin' else 'Customer' }} · {{ (m.created_at or '')[5:16].replace('T',' ') }}</small>{{ m.text or '' }}{% if m.photo_id %}<a href="{{ url_for('ticket_photo', mid=m.id) }}" target="_blank"><img src="{{ url_for('ticket_photo', mid=m.id) }}" alt="photo" loading="lazy"></a>{% endif %}</div>{% endfor %}
+</div>
+<div class="card" id="reply">
+<form method="post" action="{{ url_for('ticket_reply', tid=t.id) }}">
+{% if quick %}<div class="qr">{% for r in quick %}<button type="button" class="chip" data-r="{{ r }}" onclick="var a=document.getElementById('rt');a.value=this.dataset.r;a.focus();">{{ r[:38] }}{{ '…' if r|length > 38 }}</button>{% endfor %}</div>{% endif %}
+<textarea id="rt" name="text" rows="4" placeholder="Your reply (the customer gets it in the bot)" required></textarea>
+<div class="btns"><button type="submit">Send reply</button>
+{% if t.status == 'open' %}<button type="submit" name="close" value="1" class="green">Send and close</button>{% endif %}</div>
+</form></div>
+<script>var c=document.querySelector('.chat');if(c&&c.lastElementChild){c.lastElementChild.scrollIntoView({block:'nearest'});}</script>
 {% endblock %}""",
     "settings.html": """{% extends 'base.html' %}{% block body %}
+<style>
+.sg{margin-bottom:16px}
+.sg h3{margin:0 0 2px}
+.sg>p{margin:0 0 6px}
+.def{color:var(--muted);font-size:12.5px;font-weight:500}
+.sw{display:flex;align-items:center;gap:12px;padding:12px 14px;border:1px solid var(--line2);border-radius:10px;cursor:pointer;margin-top:8px;color:var(--ink);font-size:14.5px;font-weight:600}
+.sw input{width:20px;height:20px;margin:0;accent-color:var(--accent);flex:none}
+.themes{display:flex;gap:8px;margin-top:8px}
+.themes button{flex:1;background:var(--grey);border-color:var(--grey);color:var(--greyink);margin:0}
+.themes button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+.savebar{position:sticky;bottom:0;background:var(--bg);padding:12px 0;display:flex;gap:8px;border-top:1px solid var(--line)}
+.savebar button{margin:0}
+</style>
 <h2>Settings</h2>
-<div class="card"><h3>Referral commission</h3>
-<p class="muted">Percent of everything a referred customer buys that the person who invited them earns (added to their wallet). Applies to purchases from now on.</p>
+<div class="card sg"><h3>Appearance</h3><p class="muted">Only for this admin site, on this device.</p>
+<div class="themes"><button type="button" data-t="auto" onclick="setTheme('auto')">Auto</button><button type="button" data-t="light" onclick="setTheme('light')">Light</button><button type="button" data-t="dark" onclick="setTheme('dark')">Dark</button></div></div>
+
+<div class="card sg"><h3>Shop status</h3>
+<p class="muted">{% if s.shop_open %}The shop is <b>OPEN</b>.{% else %}The shop is <b>CLOSED</b>. Customers only see your closed message.{% endif %} You and your bot admins can still use the bot while it is closed. Money already being paid is still received.</p>
+<form method="post" action="{{ url_for('shop_toggle') }}" style="margin:0"><input type="hidden" name="state" value="{{ 'close' if s.shop_open else 'open' }}">
+<button type="submit" class="{{ 'red' if s.shop_open else 'green' }}">{{ 'Close the shop' if s.shop_open else 'Open the shop' }}</button></form></div>
+
 <form method="post" action="{{ url_for('save_settings') }}">
-<input name="referral_percent" type="number" step="0.1" min="0" max="100" value="{{ pct }}" required>
-<button type="submit">Save</button></form></div>{% endblock %}""",
+<div class="card sg"><h3>Messages</h3>
+<p class="muted">Plain text. Use {shop} for your shop name. Leave empty to use the built-in message.</p>
+<label>Welcome message <span class="def">shown after /start, under the bottom menu</span></label>
+<textarea name="welcome_text" rows="5" maxlength="1500" placeholder="Welcome to {shop}! Premium subscriptions at the best price.">{{ s.welcome_text }}</textarea>
+<label>Shop closed message <span class="def">shown to customers while the shop is closed</span></label>
+<textarea name="closed_message" rows="3" maxlength="600" placeholder="We are closed for maintenance. Back in 1 hour.">{{ s.closed_message }}</textarea></div>
+
+<div class="card sg"><h3>Wallet top-ups</h3>
+<p class="muted">Limits and time windows for customers adding funds. Changes apply to the next top-up, no restart needed.</p>
+<div class="two">
+<div><label>Smallest top-up (USDT) <span class="def">default {{ '%g' % d.min_deposit }}</span></label><input name="min_deposit" type="number" step="0.01" min="0.01" value="{{ '%g' % s.min_deposit }}" required></div>
+<div><label>Largest top-up (USDT) <span class="def">default {{ '%g' % d.max_deposit }}</span></label><input name="max_deposit" type="number" step="0.01" min="0.01" value="{{ '%g' % s.max_deposit }}" required></div>
+</div>
+<div class="two">
+<div><label>Crypto / Binance payment window (minutes) <span class="def">default {{ d.deposit_timeout_minutes }}</span></label><input name="deposit_timeout_minutes" type="number" step="1" min="1" max="1440" value="{{ s.deposit_timeout_minutes }}" required></div>
+<div><label>UPI payment window (minutes) <span class="def">default {{ d.upi_timeout_minutes }}</span></label><input name="upi_timeout_minutes" type="number" step="1" min="1" max="1440" value="{{ s.upi_timeout_minutes }}" required></div>
+</div></div>
+
+<div class="card sg"><h3>Referral commission</h3>
+<p class="muted">Percent of everything a referred customer buys that the person who invited them earns (added to their wallet). Applies to purchases from now on.</p>
+<label>Commission (%) <span class="def">default {{ '%g' % d.referral_percent }}</span></label>
+<input name="referral_percent" type="number" step="0.1" min="0" max="100" value="{{ '%g' % s.referral_percent }}" required></div>
+
+<div class="card sg"><h3>Alerts</h3>
+<label class="sw"><input type="checkbox" name="manual_alerts" value="1" {{ 'checked' if s.manual_alerts }}> Message me in Telegram about new made-to-order orders</label></div>
+
+<div class="card sg"><h3>Quick replies for support</h3>
+<p class="muted">One reply per line. They show as buttons on every ticket, tap one and edit it before sending.</p>
+<textarea name="quick_replies" rows="5">{{ s.quick_replies }}</textarea></div>
+
+<div class="savebar"><button type="submit">Save settings</button></div>
+</form>
+<form method="post" action="{{ url_for('reset_settings') }}" onsubmit="return confirm('Put every setting back to its default value?')">
+<button type="submit" class="grey">Reset all to defaults</button></form>
+<script>
+function setTheme(t){
+  try{if(t==='auto'){localStorage.removeItem('theme');}else{localStorage.setItem('theme',t);}}catch(e){}
+  if(t==='auto'){document.documentElement.removeAttribute('data-theme');}else{document.documentElement.setAttribute('data-theme',t);}
+  mark();
+}
+function mark(){
+  var t='auto';try{t=localStorage.getItem('theme')||'auto';}catch(e){}
+  document.querySelectorAll('.themes button').forEach(function(b){b.classList.toggle('on',b.dataset.t===t);});
+}
+mark();
+</script>
+{% endblock %}""",
     "upi.html": """{% extends 'base.html' %}{% block body %}
 <h2>UPI setup</h2>
 <div class="card"><h3>Rate (INR per 1 USDT)</h3>
@@ -497,6 +808,7 @@ def render_str(source, **kw):
         kw.setdefault("pending_count", len(db.pending_manual()))
         kw.setdefault("open_tickets", len(db.all_tickets("open")))
         kw.setdefault("upi_pending", db.upi_review_count())
+        kw.setdefault("shop_closed", not db.get_setting("shop_open", 1))
     return render_template_string(source, shop=SHOP_NAME, **kw)
 
 
@@ -505,6 +817,7 @@ def render(name, **kw):
         kw.setdefault("pending_count", len(db.pending_manual()))
         kw.setdefault("open_tickets", len(db.all_tickets("open")))
         kw.setdefault("upi_pending", db.upi_review_count())
+        kw.setdefault("shop_closed", not db.get_setting("shop_open", 1))
     return render_template(name, shop=SHOP_NAME, **kw)
 
 
@@ -682,8 +995,10 @@ def products():
             api_items = provider.catalog(max_age=60)
         except Exception as e:
             flash(f"Provider API error: {str(e)[:150]}", "err")
-    return render("products.html", products=db.list_products(), api_items=api_items,
-                  api_enabled=provider.ENABLED)
+    prods = db.list_products()
+    items = {p["id"]: db.stock_items(p["id"], 50) for p in prods if p["kind"] != "manual"}
+    return render("products.html", products=prods, items=items, api_items=api_items,
+                  api_enabled=provider.ENABLED, open_id=request.args.get("open", type=int))
 
 
 @app.route("/products/<int:pid>/apilink", methods=["POST"])
@@ -853,6 +1168,96 @@ def edit_product(pid):
     return redirect(url_for("products"))
 
 
+def _profit_text(price, cost):
+    d = price - cost
+    if d < -0.004:
+        return f"LOSS of ${-d:.2f} per item (selling below cost!)"
+    return f"profit ${d:.2f} per item"
+
+
+def _back(pid=None):
+    if pid:
+        return redirect(url_for("products", open=pid) + f"#p{pid}")
+    return redirect(url_for("products"))
+
+
+def _lines(text):
+    return [x.strip() for x in (text or "").splitlines() if x.strip()]
+
+
+@app.route("/products/create", methods=["POST"])
+def create_product():
+    """One step: product + cost + price + (optional) stock."""
+    f = request.form
+    name = f.get("name", "").strip()
+    kind = f.get("kind", "auto")
+    try:
+        price = _num(f.get("price"))
+        cost = _num(f.get("cost"))
+    except ValueError:
+        flash("Enter a valid cost and selling price.", "err")
+        return _back()
+    if not name or kind not in ("auto", "manual"):
+        flash("Product name is required.", "err")
+        return _back()
+    existed = any(p["name"] == name for p in db.list_products())
+    pid = db.add_product(name, price, kind)
+    if existed:
+        msg = f"'{name}' already exists, so its price and cost were not changed."
+    else:
+        db.update_product(pid, cost=cost, category=(f.get("category", "").strip() or None))
+        msg = f"'{name}' added. Cost ${cost:.2f}, price ${price:.2f}, {_profit_text(price, cost)}."
+    lines = _lines(f.get("links")) if kind == "auto" else []
+    if lines:
+        db.add_stock_lines(pid, lines)
+        msg += f" {len(lines)} stock item(s) added."
+    elif kind == "auto":
+        msg += " No stock yet - open the product and use Add stock."
+    flash(msg)
+    return _back(pid)
+
+
+@app.route("/products/<int:pid>/quick", methods=["POST"])
+def quick_product(pid):
+    f = request.form
+    try:
+        price = _num(f.get("price"))
+        cost = _num(f.get("cost"), allow_empty=True)
+    except ValueError:
+        flash("Enter a valid cost and selling price.", "err")
+        return _back(pid)
+    db.update_product(pid, price=price, cost=cost)
+    if cost is None:
+        flash(f"Price saved: ${price:.2f}. No cost set, so profit is not tracked for this product.")
+    else:
+        flash(f"Saved. Price ${price:.2f}, cost ${cost:.2f}, {_profit_text(price, cost)}.")
+    return _back(pid)
+
+
+@app.route("/products/<int:pid>/stock/add", methods=["POST"])
+def stock_add(pid):
+    lines = _lines(request.form.get("links"))
+    if not lines:
+        flash("Paste at least one item.", "err")
+    else:
+        db.add_stock_lines(pid, lines)
+        flash(f"{len(lines)} item(s) added to stock.")
+    return _back(pid)
+
+
+@app.route("/products/<int:pid>/stock/<int:sid>/delete", methods=["POST"])
+def stock_delete(pid, sid):
+    flash("Stock item removed." if db.delete_stock_item(pid, sid) else "That item was already sold or removed.", "")
+    return _back(pid)
+
+
+@app.route("/products/<int:pid>/stock/clear", methods=["POST"])
+def stock_clear(pid):
+    n = db.clear_stock(pid)
+    flash(f"Removed {n} unsold item(s).")
+    return _back(pid)
+
+
 @app.route("/products/<int:pid>/delete", methods=["POST"])
 def delete_product(pid):
     result = db.delete_product(pid)
@@ -930,13 +1335,18 @@ def manual_note(oid):
 @app.route("/users")
 def users():
     q = request.args.get("q", "")
-    return render("users.html", rows=db.find_users(q), q=q)
+    sort = request.args.get("sort", "new")
+    return render("users.html", rows=db.users_list(q, sort), q=q, sort=sort, tot=db.user_totals())
 
 
 @app.route("/users/<int:uid>/topup", methods=["POST"])
 def topup(uid):
     try:
         amount = round(float(request.form.get("amount", "")), 2)
+        if request.form.get("dir") == "remove":
+            amount = -abs(amount)
+        elif request.form.get("dir") == "add":
+            amount = abs(amount)
         if amount == 0 or abs(amount) > 100000:
             raise ValueError
     except ValueError:
@@ -957,7 +1367,11 @@ def topup(uid):
 # ------------------------------------------------- support
 @app.route("/tickets")
 def tickets():
-    return render("tickets.html", rows=db.all_tickets())
+    st = request.args.get("status", "open")
+    if st not in ("open", "closed", "all"):
+        st = "open"
+    q = request.args.get("q", "").strip()
+    return render("tickets.html", rows=db.tickets_overview(st, q), st=st, q=q, cnt=db.ticket_counts())
 
 
 @app.route("/tickets/<int:tid>")
@@ -970,7 +1384,7 @@ def ticket(tid):
     c.close()
     info = dict(t)
     info["username"] = u["username"] if u else None
-    return render("ticket.html", t=info, msgs=db.ticket_msgs(tid))
+    return render("ticket.html", t=info, msgs=db.ticket_msgs(tid), quick=_quick_replies())
 
 
 @app.route("/tickets/photo/<int:mid>")
@@ -1001,13 +1415,17 @@ def ticket_reply(tid):
     text = request.form.get("text", "").strip()
     if not t or not text:
         flash("Write a reply first.", "err")
-        return redirect(url_for("tickets"))
+        return redirect(url_for("ticket", tid=tid) if t else url_for("tickets"))
     db.add_ticket_msg(tid, "admin", text)
     _msg(t["user_id"],
          f"💬 <b>Support reply</b> · ticket #{tid}\n\n{htmllib.escape(text)}",
          f"💬 <b>客服回复</b> · 工单 #{tid}\n\n{htmllib.escape(text)}")
+    if request.form.get("close"):
+        db.set_ticket_status(tid, "closed")
+        flash("Reply sent and ticket closed.")
+        return redirect(url_for("tickets"))
     flash("Reply sent to the customer.")
-    return redirect(url_for("ticket", tid=tid))
+    return redirect(url_for("ticket", tid=tid) + "#reply")
 
 
 @app.route("/tickets/<int:tid>/status", methods=["POST"])
@@ -1018,22 +1436,89 @@ def ticket_status(tid):
 
 
 # ------------------------------------------------- settings
+DEFAULT_QUICK_REPLIES = """Done ✅ Please check your order and tell me if anything is wrong.
+Please send a screenshot of the problem.
+We are checking this now, please wait a little.
+Your money was refunded to your wallet."""
+
+
+def _quick_replies():
+    raw = db.get_setting("quick_replies", DEFAULT_QUICK_REPLIES)
+    return [x.strip() for x in str(raw).splitlines() if x.strip()][:12]
+
+
+SETTING_DEFAULTS = dict(
+    min_deposit=float(os.getenv("MIN_DEPOSIT", "0.1")),
+    max_deposit=float(os.getenv("MAX_DEPOSIT", "100")),
+    deposit_timeout_minutes=int(os.getenv("DEPOSIT_TIMEOUT_MINUTES", os.getenv("PAYMENT_TIMEOUT_MINUTES", "15"))),
+    upi_timeout_minutes=int(os.getenv("UPI_TIMEOUT_MINUTES", "30")),
+    manual_alerts=0 if os.getenv("MANUAL_ALERTS", "1") == "0" else 1,
+)
+
+
 @app.route("/settings")
 def settings():
-    return render("settings.html", pct=f"{db.referral_percent():g}")
+    d = dict(SETTING_DEFAULTS, referral_percent=float(os.getenv("REFERRAL_PERCENT", "3")))
+    s = {k: db.get_setting(k, v) for k, v in SETTING_DEFAULTS.items()}
+    s["referral_percent"] = db.referral_percent()
+    s["shop_open"] = db.get_setting("shop_open", 1)
+    s["welcome_text"] = db.get_setting("welcome_text", "")
+    s["closed_message"] = db.get_setting("closed_message", "")
+    s["quick_replies"] = "\n".join(_quick_replies())
+    return render("settings.html", s=s, d=d)
+
+
+@app.route("/settings/shop", methods=["POST"])
+def shop_toggle():
+    opening = request.form.get("state") == "open"
+    db.set_setting("shop_open", 1 if opening else 0)
+    flash("Shop is OPEN. Customers can use the bot." if opening else
+          "Shop is CLOSED. Customers see your closed message; you and your admins can still test it.")
+    back = request.form.get("back", "")
+    if not back.startswith("/") or back.startswith("//"):
+        back = url_for("settings")
+    return redirect(back)
 
 
 @app.route("/settings/save", methods=["POST"])
 def save_settings():
+    f = request.form
     try:
-        pct = float(request.form.get("referral_percent", ""))
-        if not (0 <= pct <= 100):
-            raise ValueError
+        vals = dict(
+            min_deposit=float(f.get("min_deposit", SETTING_DEFAULTS["min_deposit"])),
+            max_deposit=float(f.get("max_deposit", SETTING_DEFAULTS["max_deposit"])),
+            deposit_timeout_minutes=int(f.get("deposit_timeout_minutes", SETTING_DEFAULTS["deposit_timeout_minutes"])),
+            upi_timeout_minutes=int(f.get("upi_timeout_minutes", SETTING_DEFAULTS["upi_timeout_minutes"])),
+            referral_percent=float(f.get("referral_percent", db.referral_percent())),
+        )
     except ValueError:
-        flash("Enter a percentage between 0 and 100.", "err")
+        flash("Please enter valid numbers.", "err")
         return redirect(url_for("settings"))
-    db.set_setting("referral_percent", pct)
-    flash(f"Referral commission set to {pct:g}%.")
+    if not (0 < vals["min_deposit"] <= vals["max_deposit"]):
+        flash("Smallest top-up must be above 0 and not bigger than the largest top-up.", "err")
+        return redirect(url_for("settings"))
+    if not (1 <= vals["deposit_timeout_minutes"] <= 1440 and 1 <= vals["upi_timeout_minutes"] <= 1440):
+        flash("Payment windows must be between 1 and 1440 minutes.", "err")
+        return redirect(url_for("settings"))
+    if not (0 <= vals["referral_percent"] <= 100):
+        flash("Enter a referral percentage between 0 and 100.", "err")
+        return redirect(url_for("settings"))
+    for k, v in vals.items():
+        db.set_setting(k, v)
+    db.set_setting("manual_alerts", 1 if f.get("manual_alerts") else 0)
+    if "welcome_text" in f:
+        db.set_setting("welcome_text", f.get("welcome_text", "").strip()[:1500])
+        db.set_setting("closed_message", f.get("closed_message", "").strip()[:600])
+        replies = "\n".join(x.strip() for x in f.get("quick_replies", "").splitlines() if x.strip())
+        db.set_setting("quick_replies", replies[:3000] if replies else DEFAULT_QUICK_REPLIES)
+    flash("Settings saved. They are live in the bot now.")
+    return redirect(url_for("settings"))
+
+
+@app.route("/settings/reset", methods=["POST"])
+def reset_settings():
+    db.del_settings(list(SETTING_DEFAULTS) + ["referral_percent", "welcome_text", "closed_message", "quick_replies"])
+    flash("All settings are back to their defaults.")
     return redirect(url_for("settings"))
 
 

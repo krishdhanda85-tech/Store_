@@ -51,6 +51,47 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("digital-shop")
 
 db = ShopDB(DB_PATH)
+
+
+# ---- values the admin can change on the website (Settings page); env vars are only the defaults
+def min_deposit():
+    return db.get_setting("min_deposit", MIN_DEPOSIT)
+
+
+def max_deposit():
+    return db.get_setting("max_deposit", MAX_DEPOSIT)
+
+
+def deposit_timeout():
+    return db.get_setting("deposit_timeout_minutes", DEPOSIT_TIMEOUT_MINUTES)
+
+
+def upi_timeout():
+    return db.get_setting("upi_timeout_minutes", UPI_TIMEOUT_MINUTES)
+
+
+def manual_alerts():
+    return bool(db.get_setting("manual_alerts", 1 if MANUAL_ALERTS else 0))
+
+
+def welcome_text(language):
+    """Greeting under the bottom menu: the admin's own text (Settings page) or the built-in one."""
+    custom = (db.get_setting("welcome_text", "") or "").strip()
+    if custom:
+        return esc(custom).replace("{shop}", esc(SHOP_NAME))
+    return tt(language, "menu_ready", shop=esc(SHOP_NAME))
+
+
+def shop_closed_for(uid):
+    """True when the admin closed the shop (Settings page). Owner and admins can still use the bot."""
+    return (not db.get_setting("shop_open", 1)) and not is_admin(uid)
+
+
+def closed_text():
+    custom = (db.get_setting("closed_message", "") or "").strip()
+    if custom:
+        return esc(custom)
+    return "🔧 <b>The shop is closed right now.</b>\n\nWe will be back soon. Please try again later."
 binance = BinancePayClient()
 
 # ---------------------------------------------------------------- texts
@@ -489,7 +530,7 @@ def calc_view(uid: int, pid: int, qty: int, language: str):
 def wallet_view(uid: int, language: str):
     bal = db.get_account(uid)["balance"] or 0
     text = tt(language, "wallet", bal=money(bal), inr=inr(bal), rate=rate_text(),
-              min=f"{MIN_DEPOSIT:g}", max=f"{MAX_DEPOSIT:g}")
+              min=f"{min_deposit():g}", max=f"{max_deposit():g}")
     rows = []
     if BINANCE_ENABLED:
         rows.append([Btn(tt(language, "btn_bpay"), callback_data="fm:bpay")])
@@ -647,7 +688,7 @@ async def send_start_screen(message, user, context):
     if not language:
         await message.reply_text(tt("en", "welcome", shop=esc(SHOP_NAME)), reply_markup=kb_lang(), parse_mode=HTML)
         return
-    await message.reply_text(tt(language, "menu_ready", shop=esc(SHOP_NAME)),
+    await message.reply_text(welcome_text(language),
                              reply_markup=main_keyboard(), parse_mode=HTML)
     text, markup = shop_view(user.id, language)
     await message.reply_text(text, reply_markup=markup, parse_mode=HTML)
@@ -657,6 +698,9 @@ async def send_start_screen(message, user, context):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     clear_await(context)
+    if shop_closed_for(u.id):
+        await update.effective_message.reply_text(closed_text(), parse_mode=HTML)
+        return
     if REQUIRED_CHANNEL_ID and not await is_required_channel_member(context.bot, u.id):
         prompt = "📢 <b>Join our channel first</b>\n\nPlease join the channel and then tap <b>I've joined — Check</b> to use the bot."
         await update.effective_message.reply_text(prompt, reply_markup=join_channel_markup(), parse_mode=HTML)
@@ -706,6 +750,9 @@ async def show_menu(update, context, key):
 
 
 async def menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if shop_closed_for(update.effective_user.id):
+        await update.message.reply_text(closed_text(), parse_mode=HTML)
+        return
     db.touch_username(update.effective_user.id, update.effective_user.username)
     await show_menu(update, context, MENU_BY_LABEL[update.message.text])
 
@@ -716,7 +763,7 @@ async def cb_lang(update, context, arg):
     db.set_user_language(q.from_user.id, arg, q.from_user.username)
     await q.answer()
     await edit(q, tt(arg, "lang_set"))
-    await q.message.reply_text(tt(arg, "menu_ready", shop=esc(SHOP_NAME)), reply_markup=main_keyboard(), parse_mode=HTML)
+    await q.message.reply_text(welcome_text(arg), reply_markup=main_keyboard(), parse_mode=HTML)
     text, markup = shop_view(q.from_user.id, arg)
     await q.message.reply_text(text, reply_markup=markup, parse_mode=HTML)
 
@@ -875,7 +922,7 @@ async def cb_manual_ok(update, context, arg):
     await edit(q, tt(language, "placed", order=esc(result), name=esc(p["name"]), contact=esc(pending["contact"]),
                      delivery=esc(delivery)),
                Markup([main_menu_row(language)]))
-    if MANUAL_ALERTS:
+    if manual_alerts():
         u = q.from_user
         site = public_url()
         who = f"@{esc(u.username)}" if u.username else esc(u.full_name)
@@ -902,7 +949,7 @@ async def cb_fund_method(update, context, arg):
             return
         await q.answer()
         context.user_data["await"] = {"type": "amount", "method": "upi"}
-        await edit(q, tt(language, "ask_amount_upi", rate=rate_text(), min=f"{MIN_DEPOSIT:g}", max=f"{MAX_DEPOSIT:g}"),
+        await edit(q, tt(language, "ask_amount_upi", rate=rate_text(), min=f"{min_deposit():g}", max=f"{max_deposit():g}"),
                    Markup([[Btn(tt(language, "back"), callback_data="fund", style="primary")]]))
         return
     if (arg == "bsc" and not BSC_ENABLED) or (arg == "bpay" and not BINANCE_ENABLED) or arg not in ("bsc", "bpay"):
@@ -911,7 +958,7 @@ async def cb_fund_method(update, context, arg):
     await q.answer()
     context.user_data["await"] = {"type": "amount", "method": arg}
     name = tt(language, "btn_bpay" if arg == "bpay" else "btn_crypto")
-    await edit(q, tt(language, "ask_amount", method=esc(name), min=f"{MIN_DEPOSIT:g}", max=f"{MAX_DEPOSIT:g}"),
+    await edit(q, tt(language, "ask_amount", method=esc(name), min=f"{min_deposit():g}", max=f"{max_deposit():g}"),
                Markup([[Btn(tt(language, "back"), callback_data="fund", style="primary")]]))
 
 
@@ -1135,6 +1182,13 @@ CALLBACKS = {
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     action, _, arg = (q.data or "").partition(":")
+    if shop_closed_for(q.from_user.id):
+        await q.answer()
+        try:
+            await q.message.reply_text(closed_text(), parse_mode=HTML)
+        except Exception:
+            log.exception("Could not send the shop-closed message")
+        return
     if action == "joincheck":
         if REQUIRED_CHANNEL_ID and not await is_required_channel_member(context.bot, q.from_user.id):
             await q.answer("I can't see your channel membership yet. Join the channel first.", show_alert=True)
@@ -1154,7 +1208,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def create_deposit_flow(update, context, method: str, amount: float):
     uid = update.effective_user.id
     language = lang(uid)
-    expires = datetime.now(timezone.utc) + timedelta(minutes=DEPOSIT_TIMEOUT_MINUTES)
+    expires = datetime.now(timezone.utc) + timedelta(minutes=deposit_timeout())
     dep_id = db.create_deposit(uid, amount, method, expires)
     try:
         pay = await asyncio.to_thread(binance.create_order, dep_id, amount, f"{SHOP_NAME} deposit {dep_id}", method)
@@ -1172,7 +1226,7 @@ async def create_deposit_flow(update, context, method: str, amount: float):
                          [Btn(tt(language, "cancel_dep"), callback_data=f"fx:{dep_id}", style="danger")]])
     await update.message.reply_text(
         tt(language, "dep_created", id=esc(dep_id), credit=money(amount), amount=pay.get("amount_text", money(amount)),
-           details=payment_details(method), minutes=DEPOSIT_TIMEOUT_MINUTES),
+           details=payment_details(method), minutes=deposit_timeout()),
         reply_markup=markup, parse_mode=HTML)
 
 
@@ -1185,11 +1239,11 @@ async def create_upi_flow(update, context, amount: float):
         return
     rate = db.inr_rate()
     inr_amount = round(amount * rate, 2)
-    expires = datetime.now(timezone.utc) + timedelta(minutes=UPI_TIMEOUT_MINUTES)
+    expires = datetime.now(timezone.utc) + timedelta(minutes=upi_timeout())
     dep_id = db.create_upi_deposit(uid, amount, inr_amount, rate, acct["upi_id"], expires)
     inr_txt = inr_fmt(inr_amount)
     text = tt(language, "upi_created", id=esc(dep_id), credit=money(amount), inr=inr_txt, rate=f"{rate:g}",
-              upi=esc(acct["upi_id"]), minutes=UPI_TIMEOUT_MINUTES)
+              upi=esc(acct["upi_id"]), minutes=upi_timeout())
     markup = Markup([[Btn(tt(language, "btn_upi_paid"), callback_data=f"fu:{dep_id}", style="success")],
                      [Btn(tt(language, "cancel_dep"), callback_data=f"fx:{dep_id}", style="danger")]])
     if acct["qr"]:
@@ -1228,6 +1282,10 @@ async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     st = context.user_data.get("await")
     if not st:
+        return
+    if shop_closed_for(uid):
+        clear_await(context)
+        await msg.reply_text(closed_text(), parse_mode=HTML)
         return
     language = lang(uid)
     text = (msg.text or "").strip()
@@ -1270,10 +1328,10 @@ async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Normalize user input to cents: .4 and .40 are the same amount.
             amount_decimal = Decimal(text.replace(",", ".").strip()).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
             amount = float(amount_decimal)
-            if not amount_decimal.is_finite() or not (Decimal(str(MIN_DEPOSIT)) <= amount_decimal <= Decimal(str(MAX_DEPOSIT))):
+            if not amount_decimal.is_finite() or not (Decimal(str(min_deposit())) <= amount_decimal <= Decimal(str(max_deposit()))):
                 raise ValueError
         except (ValueError, InvalidOperation):
-            await msg.reply_text(tt(language, "amount_invalid", min=f"{MIN_DEPOSIT:g}", max=f"{MAX_DEPOSIT:g}"))
+            await msg.reply_text(tt(language, "amount_invalid", min=f"{min_deposit():g}", max=f"{max_deposit():g}"))
             return
         clear_await(context)
         if st["method"] == "upi":
@@ -1342,6 +1400,8 @@ async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def photo_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if shop_closed_for(update.effective_user.id):
+        return
     st = context.user_data.get("await")
     if st and st["type"] == "ticket":
         msg = update.message
