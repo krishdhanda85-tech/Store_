@@ -138,15 +138,15 @@ TEXT = {
         "btn_api": "🔑 API",
         "btn_api_docs": "📖 API Docs",
         "btn_docs_dl": "📄 Download docs",
-        "api_docs_1": "📖 <b>API Docs · 1/3 · Quick start</b>\n\n1️⃣ Create your key: <b>🔑 Reseller API → Create API key</b>\n2️⃣ Top up your wallet with <b>Add Funds</b>\n3️⃣ Paste this in your panel or bot:\n\n<b>API URL</b>\n<code>{url}/api/v1/index.php</code>\n<b>API key</b>\n<code>YOUR_API_KEY</code> (starts with rs_live_)\n\n4️⃣ Test it in your browser:\n<code>{url}/api/v1/index.php?action=balance&amp;api_key=YOUR_API_KEY</code>\n\nYou can send the key as header <code>Authorization: Bearer YOUR_API_KEY</code>, header <code>X-API-Key</code>, or field <code>api_key</code>.\n\nUse https:// and the full path, not only the domain.",
-        "api_docs_2": "📖 <b>API Docs · 2/3 · Actions</b>\n\nOne URL, choose with <code>action</code>:\n\n<code>action=products</code> products, price, stock\n<code>action=balance</code> wallet balance\n<code>action=buy</code> place an order\n<code>action=order</code> one order (<code>order_id</code>)\n<code>action=orders</code> last 100 orders\n\n<b>Buy example</b>\n<code>{url}/api/v1/index.php?action=buy&amp;product_id=1&amp;quantity=2&amp;idempotency_key=order-1001&amp;api_key=YOUR_API_KEY</code>\n\nMax 20 per order. Always send a unique <code>idempotency_key</code>: if you retry after a timeout you get the same order back and are not charged twice.\n\nREST also works: <code>GET /api/v1/products</code>, <code>GET /api/v1/balance</code>, <code>POST /api/v1/orders</code>.",
+        "api_docs_1": "📖 <b>API Docs · 1/3 · Quick start</b>\n\n1️⃣ Create your key: <b>🔑 Reseller API → Create API key</b>\n2️⃣ Top up your wallet with <b>Add Funds</b>\n3️⃣ Paste this in your panel or bot:\n\n<b>API URL</b>\n<code>{url}/api/v1/index.php</code>\n<b>API key</b>\n<code>{key}</code> (starts with rs_live_)\n\n4️⃣ Test it in your browser:\n<code>{url}/api/v1/index.php?action=balance&amp;api_key={key}</code>\n\nYou can send the key as header <code>Authorization: Bearer {key}</code>, header <code>X-API-Key</code>, or field <code>api_key</code>.\n\nUse https:// and the full path, not only the domain.",
+        "api_docs_2": "📖 <b>API Docs · 2/3 · Actions</b>\n\nOne URL, choose with <code>action</code>:\n\n<code>action=products</code> products, price, stock\n<code>action=balance</code> wallet balance\n<code>action=buy</code> place an order\n<code>action=order</code> one order (<code>order_id</code>)\n<code>action=orders</code> last 100 orders\n\n<b>Buy example</b>\n<code>{url}/api/v1/index.php?action=buy&amp;product_id=1&amp;quantity=2&amp;idempotency_key=order-1001&amp;api_key={key}</code>\n\nMax 20 per order. Always send a unique <code>idempotency_key</code>: if you retry after a timeout you get the same order back and are not charged twice.\n\nREST also works: <code>GET /api/v1/products</code>, <code>GET /api/v1/balance</code>, <code>POST /api/v1/orders</code>.",
         "api_docs_3": "📖 <b>API Docs · 3/3 · Replies and errors</b>\n\nEvery reply is JSON.\nSuccess: <code>{{\"ok\": true, ...}}</code>\nError: <code>{{\"ok\": false, \"error\": \"code\"}}</code>\n\nBuy reply has <code>order.items</code> = your delivered accounts and <code>balance</code> = wallet left.\n\n<b>Errors</b>\n401 <code>missing_api_key</code> / <code>invalid_api_key</code>\n402 <code>insufficient_balance</code> (top up)\n409 <code>insufficient_stock</code>\n404 <code>product_not_found</code> / <code>not_found</code>\n400 bad quantity or unknown action\n403 <code>reseller_disabled</code> (contact Support)\n\nPress <b>📄 Download docs</b> for the full guide with curl, Python and PHP examples.",
         "btn_api_new": "🔑 Create API key",
         "btn_api_regen": "🔄 New API key",
         "btn_api_regen_ok": "Yes, replace my key",
         "api_intro": "🔑 <b>Reseller API</b>\n\nSell our products from your own website or bot. Orders are paid from your wallet balance at the normal shop price (your discount, if any, is set by the admin).\n\nTap below to create your API key.",
-        "api_home": "🔑 <b>Reseller API</b>\n\n💰 Wallet: <b>${bal}</b> (top up with Add Funds)\n🏷 Discount: <b>{disc}%</b>\n🌐 API URL (paste this in your panel): <code>{url}/api/v1/index.php</code>\n📖 Docs: <code>{url}/api/docs</code>\n\nKey goes in header <code>Authorization: Bearer YOUR_API_KEY</code> (or <code>?api_key=YOUR_API_KEY</code>)\n\nQuick test: <code>{url}/api/v1/index.php?action=balance&amp;api_key=YOUR_API_KEY</code>\n\nREST also works:\n<code>GET /api/v1/products</code> — products, price, stock\n<code>GET /api/v1/balance</code> — wallet balance\n<code>POST /api/v1/orders</code> — body: product_id, quantity (max 20)\n<code>GET /api/v1/orders</code> — your orders\n\nSend a unique <code>Idempotency-Key</code> header with every order. Only auto-delivery products are available. Not enough balance gives error 402.",
-        "api_key_new": "✅ <b>Your API key</b>\n\n<code>{key}</code>\n\n⚠️ Copy it now. It is shown only once. Never share it.",
+        "api_home": "🔑 <b>Reseller API</b>\n\n💰 Wallet: <b>${bal}</b> (top up with Add Funds)\n🏷 Discount: <b>{disc}%</b>\n🌐 API URL (paste this in your panel): <code>{url}/api/v1/index.php</code>\n🔑 API key: <code>{key}</code>\n📖 Docs: <code>{url}/api/docs</code>\n\nKey goes in header <code>Authorization: Bearer {key}</code> (or <code>?api_key={key}</code>)\n\nQuick test: <code>{url}/api/v1/index.php?action=balance&amp;api_key={key}</code>\n\nREST also works:\n<code>GET /api/v1/products</code> — products, price, stock\n<code>GET /api/v1/balance</code> — wallet balance\n<code>POST /api/v1/orders</code> — body: product_id, quantity (max 20)\n<code>GET /api/v1/orders</code> — your orders\n\nSend a unique <code>Idempotency-Key</code> header with every order. Only auto-delivery products are available. Not enough balance gives error 402.{keynote}",
+        "api_key_new": "✅ <b>Your API key</b>\n\n<code>{key}</code>\n\n⚠️ Never share it. You can see it again anytime in 🔑 Reseller API.",
         "api_regen_ask": "Replace your API key? The old key stops working immediately.",
         "api_disabled": "⛔ Your API access is disabled. Please open Support.",
         "api_key_sent": "✅ <b>API key created.</b>\nYour key is in the message below. Copy it now.",
@@ -1025,6 +1025,17 @@ async def cb_support(update, context, arg):
                    Markup([[Btn(tt(language, "btn_cancel"), callback_data="cx", style="danger")]]))
 
 
+def _api_key_info(uid: int):
+    """(html-safe key to show, note). Old keys made before key storage cannot be shown."""
+    try:
+        k = reseller_api.get_key_for_user(uid)
+    except Exception:
+        k = None
+    note = "" if k else ("\n\nℹ️ Your key is hidden because it was created before this update. "
+                         "Tap 🔄 New API key once and it will show here from then on.")
+    return esc(k or "YOUR_API_KEY"), note
+
+
 def api_view(uid: int, language: str):
     reseller_api.init_schema()   # safe to repeat
     r = reseller_api.get_reseller_by_user(uid)
@@ -1034,8 +1045,9 @@ def api_view(uid: int, language: str):
                                                   main_menu_row(language)])
     if not r["active"]:
         return tt(language, "api_disabled"), Markup([main_menu_row(language)])
+    key_html, keynote = _api_key_info(uid)
     text = tt(language, "api_home", bal=money(reseller_api.wallet_balance(uid)), disc=f"{float(r['price_discount'] or 0):g}",
-              url=esc(API_BASE_URL or "(ask the admin for the site link)"))
+              url=esc(API_BASE_URL or "(ask the admin for the site link)"), key=key_html, keynote=keynote)
     return text, Markup([[Btn(tt(language, "btn_api_docs"), callback_data="api:docs1", style="primary")],
                          [Btn(MENU["funds"], callback_data="menu:funds", style="success"),
                           Btn(tt(language, "btn_api_regen"), callback_data="api:regen")],
@@ -1060,13 +1072,16 @@ async def cb_api(update, context, arg):
                 nav.append(Btn("◀️", callback_data=f"api:docs{n - 1}"))
             if n < 3:
                 nav.append(Btn("▶️", callback_data=f"api:docs{n + 1}"))
-            await edit(q, tt(language, f"api_docs_{n}", url=esc(API_BASE_URL or "https://YOUR-DOMAIN")),
+            await edit(q, tt(language, f"api_docs_{n}", url=esc(API_BASE_URL or "https://YOUR-DOMAIN"), key=_api_key_info(uid)[0]),
                        Markup([nav, [Btn(tt(language, "btn_docs_dl"), callback_data="api:dl")],
                                [Btn(tt(language, "btn_api"), callback_data="api:home")]]))
         elif arg == "dl":
             path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "API_DOCS.md")
             with open(path, "r", encoding="utf-8") as fh:
                 body = fh.read().replace("https://YOUR-DOMAIN", API_BASE_URL or "https://YOUR-DOMAIN")
+            my_key = await asyncio.to_thread(reseller_api.get_key_for_user, uid)
+            if my_key:
+                body = body.replace("YOUR_KEY", my_key)
             bio = io.BytesIO(body.encode("utf-8"))
             bio.name = "API_DOCS.md"
             await chat.send_document(bio, caption="📄 Reseller API docs")

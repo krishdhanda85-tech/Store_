@@ -1,18 +1,26 @@
 """First-party reseller API for the existing digital shop.
 
 Authentication: Authorization: Bearer <API key> (or X-API-Key).
-Keys are shown only once on creation; only SHA-256 hashes are stored.
+Lookup uses a SHA-256 hash of the key. An encrypted copy (key_enc) is also kept so the
+owner can see their own key again inside the bot (Reseller API screen / docs).
 """
+import base64
 import hashlib
 import json
+import logging
 import os
 import secrets
 import sqlite3
 from datetime import datetime, timezone
 from flask import Blueprint, jsonify, request, g
+try:
+    from cryptography.fernet import Fernet
+except Exception:   # library missing -> keys are simply not stored for re-display
+    Fernet = None
 
 DB_PATH = os.getenv("DB_PATH", "shop.db")
 api = Blueprint("reseller_api", __name__)
+log = logging.getLogger("reseller_api")
 MAX_QTY = 20
 
 
@@ -59,8 +67,41 @@ def init_schema():
     cols = [r[1] for r in c.execute("PRAGMA table_info(api_resellers)").fetchall()]
     if "user_id" not in cols:   # Telegram user id -> API orders are paid from that user's bot wallet
         c.execute("ALTER TABLE api_resellers ADD COLUMN user_id INTEGER")
+    if "key_enc" not in cols:   # encrypted copy of the key so the bot can show it again
+        c.execute("ALTER TABLE api_resellers ADD COLUMN key_enc TEXT")
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_api_resellers_user ON api_resellers(user_id) WHERE user_id IS NOT NULL")
     c.commit(); c.close()
+
+
+def _fernet():
+    if Fernet is None:
+        return None
+    secret = os.getenv("API_KEY_SECRET") or os.getenv("BOT_TOKEN") or ""
+    if not secret:
+        return None
+    return Fernet(base64.urlsafe_b64encode(hashlib.sha256(secret.encode()).digest()))
+
+
+def _encrypt_key(key):
+    f = _fernet()
+    return f.encrypt(key.encode()).decode() if f else None
+
+
+def get_key_for_user(user_id):
+    """The user's own raw API key (decrypted), or None if it was created before this feature."""
+    c = connect()
+    row = c.execute("SELECT key_hash,key_enc FROM api_resellers WHERE user_id=? AND active=1", (user_id,)).fetchone()
+    c.close()
+    f = _fernet()
+    if not row or not row["key_enc"] or not f:
+        return None
+    try:
+        key = f.decrypt(row["key_enc"].encode()).decode()
+    except Exception:
+        return None
+    if hashlib.sha256(key.encode()).hexdigest() != row["key_hash"]:
+        return None
+    return key
 
 
 def _new_key():
@@ -81,8 +122,8 @@ def create_for_user(user_id, name):
     key = _new_key()
     c = connect()
     try:
-        c.execute("INSERT INTO api_resellers(name,key_hash,balance,active,price_discount,created_at,user_id) VALUES(?,?,0,1,0,?,?)",
-                  ((name or str(user_id))[:80], hashlib.sha256(key.encode()).hexdigest(), now(), user_id))
+        c.execute("INSERT INTO api_resellers(name,key_hash,balance,active,price_discount,created_at,user_id,key_enc) VALUES(?,?,0,1,0,?,?,?)",
+                  ((name or str(user_id))[:80], hashlib.sha256(key.encode()).hexdigest(), now(), user_id, _encrypt_key(key)))
         c.commit()
     except sqlite3.IntegrityError:
         c.close()
@@ -95,7 +136,8 @@ def regenerate_key(user_id):
     """Used by the bot: replace the user's key (old one stops working). Returns the new raw key or None."""
     key = _new_key()
     c = connect()
-    cur = c.execute("UPDATE api_resellers SET key_hash=? WHERE user_id=?", (hashlib.sha256(key.encode()).hexdigest(), user_id))
+    cur = c.execute("UPDATE api_resellers SET key_hash=?, key_enc=? WHERE user_id=?",
+                    (hashlib.sha256(key.encode()).hexdigest(), _encrypt_key(key), user_id))
     c.commit(); c.close()
     return key if cur.rowcount else None
 
@@ -184,6 +226,30 @@ def _mna(e):
     if request.path.startswith("/api"):
         return _error("method_not_allowed", 405)
     return e
+
+
+@api.after_app_request
+def _api_compat_and_log(resp):
+    """Log what panels (e.g. Goatsell) call, and add common success/status/message fields
+    next to "ok" so panels that look for those keys also understand the reply."""
+    if not request.path.startswith("/api"):
+        return resp
+    try:
+        p = _params()
+        shown = {k: ("***" if k.lower() in ("api_key", "apikey", "key", "token") else str(v)[:40]) for k, v in p.items()}
+        log.warning("API %s %s -> %s params=%s ua=%s", request.method, request.path, resp.status_code, shown,
+                    (request.headers.get("User-Agent") or "")[:60])
+        if resp.is_json:
+            data = resp.get_json(silent=True)
+            if isinstance(data, dict) and "ok" in data:
+                data.setdefault("success", bool(data["ok"]))
+                data.setdefault("status", "success" if data["ok"] else "error")
+                if not data["ok"]:
+                    data.setdefault("message", data.get("error"))
+                resp.set_data(json.dumps(data))
+    except Exception:
+        pass
+    return resp
 
 
 @api.app_errorhandler(500)

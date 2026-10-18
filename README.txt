@@ -80,3 +80,23 @@ Files changed: bot.py, reseller_api.py, reseller_admin.py (deploy all three, kee
 - "New API key" in the bot replaces the key (old one stops working).
 - Resellers created on the admin site WITHOUT a Telegram ID keep the old admin-added balance.
 - Optional variable: API_BASE_URL (else PUBLIC_URL / RAILWAY_PUBLIC_DOMAIN) = site link shown in the bot.
+
+
+=====================================================================
+API KEY SHOWN INSIDE THE BOT (new)
+=====================================================================
+Files changed: bot.py, reseller_api.py, reseller_admin.py, requirements.txt (cryptography added).
+- Profile -> API screen, Docs 1/3 and 2/3, and "Download docs" now show the user's own API URL and key.
+- The key is stored encrypted (column api_resellers.key_enc). Lookup still uses the SHA-256 hash.
+- Railway Variables:
+    API_BASE_URL=https://your-app.up.railway.app   (site link shown in the bot, no trailing slash)
+    API_KEY_SECRET=<long random text>              (encrypts the stored keys; set once, never change it)
+  If API_KEY_SECRET is missing, BOT_TOKEN is used. If that secret changes, old keys stop showing
+  and the user taps "New API key" again.
+- Keys created before this update cannot be shown: tap Profile -> API -> New API key once
+  (the old key stops working, so update it in any panel that uses it).
+- Every API reply now also carries "success", "status" and (on errors) "message" next to "ok".
+- Every /api request is logged (method, path, action, status; keys are masked as ***).
+- Panel endpoint URL (e.g. Goatsell): https://your-app.up.railway.app/api/v1/index.php
+  Health check (no key): https://your-app.up.railway.app/api/v1/health
+- The old Reseller_API_Channel_Features_Essential.zip was removed (outdated copies of 4 files).

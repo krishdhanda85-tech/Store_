@@ -1,5 +1,6 @@
 import hashlib
 import secrets
+import reseller_api
 from flask import Blueprint, request, redirect, url_for, flash, render_template_string
 
 admin_api = Blueprint('reseller_admin', __name__)
@@ -26,8 +27,9 @@ def register(app, db):
                         try: tg = int(request.form.get('user_id', '').strip() or 0) or None
                         except ValueError: tg = None
                         try:
-                            c.execute('INSERT INTO api_resellers(name,key_hash,balance,active,price_discount,created_at,user_id) VALUES(?,?,0,1,?,?,?)',
-                                      (name, hashlib.sha256(key.encode()).hexdigest(), discount, db._now(), tg))
+                            reseller_api.init_schema()   # makes sure the key_enc column exists
+                            c.execute('INSERT INTO api_resellers(name,key_hash,balance,active,price_discount,created_at,user_id,key_enc) VALUES(?,?,0,1,?,?,?,?)',
+                                      (name, hashlib.sha256(key.encode()).hexdigest(), discount, db._now(), tg, reseller_api._encrypt_key(key)))
                             c.commit()
                             flash('NEW API KEY (copy now; it will not be shown again): ' + key)
                         except Exception:
