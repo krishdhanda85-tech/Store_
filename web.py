@@ -217,7 +217,11 @@ h2{font-size:22px}
 {% if session.get('ok') and shop_closed %}<div class="msg err"><b>The shop is CLOSED.</b> Customers cannot use the bot.
 <form method="post" action="{{ url_for('shop_toggle') }}" style="margin:8px 0 0"><input type="hidden" name="state" value="open"><input type="hidden" name="back" value="{{ request.path }}"><button type="submit" class="green sm">Open the shop</button></form></div>{% endif %}
 {% block body %}{% endblock %}
-</main></div></body></html>""",
+</main></div><div id="google_translate_element" style="position:fixed;right:14px;bottom:14px;z-index:9999;background:var(--card,#fff);padding:7px 10px;border-radius:12px;box-shadow:0 4px 18px #0002"><span style="font-size:12px;font-weight:700">🌐 Idioma / Language</span><div id="google_translate_inner"></div></div>
+<script>
+function googleTranslateElementInit(){new google.translate.TranslateElement({pageLanguage:'en',includedLanguages:'en,es',autoDisplay:false},'google_translate_inner');}
+</script><script src="https://translate.google.com/translate_a/element.js?cb=googleTranslateElementInit"></script>
+</body></html>""",
     "login.html": """{% extends 'base.html' %}{% block body %}
 <div class="card login">
 <div class="mark">{{ shop[:1]|upper }}</div>

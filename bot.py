@@ -271,8 +271,28 @@ TEXT = {
         "link_added": "✅ 商品已加入库存。",
         "help": "请使用下方菜单，或发送 /start。",
     },
+    "es": {
+        'welcome': '👋 <b>¡Bienvenido a {shop}!</b>\n\n✨ Productos digitales premium a excelentes precios.\n⚡ Entrega rápida • 🔒 Pago seguro • 🎧 Atención al cliente\n\n🌐 Elige tu idioma 👇',
+        'menu_ready': '👋 <b>¡Bienvenido a {shop}!</b>\n\n✨ Tu tienda digital de suscripciones y servicios premium.\n⚡ Entrega rápida • 💳 Recargas fáciles • 🎧 Soporte cuando lo necesites.\n\n👇 <b>¡Elige una opción para comenzar!</b>',
+        'lang_set': '✅ Idioma guardado.',
+        'shop_head': '🛍️ <b>Bienvenido a la tienda</b>\n\n<blockquote>🟢 Productos disponibles: <b>{avail}</b>\n📦 Productos totales: <b>{total}</b>\n⚡ Entrega digital rápida</blockquote>\n\n🔷 Elige una categoría o explora los productos ⬇️',
+        'no_products': '🛍 <b>{shop}</b>\n\nNo hay productos disponibles en este momento.',
+        'cat_head': '📂 <b>{cat}</b>\n\n🟢 Selecciona un producto ⬇️',
+        'btn_search': '🔎 Buscar',
+        'search_ask': '🔎 <b>Buscar</b>\n\nEscribe el nombre del producto:',
+        'search_head': '🔎 <b>Resultados para «{q}»</b>',
+        'search_none': '🔎 No se encontraron resultados para «{q}».',
+        'sold_out': 'Agotado',
+        'in_stock': 'Disponible',
+        'made_to_order': 'Bajo pedido',
+        'settings': '⚙️ <b>Configuración</b>\n\n🌐 Idioma: <b>{lang}</b>',
+        'admin_only': 'Se requieren permisos de administrador.',
+        'owner_only': 'Se requieren permisos del propietario.',
+        'help': 'Usa el menú de abajo o envía /start.',
+        'shop_closed': '🔧 <b>La tienda está cerrada en este momento.</b>\n\nVolveremos pronto. Inténtalo de nuevo más tarde.',
+    },
 }
-LANG_NAMES = {"en": "English", "zh": "中文"}
+LANG_NAMES = {"en": "English", "zh": "中文", "es": "Español"}
 
 
 def tt(language: str, key: str, /, **kw) -> str:
@@ -619,7 +639,8 @@ def support_view(uid: int, language: str):
 def settings_view(uid: int, language: str):
     text = tt(language, "settings", lang=LANG_NAMES.get(language, language))
     return text, Markup([[Btn("🇬🇧 English", callback_data="setlang:en", style="primary"),
-                          Btn("🇨🇳 中文", callback_data="setlang:zh", style="primary")],
+                          Btn("🇨🇳 中文", callback_data="setlang:zh", style="primary"),
+                          Btn("🇪🇸 Español", callback_data="setlang:es", style="success")],
                          main_menu_row(language)])
 
 
