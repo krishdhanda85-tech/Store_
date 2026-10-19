@@ -1494,10 +1494,10 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/setref <percent>\n"
         "/setrate <inr per USDT>\n"
         "/paymentcenter\n"
-        "/apiproducts - provider catalog (keys, cost, stock)\n"
-        "/linkapi <product_id> <provider_key>\n"
-        "/unlinkapi <product_id>\n"
-        "/apibalance - provider wallet\n\n"
+        "/apiproducts [supplier_id] - supplier catalogs (keys, cost, stock)\n"
+        "/linkapi <product_id> <supplier_id> <provider_key>\n"
+        "/unlinkapi <product_id> [supplier_id]\n"
+        "/apibalance - supplier wallets\n\n"
         "UPI accounts, QR codes, UPI verification and support replies are done on the admin site."
     )
 
@@ -1747,56 +1747,79 @@ async def setref(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Referral commission set to {pct:g}%.")
 
 async def apiproducts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Owner only: list provider products with their keys, cost and stock."""
+    """Owner only: list every supplier's products with keys, cost and stock."""
     if not is_owner(update.effective_user.id):
         return
-    if not provider.ENABLED:
-        await update.message.reply_text("Set CUPPON_API_KEY in the environment first.")
+    sups = [s for s in await asyncio.to_thread(db.list_suppliers, True) if s["key"]]
+    if not sups:
+        await update.message.reply_text("No supplier yet. Add one on the admin site -> Suppliers API.")
         return
-    try:
-        items = await asyncio.to_thread(provider.catalog)
-    except Exception as e:
-        await update.message.reply_text(f"Provider error: {str(e)[:200]}")
-        return
-    linked = {m["provider_key"]: pid for pid, m in db._links().items()}
+    if context.args and context.args[0].isdigit():
+        sups = [s for s in sups if s["id"] == int(context.args[0])]
+    linked = {}
+    for pid, d in (await asyncio.to_thread(db.sources_by_product)).items():
+        for o in d["offers"]:
+            linked[(o["supplier_id"], o["provider_key"])] = pid
     lines = []
-    for p in items:
-        tag = f" -> #{linked[p['key']]}" if p["key"] in linked else ""
-        lines.append(f"{p['key']} | {p['name']} | cost ${float(p['price_usdt_from']):.2f} | stock {p['stock']}{tag}")
-    await update.message.reply_text("\n".join(lines) or "Provider has no products.")
+    for s in sups:
+        try:
+            items = await asyncio.to_thread(provider.catalog_for, s)
+        except Exception as e:
+            lines.append(f"== {s['name']} (#{s['id']}): error {str(e)[:120]}")
+            continue
+        lines.append(f"== {s['name']} (#{s['id']})")
+        for p in items:
+            tag = f" -> #{linked[(s['id'], p['key'])]}" if (s["id"], p["key"]) in linked else ""
+            lines.append(f"{p['key']} | {p['name']} | cost ${p['cost']:.2f} | stock {p['stock']}{tag}")
+    text = "\n".join(lines)
+    for i in range(0, len(text), 3800):
+        await update.message.reply_text(text[i:i + 3800])
 
 
 async def linkapi(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Owner only: /linkapi <product_id> <provider_key>"""
+    """Owner only: /linkapi <product_id> <supplier_id> <provider_key>   (old form without supplier_id still works)"""
     if not is_owner(update.effective_user.id):
         return
-    if len(context.args) != 2 or not context.args[0].isdigit():
-        await update.message.reply_text("Usage: /linkapi <product_id> <provider_key>   (keys: /apiproducts)")
+    a = context.args
+    if len(a) not in (2, 3) or not a[0].isdigit() or (len(a) == 3 and not a[1].isdigit()):
+        await update.message.reply_text("Usage: /linkapi <product_id> <supplier_id> <provider_key>   (see /apiproducts)")
         return
     try:
-        await asyncio.to_thread(db.link_api, int(context.args[0]), context.args[1])
+        if len(a) == 3:
+            await asyncio.to_thread(db.link_api, int(a[0]), a[2], int(a[1]))
+        else:
+            await asyncio.to_thread(db.link_api, int(a[0]), a[1])
     except Exception as e:
         await update.message.reply_text(f"❌ {str(e)[:300]}")
         return
-    await update.message.reply_text("✅ Linked. Stock now = your own stock + provider stock. Your price stays as set on the site.")
+    await update.message.reply_text("✅ Linked. Choose which supplier is used first on the admin site -> Products. "
+                                    "Your price stays as set on the site.")
 
 
 async def unlinkapi(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id) or len(context.args) != 1 or not context.args[0].isdigit():
+    """Owner only: /unlinkapi <product_id> [supplier_id]  (no supplier_id = remove all suppliers)"""
+    a = context.args
+    if not is_owner(update.effective_user.id) or not a or not a[0].isdigit():
         return
-    db.unlink_api(int(context.args[0]))
+    await asyncio.to_thread(db.unlink_api, int(a[0]), int(a[1]) if len(a) > 1 and a[1].isdigit() else None)
     await update.message.reply_text("✅ Unlinked.")
 
 
 async def apibalance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
         return
-    try:
-        bal = await asyncio.to_thread(provider.wallet)
-    except Exception as e:
-        await update.message.reply_text(f"Provider error: {str(e)[:200]}")
+    sups = [s for s in await asyncio.to_thread(db.list_suppliers, True) if s["key"]]
+    if not sups:
+        await update.message.reply_text("No supplier yet. Add one on the admin site -> Suppliers API.")
         return
-    await update.message.reply_text(f"Provider wallet: {bal:.4f} USDT")
+    lines = []
+    for s in sups:
+        try:
+            bal = await asyncio.to_thread(provider.balance_for, s)
+            lines.append(f"{s['name']} (#{s['id']}): {bal:.4f}")
+        except Exception as e:
+            lines.append(f"{s['name']} (#{s['id']}): error {str(e)[:120]}")
+    await update.message.reply_text("Supplier wallets:\n" + "\n".join(lines))
 
 
 async def provider_job(context: ContextTypes.DEFAULT_TYPE):
@@ -1807,8 +1830,8 @@ async def provider_job(context: ContextTypes.DEFAULT_TYPE):
     try:
         alerts = await asyncio.to_thread(db.sync)
         stuck = await asyncio.to_thread(db.stuck_provider_orders)
-        alerts += [f"⚠️ Provider order {r['idem']} bought {r['qty']} item(s) but they are not in stock yet. "
-                   f"Check table provider_orders (items are saved there)." for r in stuck]
+        alerts += [f"⚠️ Supplier order {r['idem']} ({r['status']}): {r['qty']} item(s) may be paid but are not fully "
+                   f"in stock. Check table provider_orders (items are saved there)." for r in stuck]
     except Exception as e:
         log.warning("provider sync failed: %s", e)
         return

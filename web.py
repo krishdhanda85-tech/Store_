@@ -28,6 +28,8 @@ from reseller_admin import register as register_reseller_admin
 init_reseller_schema()
 app.register_blueprint(reseller_api_blueprint)
 register_reseller_admin(app, db)
+from suppliers_admin import register as register_suppliers_admin
+register_suppliers_admin(app, db)
 app.config["MAX_CONTENT_LENGTH"] = 3 * 1024 * 1024   # QR uploads
 app.secret_key = os.getenv("SECRET_KEY") or hashlib.sha256(
     ("shop-admin:" + ADMIN_PASSWORD).encode()
@@ -181,7 +183,7 @@ h2{font-size:22px}
 }
 @media(prefers-reduced-motion:reduce){*{transition:none!important}}
 </style></head><body class="{{ 'app' if session.get('ok') else 'bare' }}">
-{% macro ico(n) %}<svg viewBox="0 0 24 24" aria-hidden="true">{% if n=='home' %}<path d="M3 11l9-8 9 8"/><path d="M5 10v10h14V10"/>{% elif n=='box' %}<path d="M21 8l-9-5-9 5 9 5 9-5z"/><path d="M3 8v8l9 5 9-5V8"/><path d="M12 13v8"/>{% elif n=='list' %}<path d="M8 6h13M8 12h13M8 18h13"/><path d="M3 6h.01M3 12h.01M3 18h.01"/>{% elif n=='clock' %}<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>{% elif n=='card' %}<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18"/>{% elif n=='qr' %}<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3zM20 14v.01M20 20v.01M17 20h-3"/>{% elif n=='users' %}<circle cx="9" cy="8" r="4"/><path d="M2 21c0-4 3-7 7-7s7 3 7 7"/><path d="M17 4a4 4 0 010 8M22 21c0-3-2-5.5-5-6.5"/>{% elif n=='help' %}<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3.5"/><path d="M5.6 5.6l3.9 3.9M14.5 14.5l3.9 3.9M18.4 5.6l-3.9 3.9M9.5 14.5l-3.9 3.9"/>{% elif n=='tag' %}<path d="M3 12V3h9l9 9-9 9-9-9z"/><circle cx="7.5" cy="7.5" r="1.2"/>{% elif n=='key' %}<circle cx="8" cy="15" r="4"/><path d="M11 12l9-9M16 7l3 3"/>{% elif n=='shield' %}<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/>{% elif n=='sliders' %}<path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/>{% elif n=='out' %}<path d="M9 21H5V3h4"/><path d="M16 17l5-5-5-5M21 12H9"/>{% elif n=='menu' %}<path d="M4 6h16M4 12h16M4 18h16"/>{% endif %}</svg>{% endmacro %}
+{% macro ico(n) %}<svg viewBox="0 0 24 24" aria-hidden="true">{% if n=='home' %}<path d="M3 11l9-8 9 8"/><path d="M5 10v10h14V10"/>{% elif n=='box' %}<path d="M21 8l-9-5-9 5 9 5 9-5z"/><path d="M3 8v8l9 5 9-5V8"/><path d="M12 13v8"/>{% elif n=='list' %}<path d="M8 6h13M8 12h13M8 18h13"/><path d="M3 6h.01M3 12h.01M3 18h.01"/>{% elif n=='clock' %}<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>{% elif n=='card' %}<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18"/>{% elif n=='qr' %}<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3zM20 14v.01M20 20v.01M17 20h-3"/>{% elif n=='users' %}<circle cx="9" cy="8" r="4"/><path d="M2 21c0-4 3-7 7-7s7 3 7 7"/><path d="M17 4a4 4 0 010 8M22 21c0-3-2-5.5-5-6.5"/>{% elif n=='help' %}<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3.5"/><path d="M5.6 5.6l3.9 3.9M14.5 14.5l3.9 3.9M18.4 5.6l-3.9 3.9M9.5 14.5l-3.9 3.9"/>{% elif n=='tag' %}<path d="M3 12V3h9l9 9-9 9-9-9z"/><circle cx="7.5" cy="7.5" r="1.2"/>{% elif n=='key' %}<circle cx="8" cy="15" r="4"/><path d="M11 12l9-9M16 7l3 3"/>{% elif n=='shield' %}<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/>{% elif n=='sliders' %}<path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/>{% elif n=='out' %}<path d="M9 21H5V3h4"/><path d="M16 17l5-5-5-5M21 12H9"/>{% elif n=='link' %}<path d="M10 14a5 5 0 007 0l3-3a5 5 0 00-7-7l-1 1"/><path d="M14 10a5 5 0 00-7 0l-3 3a5 5 0 007 7l1-1"/>{% elif n=='menu' %}<path d="M4 6h16M4 12h16M4 18h16"/>{% endif %}</svg>{% endmacro %}
 {% macro nl(ep, label, icon, count=0, alt='') %}<a class="nl {{ 'on' if request.endpoint == ep or request.endpoint == alt }}" href="{{ url_for(ep) }}">{{ ico(icon) }}<span>{{ label }}</span>{% if count %}<span class="badge">{{ count }}</span>{% endif %}</a>{% endmacro %}
 {% if session.get('ok') %}
 <div class="topbar"><button type="button" onclick="document.body.classList.toggle('nav-open')" aria-label="Open menu">{{ ico('menu') }}</button><span class="mark">{{ shop[:1]|upper }}</span><span>{{ shop }}</span></div>
@@ -201,6 +203,7 @@ h2{font-size:22px}
 {{ nl('tickets','Support','help',open_tickets,'ticket') }}
 {{ nl('userprices','User prices','tag') }}
 <div class="grp">System</div>
+{{ nl('suppliers_admin.suppliers','Suppliers API','link') }}
 {{ nl('reseller_admin.resellers','Resellers API','key') }}
 {{ nl('admins','Admins','shield') }}
 {{ nl('settings','Settings','sliders') }}
@@ -474,14 +477,43 @@ h2{font-size:22px}
 <textarea name="description" rows="4">{{ p.description or '' }}</textarea>
 <button type="submit">Save changes</button>
 </form>
-{% if api_enabled and p.kind != 'manual' %}
-<form method="post" action="{{ url_for('api_link', pid=p.id) }}" style="margin-top:14px">
-<label>Provider API link {% if p.api_key %}<span class="muted">· cost ${{ '%.2f' % p.api_cost }} · provider stock {{ p.api_stock }} · profit ${{ '%.2f' % (p.price - p.api_cost) }}/item</span>{% endif %}</label>
-<select name="provider_key">
-<option value="">- not linked (own stock only) -</option>
-{% for a in api_items %}<option value="{{ a.key }}" {{ 'selected' if p.api_key == a.key }}>{{ a.name }} · cost ${{ a.price_usdt_from }} · stock {{ a.stock }}</option>{% endfor %}
+{% if p.kind != 'manual' %}
+{% set src = sources.get(p.id) %}
+<div style="margin-top:14px">
+<label>Suppliers (API) {% if p.api_key %}<span class="muted">· active cost ${{ '%.2f' % p.api_cost }} · profit ${{ '%.2f' % (p.price - p.api_cost) }}/item</span>{% endif %}</label>
+{% if src %}
+<div class="scroll"><table>
+<tr><th>Supplier</th><th>Product key</th><th>Cost</th><th>Stock</th><th>Profit</th><th></th></tr>
+{% for o in src.offers %}<tr>
+<td>{{ o.sname }}{% if src.mode == 'manual' and src.chosen == o.supplier_id %} <span class="muted">(first choice)</span>{% endif %}</td>
+<td><code>{{ o.provider_key }}</code></td><td>${{ '%.2f' % o.cost }}</td><td>{{ o.stock }}</td>
+<td class="{{ 'paid' if p.price > o.cost else 'failed' }}">${{ '%.2f' % (p.price - o.cost) }}</td>
+<td><form method="post" action="{{ url_for('source_edit', pid=p.id) }}"><input type="hidden" name="action" value="remove"><input type="hidden" name="source_id" value="{{ o.id }}"><button class="red sm" type="submit">Remove</button></form></td>
+</tr>{% endfor %}
+</table></div>
+<form method="post" action="{{ url_for('source_edit', pid=p.id) }}" style="margin-top:10px">
+<input type="hidden" name="action" value="mode">
+<label>Which supplier to buy from</label>
+<select name="mode">
+<option value="manual" {{ 'selected' if src.mode == 'manual' }}>I choose the supplier</option>
+<option value="cheapest" {{ 'selected' if src.mode == 'cheapest' }}>Automatically the cheapest one that has stock</option>
 </select>
-<button type="submit">Save API link</button></form>
+<label>My choice <span class="hint">used first when "I choose"</span></label>
+<select name="chosen">{% for o in src.offers %}<option value="{{ o.supplier_id }}" {{ 'selected' if src.chosen == o.supplier_id }}>{{ o.sname }} · ${{ '%.2f' % o.cost }} · stock {{ o.stock }}</option>{% endfor %}</select>
+<label style="display:flex;gap:8px;align-items:center"><input type="checkbox" name="fallback" value="1" style="width:auto" {{ 'checked' if src.fallback }}> If it fails or is out of stock, try the other suppliers</label>
+<button type="submit">Save</button></form>
+{% endif %}
+{% if suppliers_cat %}
+<form method="post" action="{{ url_for('source_edit', pid=p.id) }}" style="margin-top:10px">
+<input type="hidden" name="action" value="add">
+<label>Add a supplier product</label>
+<select name="offer" required>
+<option value="">- choose -</option>
+{% for sp in suppliers_cat %}<optgroup label="{{ sp.name }}">{% for a in sp['items'] %}<option value="{{ sp.id }}|{{ a.key }}">{{ a.name }} · cost ${{ '%.2f' % a.cost }} · stock {{ a.stock }}</option>{% endfor %}</optgroup>{% endfor %}
+</select>
+<button type="submit">Add</button></form>
+{% else %}<p class="muted" style="margin-top:8px">No supplier connected yet. <a href="{{ url_for('suppliers_admin.suppliers') }}">Add a supplier</a>.</p>{% endif %}
+</div>
 {% endif %}
 </div></details>
 
@@ -989,31 +1021,34 @@ def orders():
 
 @app.route("/products")
 def products():
-    api_items = []
-    if provider.ENABLED:
-        try:
-            api_items = provider.catalog(max_age=60)
-        except Exception as e:
-            flash(f"Provider API error: {str(e)[:150]}", "err")
+    cat, errs = db.catalog_options(max_age=60)
+    for e in errs:
+        flash(e, "err")
     prods = db.list_products()
     items = {p["id"]: db.stock_items(p["id"], 50) for p in prods if p["kind"] != "manual"}
-    return render("products.html", products=prods, items=items, api_items=api_items,
-                  api_enabled=provider.ENABLED, open_id=request.args.get("open", type=int))
+    return render("products.html", products=prods, items=items, suppliers_cat=cat,
+                  sources=db.sources_by_product(), open_id=request.args.get("open", type=int))
 
 
-@app.route("/products/<int:pid>/apilink", methods=["POST"])
-def api_link(pid):
-    key = request.form.get("provider_key", "").strip()
+@app.route("/products/<int:pid>/sources", methods=["POST"])
+def source_edit(pid):
+    act = request.form.get("action", "")
     try:
-        if key:
-            db.link_api(pid, key)
-            flash("Linked to provider product. Stock = your own stock + provider stock.")
-        else:
-            db.unlink_api(pid)
-            flash("Provider link removed.")
+        if act == "add":
+            sid, _, key = request.form.get("offer", "").partition("|")
+            db.add_source(pid, int(sid), key)
+            flash("Supplier product added.")
+        elif act == "remove":
+            db.remove_source(pid, int(request.form.get("source_id", "0")))
+            flash("Supplier product removed.")
+        elif act == "mode":
+            ch = request.form.get("chosen", "")
+            db.set_source_mode(pid, request.form.get("mode", "manual"), int(ch) if ch.isdigit() else None,
+                               bool(request.form.get("fallback")))
+            flash("Supplier choice saved.")
     except Exception as e:
         flash(str(e)[:200], "err")
-    return redirect(url_for("products"))
+    return redirect(url_for("products", open=pid))
 
 
 @app.route("/products/add", methods=["POST"])

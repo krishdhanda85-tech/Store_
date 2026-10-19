@@ -320,8 +320,8 @@ def create_order():
     # If a linked product needs more than the local stock, fetch the missing
     # quantity from the configured upstream provider before fulfilling the API order.
     try:
-        from provider import ShopDB, ENABLED as PROVIDER_ENABLED
-        if PROVIDER_ENABLED:
+        from provider import ShopDB
+        if True:
             shop = ShopDB(DB_PATH)
             link = shop._link(pid)
             if link:
@@ -345,9 +345,11 @@ def create_order():
                         if available_check + 1e-9 < amount_check:
                             return jsonify({"ok": False, "error": "insufficient_balance",
                                             "required": amount_check, "balance": round(available_check, 2)}), 402
-                        if need > int(link["provider_stock"] or 0):
+                        got = shop.fetch_stock(pid, need)      # picks the supplier you chose, with fallback
+                        if got == "stock":
                             return _error("insufficient_stock", 409)
-                        shop._fetch_from_provider(p_row, link, need)
+                        if got != "ok":
+                            return _error("upstream_provider_unavailable", 502)
     except Exception:
         log.exception("Upstream provider fulfillment failed for reseller API order")
         return _error("upstream_provider_unavailable", 502)
