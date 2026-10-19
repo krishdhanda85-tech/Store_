@@ -143,3 +143,21 @@ Files changed: bot.py, reseller_api.py, reseller_admin.py, requirements.txt (cry
 - Panel endpoint URL (e.g. Goatsell): https://your-app.up.railway.app/api/v1/index.php
   Health check (no key): https://your-app.up.railway.app/api/v1/health
 - The old Reseller_API_Channel_Features_Essential.zip was removed (outdated copies of 4 files).
+
+
+MADE-TO-ORDER RESELLER API UPDATE
+- Products with kind other than `auto`/`automatic` are listed with stock=-1, available=true, made_to_order=true. Some supplier panels may display -1 as unlimited/manual availability.
+- POST /api/v1/orders accepts `contact` (or `email` / `customer_email`) for made-to-order products, charges the reseller wallet, queues status `processing`, and alerts the shop owner.
+- Telegram alert uses the active shop's BOT_TOKEN and OWNER_ID/tenant owner ID. Keep these private.
+- Optional email alert: set SMTP_HOST, SMTP_PORT (default 587), SMTP_USER, SMTP_PASSWORD, SMTP_FROM, and MTO_NOTIFY_EMAIL in Railway Variables.
+- No database file is bundled. The code adds the `contact` column to api_reseller_orders automatically without deleting existing orders. Back up shop.db before deploying.
+
+MADE-TO-ORDER OTP FLOW (NEW)
+----------------------------
+1. Seller opens the admin panel > Resellers API and taps “I’m Online”. Keep that page open; a heartbeat keeps the online state fresh. If the page is closed or stops heartbeating for 3 minutes, the API reports the seller offline.
+2. The reseller bot should call GET /api/v1/seller-status with its API key. Show “Request OTP” only when online.
+3. When the customer taps Request OTP, the reseller bot calls POST /api/v1/orders/ORDER_ID/request-otp with its API key. If seller is offline, the API returns HTTP 409 with error seller_offline.
+4. The seller enters the current OTP in the website and taps “Send OTP to reseller API”. Order status becomes otp_ready. The reseller bot should poll GET /api/v1/orders/ORDER_ID; when status is otp_ready, send the `otp` field to the matching customer.
+5. After the customer has used the OTP, the seller enters profile and PIN on the website and completes the order. Status becomes completed; the reseller bot polls the order and sends `profile` and `pin` to that same customer.
+
+Order statuses for this flow: processing, otp_requested, otp_ready, completed. Use order ID plus your own customer mapping so data never goes to a different customer. API keys must remain private. OTP/PIN are sensitive; do not log them or store them in public channels. The website retains them in the shop database for the order record; remove the order record when no longer needed if your retention requirements call for it.

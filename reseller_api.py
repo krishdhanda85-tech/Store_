@@ -12,6 +12,8 @@ import os
 import re
 import secrets
 import sqlite3
+import smtplib
+from email.message import EmailMessage
 from datetime import datetime, timezone
 from flask import Blueprint, jsonify, request, g
 
@@ -60,13 +62,27 @@ def init_schema():
       status TEXT NOT NULL,
       items_json TEXT NOT NULL DEFAULT '[]',
       customer_ref TEXT,
+      contact TEXT,
+      otp_text TEXT,
+      profile_text TEXT,
+      pin_text TEXT,
       idempotency_key TEXT,
       created_at TEXT NOT NULL,
       UNIQUE(reseller_id, idempotency_key),
       FOREIGN KEY(reseller_id) REFERENCES api_resellers(id)
     );
     CREATE INDEX IF NOT EXISTS idx_api_orders_reseller ON api_reseller_orders(reseller_id, created_at);
+    CREATE TABLE IF NOT EXISTS api_shop_presence (
+      id INTEGER PRIMARY KEY CHECK(id=1), online INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL
+    );
+    INSERT OR IGNORE INTO api_shop_presence(id,online,updated_at) VALUES(1,0,CURRENT_TIMESTAMP);
     """)
+    order_cols = [r[1] for r in c.execute("PRAGMA table_info(api_reseller_orders)").fetchall()]
+    if "contact" not in order_cols:
+        c.execute("ALTER TABLE api_reseller_orders ADD COLUMN contact TEXT")
+    for col in ("otp_text", "profile_text", "pin_text"):
+        if col not in order_cols:
+            c.execute(f"ALTER TABLE api_reseller_orders ADD COLUMN {col} TEXT")
     cols = [r[1] for r in c.execute("PRAGMA table_info(api_resellers)").fetchall()]
     if "user_id" not in cols:   # Telegram user id -> API orders are paid from that user's bot wallet
         c.execute("ALTER TABLE api_resellers ADD COLUMN user_id INTEGER")
@@ -291,6 +307,93 @@ def balance():
     return jsonify({"ok": True, "reseller_id": g.reseller["id"], "balance": round(bal, 2)})
 
 
+def _notify_owner_mto(order_id, product_name, qty, amount, reseller_name, contact, customer_ref):
+    """Best-effort owner alert. Telegram is primary; SMTP email is optional via env vars."""
+    lines = ["🛠 NEW MADE-TO-ORDER RESELLER ORDER", f"Order: {order_id}",
+             f"Product: {product_name}", f"Quantity: {qty}", f"Amount: {amount:.2f}",
+             f"Reseller: {reseller_name}", f"Customer email/contact: {contact or 'Not provided'}",
+             f"Customer reference: {customer_ref or 'Not provided'}",
+             "Action: prepare the product, then fulfill/mark this order manually."]
+    message = "\n".join(lines)
+    try:
+        tenant = tenancy.cur()
+        token = getattr(tenant, "bot_token", "") or os.getenv("BOT_TOKEN", "")
+        owner = getattr(tenant, "owner_id", 0) or int(os.getenv("OWNER_ID", "0") or 0)
+        if token and owner:
+            import requests
+            requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                          json={"chat_id": owner, "text": message}, timeout=8).raise_for_status()
+    except Exception:
+        log.exception("Could not send made-to-order Telegram alert")
+    try:
+        host = os.getenv("SMTP_HOST", "").strip()
+        to_addr = os.getenv("MTO_NOTIFY_EMAIL", "").strip()
+        from_addr = os.getenv("SMTP_FROM", "").strip() or os.getenv("SMTP_USER", "").strip()
+        if host and to_addr and from_addr:
+            msg = EmailMessage()
+            msg["Subject"] = f"Made-to-order reseller order {order_id}"
+            msg["From"] = from_addr
+            msg["To"] = to_addr
+            msg.set_content(message)
+            with smtplib.SMTP(host, int(os.getenv("SMTP_PORT", "587")), timeout=10) as server:
+                server.starttls()
+                user = os.getenv("SMTP_USER", "").strip()
+                password = os.getenv("SMTP_PASSWORD", "")
+                if user and password:
+                    server.login(user, password)
+                server.send_message(msg)
+    except Exception:
+        log.exception("Could not send made-to-order email alert")
+
+
+@api.get("/api/v1/seller-status")
+def seller_status():
+    """Online presence visible to authenticated reseller integrations."""
+    c = connect()
+    row = c.execute("SELECT online,updated_at FROM api_shop_presence WHERE id=1").fetchone()
+    c.close()
+    online = bool(row["online"]) if row else False
+    if online and row and row["updated_at"]:
+        try:
+            stamp = datetime.fromisoformat(str(row["updated_at"]).replace("Z", "+00:00"))
+            if stamp.tzinfo is None: stamp = stamp.replace(tzinfo=timezone.utc)
+            online = (datetime.now(timezone.utc) - stamp).total_seconds() <= 180
+        except (TypeError, ValueError):
+            online = False
+    return jsonify({"ok": True, "online": online, "status": "online" if online else "offline",
+                    "updated_at": row["updated_at"] if row else None,
+                    "message": "Seller online — OTP requests may be submitted" if online else "Seller offline — order will remain pending"})
+
+
+@api.post("/api/v1/orders/<order_id>/request-otp")
+def request_order_otp():
+    """Called by a reseller bot when its customer taps Request OTP."""
+    c = connect()
+    presence = c.execute("SELECT online,updated_at FROM api_shop_presence WHERE id=1").fetchone()
+    online = bool(presence["online"]) if presence else False
+    if online and presence and presence["updated_at"]:
+        try:
+            stamp = datetime.fromisoformat(str(presence["updated_at"]).replace("Z", "+00:00"))
+            if stamp.tzinfo is None: stamp = stamp.replace(tzinfo=timezone.utc)
+            online = (datetime.now(timezone.utc) - stamp).total_seconds() <= 180
+        except (TypeError, ValueError):
+            online = False
+    if not online:
+        c.close()
+        return _error("seller_offline", 409)
+    c.execute("BEGIN IMMEDIATE")
+    row = c.execute("SELECT * FROM api_reseller_orders WHERE id=? AND reseller_id=?", (request.view_args.get("order_id"), g.reseller["id"])).fetchone()
+    if not row:
+        c.rollback(); c.close(); return _error("order_not_found", 404)
+    if row["status"] not in ("processing", "otp_requested"):
+        c.rollback(); c.close(); return _error("order_not_waiting_for_otp", 409)
+    c.execute("UPDATE api_reseller_orders SET status='otp_requested' WHERE id=? AND reseller_id=?", (row["id"], g.reseller["id"]))
+    c.commit()
+    fresh = c.execute("SELECT * FROM api_reseller_orders WHERE id=?", (row["id"],)).fetchone()
+    c.close()
+    return jsonify({"ok": True, "order": _order_json(dict(fresh)), "message": "OTP request sent to seller queue"})
+
+
 @api.get("/api/v1/products")
 def products():
     # Show live stock: local ready stock + linked upstream provider stock.
@@ -308,10 +411,13 @@ def products():
     out = []
     for r in rows:
         stock = int(r["local_stock"] or 0) + provider_stock.get(int(r["id"]), 0)
+        is_manual = str(r["kind"] or "").lower() not in ("auto", "automatic")
         unit = round(float(r["price"]) * (1 - discount / 100), 2)
         out.append({"id": r["id"], "name": r["name"], "description": r["description"],
                     "category": r["category"], "kind": r["kind"], "price": unit,
-                    "stock": stock, "available": bool(stock > 0)})
+                    # -1 is the common reseller API convention for made-to-order/unlimited availability.
+                    "stock": (-1 if is_manual else stock), "available": (True if is_manual else bool(stock > 0)),
+                    "made_to_order": is_manual, "stock_note": ("made_to_order" if is_manual else None)})
     return jsonify({"ok": True, "currency": "shop_balance_units", "products": out})
 
 @api.post("/api/v1/orders")
@@ -336,6 +442,55 @@ def create_order():
         check.close()
         if prior:
             return jsonify({"ok": True, "order": _order_json(dict(prior)), "replayed": True})
+
+    # Made-to-order products are queued for the owner instead of being rejected for zero stock.
+    # API callers can send email/contact as `contact`, `email`, or `customer_email`.
+    c = connect()
+    product = c.execute("SELECT id,name,price,active,kind FROM products WHERE id=? AND active=1", (pid,)).fetchone()
+    c.close()
+    if not product:
+        return _error("product_not_found", 404)
+    is_manual = str(product["kind"] or "").lower() not in ("auto", "automatic")
+    if is_manual:
+        contact = str(body.get("contact") or body.get("email") or body.get("customer_email") or "").strip()[:200] or None
+        if not contact:
+            return _error("contact_required_for_made_to_order", 400)
+        c = connect()
+        c.execute("BEGIN IMMEDIATE")
+        if idem:
+            prior = c.execute("SELECT * FROM api_reseller_orders WHERE reseller_id=? AND idempotency_key=?", (g.reseller["id"], idem)).fetchone()
+            if prior:
+                c.commit(); c.close()
+                return jsonify({"ok": True, "order": _order_json(dict(prior)), "replayed": True})
+        reseller = c.execute("SELECT * FROM api_resellers WHERE id=? AND active=1", (g.reseller["id"],)).fetchone()
+        if not reseller:
+            c.rollback(); c.close(); return _error("reseller_disabled", 403)
+        discount = max(0.0, min(90.0, float(reseller["price_discount"] or 0)))
+        unit = round(float(product["price"]) * (1 - discount / 100), 2)
+        amount = round(unit * qty, 2)
+        linked = reseller["user_id"]
+        if linked:
+            w = c.execute("SELECT COALESCE(balance,0) b FROM users WHERE user_id=?", (linked,)).fetchone()
+            available = float(w["b"]) if w else 0.0
+        else:
+            available = float(reseller["balance"])
+        if available + 1e-9 < amount:
+            c.rollback(); c.close()
+            return jsonify({"ok": False, "error": "insufficient_balance", "required": amount, "balance": round(available, 2)}), 402
+        order_id = "RSL-" + secrets.token_hex(6).upper()
+        timestamp = now()
+        if linked:
+            c.execute("UPDATE users SET balance=ROUND(COALESCE(balance,0)-?,2) WHERE user_id=?", (amount, linked))
+        else:
+            c.execute("UPDATE api_resellers SET balance=ROUND(balance-?,2) WHERE id=?", (amount, reseller["id"]))
+        c.execute("INSERT INTO api_reseller_orders(id,reseller_id,product_id,quantity,unit_price,amount,status,items_json,customer_ref,contact,idempotency_key,created_at) VALUES(?,?,?,?,?,?,'processing','[]',?,?,?,?)",
+                  (order_id, reseller["id"], pid, qty, unit, amount, customer_ref, contact, idem, timestamp))
+        c.commit(); c.close()
+        _notify_owner_mto(order_id, product["name"], qty, amount, reseller["name"], contact, customer_ref)
+        return jsonify({"ok": True, "order": {"id": order_id, "product_id": pid, "product_name": product["name"],
+                      "quantity": qty, "unit_price": unit, "amount": amount, "status": "processing",
+                      "items": [], "customer_ref": customer_ref, "contact": contact, "created_at": timestamp},
+                      "balance": round(available - amount, 2), "message": "Made-to-order request queued; shop owner notified."}), 201
 
     # If a linked product needs more than the local stock, fetch the missing
     # quantity from the configured upstream provider before fulfilling the API order.
@@ -422,7 +577,10 @@ def _order_json(o):
     try: items = json.loads(o.get("items_json") or "[]")
     except (ValueError, TypeError): items = []
     return {"id": o["id"], "product_id": o["product_id"], "quantity": o["quantity"], "unit_price": o["unit_price"],
-            "amount": o["amount"], "status": o["status"], "items": items, "customer_ref": o.get("customer_ref"), "created_at": o["created_at"]}
+            "amount": o["amount"], "status": o["status"], "items": items, "customer_ref": o.get("customer_ref"),
+            "contact": o.get("contact"), "otp": o.get("otp_text") if o.get("status") == "otp_ready" else None,
+            "profile": o.get("profile_text") if o.get("status") == "completed" else None,
+            "pin": o.get("pin_text") if o.get("status") == "completed" else None, "created_at": o["created_at"]}
 
 
 @api.get("/api/v1/orders")
