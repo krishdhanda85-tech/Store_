@@ -48,13 +48,13 @@ def public_url():
         url = ("https://" + domain) if domain else ""
     return url.rstrip("/")
 
-def _conn():
-    c = sqlite3.connect(DB_PATH, timeout=15)
+def _connect(db_path):
+    c = sqlite3.connect(db_path, timeout=15)
     c.row_factory = sqlite3.Row
     return c
 
-def ensure_schema():
-    c = _conn()
+def ensure_schema(db_path=None):
+    c = _connect(db_path or DB_PATH)
     c.execute("""CREATE TABLE IF NOT EXISTS crypto_payments (
         order_id TEXT PRIMARY KEY, payable REAL NOT NULL,
         created_ms INTEGER NOT NULL, txid TEXT UNIQUE)""")
@@ -65,21 +65,49 @@ def ensure_schema():
         c.execute("ALTER TABLE crypto_payments ADD COLUMN submitted_txid TEXT")
     c.commit(); c.close()
 
-def get_payment_info(order_id):
-    ensure_schema(); c = _conn()
+def get_payment_info(order_id, db_path=None):
+    ensure_schema(db_path); c = _connect(db_path or DB_PATH)
     r = c.execute("SELECT * FROM crypto_payments WHERE order_id=?", (order_id,)).fetchone()
     c.close(); return r
 
 class BinancePayClient:
-    """Name kept so existing bot.py imports work. Handles both 'bsc' and 'bpay' methods."""
-    def __init__(self, api_key="", secret_key="", base_url=""):
+    """Handles both 'bsc' and 'bpay' methods for ONE shop (tenant).
+
+    cfg=None  -> the main shop: values come from Railway variables (old behaviour).
+    cfg=dict  -> a seller's own payment setup: api_key, secret, pay_id, deposit_address,
+                 network (optional). The BSC RPC URL, USDT contract, proxy and Binance base
+                 URL are platform-wide (Railway variables) and shared by every shop.
+    db_path   -> the shop's own database file (payment rows are stored per shop).
+    """
+    def __init__(self, cfg=None, db_path=None):
+        cfg = cfg or {}
         self._bp_cache = None  # (timestamp, rows)
-        ensure_schema()
+        self.db_path = db_path or DB_PATH
+        self.api_key = (cfg.get("api_key") if cfg else BINANCE_API_KEY) or ""
+        self.secret = (cfg.get("secret") if cfg else BINANCE_SECRET) or ""
+        self.pay_id = (cfg.get("pay_id") if cfg else PAY_ID) or ""
+        self.deposit_address = (cfg.get("deposit_address") if cfg else DEPOSIT_ADDRESS) or ""
+        self.deposit_network = (cfg.get("network") or DEPOSIT_NETWORK) if cfg else DEPOSIT_NETWORK
+        self.rpc_url = RPC_URL
+        self.contract = USDT_CONTRACT_ADDRESS
+        ensure_schema(self.db_path)
+
+    # ---------- what this shop has configured ----------
+    @property
+    def binance_enabled(self):
+        return bool(self.api_key and self.secret and self.pay_id)
+
+    @property
+    def bsc_enabled(self):
+        return bool(self.rpc_url and self.deposit_address and self.contract)
+
+    def _conn(self):
+        return _connect(self.db_path)
 
     # ---------- BSC ----------
     def _rpc(self, method, params):
-        if not RPC_URL: raise RuntimeError("Set NODEREAL_RPC_URL in Railway Variables.")
-        r = requests.post(RPC_URL, json={"jsonrpc":"2.0", "id":1, "method":method, "params":params}, timeout=20)
+        if not self.rpc_url: raise RuntimeError("BSC RPC is not configured on the platform (NODEREAL_RPC_URL).")
+        r = requests.post(self.rpc_url, json={"jsonrpc":"2.0", "id":1, "method":method, "params":params}, timeout=20)
         r.raise_for_status(); data = r.json()
         if data.get("error"): raise RuntimeError(f"BSC RPC error: {data['error']}")
         return data.get("result")
@@ -89,15 +117,15 @@ class BinancePayClient:
         now = time.time()
         if not force and self._bp_cache and now - self._bp_cache[0] < BPAY_CACHE_SECONDS:
             return self._bp_cache[1]
-        if not BINANCE_ENABLED:
-            raise RuntimeError("Set BINANCE_API_KEY, BINANCE_SECRET_KEY and BINANCE_PAY_ID in Railway Variables.")
+        if not self.binance_enabled:
+            raise RuntimeError("Binance Pay is not configured: set the Binance API key, secret and Pay ID.")
         ts = int(now * 1000)
         qs = urlencode({"startTimestamp": ts - BPAY_WINDOW_MS, "endTimestamp": ts,
                         "limit": 100, "timestamp": ts, "recvWindow": 10000})
-        sig = hmac.new(BINANCE_SECRET.encode(), qs.encode(), hashlib.sha256).hexdigest()
+        sig = hmac.new(self.secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
         proxies = {"https": BINANCE_PROXY, "http": BINANCE_PROXY} if BINANCE_PROXY else None
         r = requests.get(f"{BINANCE_BASE}/sapi/v1/pay/transactions?{qs}&signature={sig}",
-                         headers={"X-MBX-APIKEY": BINANCE_API_KEY}, proxies=proxies, timeout=20)
+                         headers={"X-MBX-APIKEY": self.api_key}, proxies=proxies, timeout=20)
         if r.status_code == 451:
             raise RuntimeError("Binance returned 451: this server's IP/region is blocked. "
                                "Move the service to a non-US region or set BINANCE_PROXY.")
@@ -115,7 +143,7 @@ class BinancePayClient:
         """Store the exact requested amount; payment is matched by submitted TX hash, not decimal slots."""
         # Keep payment amounts to 2 decimals; 0.4 and 0.40 resolve identically.
         payable = float(Decimal(str(base_amount)).quantize(Decimal("0.01")))
-        c = _conn()
+        c = self._conn()
         c.execute("INSERT OR REPLACE INTO crypto_payments(order_id,payable,created_ms,txid,method,submitted_txid) VALUES(?,?,?,NULL,?,NULL)",
                   (order_id, payable, int(time.time() * 1000), method))
         c.commit(); c.close()
@@ -126,7 +154,7 @@ class BinancePayClient:
         tx_hash = str(tx_hash or "").strip().lower()
         if not (tx_hash.startswith("0x") and len(tx_hash) == 66 and all(ch in "0123456789abcdef" for ch in tx_hash[2:])):
             return "invalid"
-        c = _conn()
+        c = self._conn()
         try:
             c.execute("BEGIN IMMEDIATE")
             row = c.execute("SELECT submitted_txid,txid FROM crypto_payments WHERE order_id=?", (order_id,)).fetchone()
@@ -144,12 +172,12 @@ class BinancePayClient:
 
     def release(self, order_id):
         """Free the reserved amount of a cancelled, still-unpaid order."""
-        c = _conn()
+        c = self._conn()
         c.execute("DELETE FROM crypto_payments WHERE order_id=? AND txid IS NULL", (order_id,))
         c.commit(); c.close()
 
     def _claim(self, order_id, txid):
-        c = _conn()
+        c = self._conn()
         try:
             cur = c.execute("UPDATE crypto_payments SET txid=? WHERE order_id=? AND txid IS NULL", (str(txid), order_id))
             c.commit(); return cur.rowcount == 1
@@ -158,16 +186,16 @@ class BinancePayClient:
 
     def create_order(self, merchant_trade_no, amount, description, method="bsc"):
         if method == "bpay":
-            if not BINANCE_ENABLED:
+            if not self.binance_enabled:
                 raise RuntimeError("Binance Pay is not configured.")
             self._bpay_history()  # preflight: fail now (e.g. 451) instead of after the user has paid
-            where = ["Send EXACTLY {text} USDT via Binance Pay:", f"Binance Pay ID: {PAY_ID}"]
+            where = ["Send EXACTLY {text} USDT via Binance Pay:", f"Binance Pay ID: {self.pay_id}"]
         else:
-            if not RPC_URL: raise RuntimeError("Set NODEREAL_RPC_URL in Railway Variables.")
-            if not DEPOSIT_ADDRESS or not USDT_CONTRACT_ADDRESS: raise RuntimeError("Set DEPOSIT_ADDRESS and USDT_CONTRACT_ADDRESS in Railway Variables.")
-            if not DEPOSIT_ADDRESS.startswith("0x") or len(DEPOSIT_ADDRESS) != 42: raise RuntimeError("DEPOSIT_ADDRESS does not look like a BSC address.")
-            if not USDT_CONTRACT_ADDRESS.startswith("0x") or len(USDT_CONTRACT_ADDRESS) != 42: raise RuntimeError("USDT_CONTRACT_ADDRESS does not look like a token contract address.")
-            where = ["Send EXACTLY {text} USDT on BNB Smart Chain (BEP20):", f"USDT address: {DEPOSIT_ADDRESS}"]
+            if not self.rpc_url: raise RuntimeError("BSC RPC is not configured on the platform (NODEREAL_RPC_URL).")
+            if not self.deposit_address or not self.contract: raise RuntimeError("BEP20 deposit address is not set.")
+            if not self.deposit_address.startswith("0x") or len(self.deposit_address) != 42: raise RuntimeError("Deposit address does not look like a BSC address.")
+            if not self.contract.startswith("0x") or len(self.contract) != 42: raise RuntimeError("USDT_CONTRACT_ADDRESS does not look like a token contract address.")
+            where = ["Send EXACTLY {text} USDT on BNB Smart Chain (BEP20):", f"USDT address: {self.deposit_address}"]
             method = "bsc"
         payable = self._reserve(merchant_trade_no, float(amount), method)
         text = f"{payable:.{DECIMALS}f}"
@@ -176,7 +204,7 @@ class BinancePayClient:
         return {"prepay_id": merchant_trade_no, "checkout_url": "", "amount_text": text, "details": details}
 
     def query_order(self, order_id):
-        row = get_payment_info(order_id)
+        row = get_payment_info(order_id, self.db_path)
         if not row: return "UNKNOWN"
         if row["txid"]: return "PAID"
         try:
@@ -207,8 +235,8 @@ class BinancePayClient:
         return "PENDING"
 
     def _query_bsc(self, order_id, row):
-        if not BSC_ENABLED:
-            raise RuntimeError("Missing NODEREAL_RPC_URL, DEPOSIT_ADDRESS or USDT_CONTRACT_ADDRESS.")
+        if not self.bsc_enabled:
+            raise RuntimeError("BEP20 is not configured (RPC, deposit address or USDT contract missing).")
         txid = str(row["submitted_txid"] or "").strip().lower()
         if not txid:
             return "PENDING"
@@ -223,8 +251,8 @@ class BinancePayClient:
         if latest - block + 1 < CONFIRMATIONS:
             return "PENDING"
         payable = Decimal(str(row["payable"]))
-        deposit_to = DEPOSIT_ADDRESS.lower()
-        token = USDT_CONTRACT_ADDRESS.lower()
+        deposit_to = self.deposit_address.lower()
+        token = self.contract.lower()
         found = False
         for item in receipt.get("logs", []):
             try:
@@ -247,5 +275,5 @@ class BinancePayClient:
         # The unique txid constraint prevents a transaction from crediting two deposits.
         if self._claim(order_id, "bsc:" + txid):
             return "PAID"
-        current = get_payment_info(order_id)
+        current = get_payment_info(order_id, self.db_path)
         return "PAID" if current and current["txid"] == "bsc:" + txid else "PENDING"

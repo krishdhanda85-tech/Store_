@@ -10,22 +10,19 @@ import requests
 from flask import Flask, request, session, redirect, url_for, render_template, render_template_string, flash
 from jinja2 import DictLoader
 
-from db import Database
 import provider
-from provider import ShopDB
+import tenancy
+import sellers_web
+from flask import g
 
-DB_PATH = os.getenv("DB_PATH", "shop.db")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
-SHOP_NAME = os.getenv("SHOP_NAME", "Digital Shop")
 
-db = ShopDB(DB_PATH)
-db.init()
+tenancy.init_all()
+db = tenancy.db                  # always the shop of the logged-in person (see guard() below)
 
 app = Flask(__name__)
-from reseller_api import api as reseller_api_blueprint, init_schema as init_reseller_schema
+from reseller_api import api as reseller_api_blueprint
 from reseller_admin import register as register_reseller_admin
-init_reseller_schema()
 app.register_blueprint(reseller_api_blueprint)
 register_reseller_admin(app, db)
 from suppliers_admin import register as register_suppliers_admin
@@ -203,7 +200,8 @@ h2{font-size:22px}
 {{ nl('tickets','Support','help',open_tickets,'ticket') }}
 {{ nl('userprices','User prices','tag') }}
 <div class="grp">System</div>
-{{ nl('suppliers_admin.suppliers','Suppliers API','link') }}
+{% if is_main %}{{ nl('sellers_admin.sellers','Sellers','users',pending_sellers) }}{% else %}{{ nl('connect','Bot & payments','link') }}{% endif %}
+{% if is_main %}{{ nl('suppliers_admin.suppliers','Suppliers API','link') }}{% endif %}
 {{ nl('reseller_admin.resellers','Resellers API','key') }}
 {{ nl('admins','Admins','shield') }}
 {{ nl('settings','Settings','sliders') }}
@@ -214,6 +212,8 @@ h2{font-size:22px}
 {% with m = get_flashed_messages(with_categories=true) %}
 {% for cat, text in m %}<div class="msg {{ 'err' if cat == 'err' else '' }}">{{ text }}</div>{% endfor %}
 {% endwith %}
+{% if session.get('ok') and not is_main and tstatus == 'pending' %}<div class="msg err"><b>Waiting for approval.</b> The platform owner has to approve your shop before your bot goes live. You can already fill in <a href="{{ url_for('connect') }}">Bot &amp; payments</a>.</div>{% endif %}
+{% if session.get('ok') and not is_main and tstatus == 'active' and not bot_ready %}<div class="msg err"><b>Your bot is not connected yet.</b> Open <a href="{{ url_for('connect') }}">Bot &amp; payments</a> and add your bot token and Telegram ID.</div>{% endif %}
 {% if session.get('ok') and shop_closed %}<div class="msg err"><b>The shop is CLOSED.</b> Customers cannot use the bot.
 <form method="post" action="{{ url_for('shop_toggle') }}" style="margin:8px 0 0"><input type="hidden" name="state" value="open"><input type="hidden" name="back" value="{{ request.path }}"><button type="submit" class="green sm">Open the shop</button></form></div>{% endif %}
 {% block body %}{% endblock %}
@@ -224,10 +224,13 @@ h2{font-size:22px}
 <h2>{{ shop }}</h2>
 <p class="muted">Sign in to manage your store.</p>
 <form method="post">
+<label for="em">E-mail <span class="muted">(sellers; leave empty if you are the platform owner)</span></label>
+<input id="em" type="email" name="email" placeholder="you@example.com" autofocus>
 <label for="pw">Password</label>
-<input id="pw" type="password" name="password" placeholder="Enter admin password" autofocus required>
+<input id="pw" type="password" name="password" placeholder="Password" required>
 <button type="submit">Sign in</button>
-</form></div>{% endblock %}""",
+</form>
+{% if signup != 'closed' %}<p class="muted" style="margin:14px 0 0"><a href="{{ url_for('register_seller') }}">Want your own shop? Create a seller account</a></p>{% endif %}</div>{% endblock %}""",
     "dashboard.html": """{% extends 'base.html' %}{% block body %}
 <div class="page-head"><h2>Dashboard</h2>
 <div class="seg">{% for k, lbl in ranges %}<a href="{{ url_for('dashboard', range=k) }}" class="{{ 'on' if k == rng }}">{{ lbl }}</a>{% endfor %}</div></div>
@@ -832,25 +835,34 @@ mark();
 </div></form>{% endif %}</div>
 {% else %}<div class="card">Nothing here.</div>{% endfor %}{% endblock %}""",
 }
+TEMPLATES.update(sellers_web.TEMPLATES)
 app.jinja_loader = DictLoader(TEMPLATES)
 
 
-def render_str(source, **kw):
-    if session.get("ok"):
+def _ctx(kw):
+    """Values every page needs: the shop name and, for a logged-in person, the menu counters."""
+    t = tenancy.current_or_none()
+    kw.setdefault("shop", t.name if t else tenancy.PLATFORM_NAME)
+    kw.setdefault("signup", tenancy.signup_mode())
+    if t and session.get("ok"):
         kw.setdefault("pending_count", len(db.pending_manual()))
         kw.setdefault("open_tickets", len(db.all_tickets("open")))
         kw.setdefault("upi_pending", db.upi_review_count())
         kw.setdefault("shop_closed", not db.get_setting("shop_open", 1))
-    return render_template_string(source, shop=SHOP_NAME, **kw)
+        kw.setdefault("is_main", t.is_main)
+        kw.setdefault("tstatus", t.status)
+        kw.setdefault("bot_ready", t.can_run_bot or t.is_main)
+        if t.is_main:
+            kw.setdefault("pending_sellers", sum(1 for r in tenancy.all_rows() if r["status"] == "pending"))
+    return kw
+
+
+def render_str(source, **kw):
+    return render_template_string(source, **_ctx(kw))
 
 
 def render(name, **kw):
-    if session.get("ok"):
-        kw.setdefault("pending_count", len(db.pending_manual()))
-        kw.setdefault("open_tickets", len(db.all_tickets("open")))
-        kw.setdefault("upi_pending", db.upi_review_count())
-        kw.setdefault("shop_closed", not db.get_setting("shop_open", 1))
-    return render_template(name, shop=SHOP_NAME, **kw)
+    return render_template(name, **_ctx(kw))
 
 
 # ------------------------------------------------------------------- auth
@@ -863,32 +875,72 @@ def _blocked(ip):
     return len(_attempts[ip]) >= 5
 
 
+PUBLIC_ENDPOINTS = ("login", "static", "register_seller")
+
+
 @app.before_request
 def guard():
+    """Decides who is logged in and points `db` / `binance` at THEIR shop for this request."""
     if request.path.startswith("/api"):
+        return None                       # the API picks the shop from the API key
+    if request.endpoint in PUBLIC_ENDPOINTS:
         return None
-    if request.endpoint in ("login", "static"):
-        return None
-    if not session.get("ok"):
+    tid = session.get("tid")
+    if not session.get("ok") or not tid:
+        session.clear()
         return redirect(url_for("login"))
+    t = tenancy.get_tenant(tid)
+    if t is None or t.status == "suspended":
+        session.clear()
+        flash("This account is not available. Contact the platform owner.", "err")
+        return redirect(url_for("login"))
+    ep = request.endpoint or ""
+    if not t.is_main and (ep.startswith("sellers_admin.") or ep.startswith("suppliers_admin.")):
+        return redirect(url_for("dashboard"))
+    g._tenant_tok = tenancy.set_current(t)
     return None
+
+
+@app.teardown_request
+def release_shop(exc):
+    tok = g.pop("_tenant_tok", None)
+    if tok is not None:
+        try:
+            tenancy.reset_current(tok)
+        except ValueError:
+            pass
 
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
         ip = request.headers.get("X-Forwarded-For", request.remote_addr or "").split(",")[0].strip()
-        if not ADMIN_PASSWORD:
-            flash("ADMIN_PASSWORD is not set on the server.", "err")
-        elif _blocked(ip):
+        email = (request.form.get("email") or "").strip()
+        password = request.form.get("password", "")
+        if _blocked(ip):
             flash("Too many attempts. Try again in 5 minutes.", "err")
-        elif hmac.compare_digest(request.form.get("password", ""), ADMIN_PASSWORD):
-            session.clear()
-            session["ok"] = True
-            return redirect(url_for("dashboard"))
-        else:
+            return render("login.html")
+        tid, err = None, None
+        if email:                                   # a seller
+            tid = tenancy.authenticate(email, password)
+        elif not ADMIN_PASSWORD:                    # the platform owner
+            err = "ADMIN_PASSWORD is not set on the server."
+        elif hmac.compare_digest(password, ADMIN_PASSWORD):
+            tid = tenancy.MAIN_ID
+        if tid:
+            t = tenancy.get_tenant(tid)
+            if t and t.status == "suspended":
+                err = "This account is suspended. Contact the platform owner."
+            elif t:
+                session.clear()
+                session["ok"] = True
+                session["tid"] = tid
+                ready = tid == tenancy.MAIN_ID or t.can_run_bot
+                return redirect(url_for("dashboard") if ready else url_for("connect"))
+        elif err is None:
             _attempts.setdefault(ip, []).append(time.time())
-            flash("Wrong password.", "err")
+            err = "Wrong e-mail or password."
+        flash(err or "Could not log in.", "err")
     return render("login.html")
 
 
@@ -896,6 +948,9 @@ def login():
 def logout():
     session.clear()
     return redirect(url_for("login"))
+
+
+sellers_web.register(app, render, render_str)
 
 
 # ------------------------------------------------------------------ pages
@@ -1428,6 +1483,7 @@ def ticket_photo(mid):
     c = db.conn()
     row = c.execute("SELECT photo_id FROM ticket_msgs WHERE id=?", (mid,)).fetchone()
     c.close()
+    BOT_TOKEN = tenancy.cur().bot_token
     if not row or not row["photo_id"] or not BOT_TOKEN:
         return ("", 404)
     try:

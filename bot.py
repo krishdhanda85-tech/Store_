@@ -14,33 +14,24 @@ from telegram import (Update, InlineKeyboardButton as _Btn, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, MessageHandler,
-    ContextTypes, filters
+    Application, ApplicationHandlerStop, CommandHandler, CallbackQueryHandler, MessageHandler,
+    ContextTypes, TypeHandler, filters
 )
 
-from db import Database
 import provider
 import reseller_api
-from provider import ShopDB
-from binance_pay import (BinancePayClient, PAY_ID, DEPOSIT_ADDRESS, DEPOSIT_NETWORK,
-                         BINANCE_ENABLED, BSC_ENABLED, public_url)
+import tenancy
+from binance_pay import public_url
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 DEPOSIT_TIMEOUT_MINUTES = int(os.getenv("DEPOSIT_TIMEOUT_MINUTES", os.getenv("PAYMENT_TIMEOUT_MINUTES", "15")))
 UPI_TIMEOUT_MINUTES = int(os.getenv("UPI_TIMEOUT_MINUTES", "30"))   # time to pay + send the UTR
 UTR_RE = re.compile(r"^\d{12}$")
 MIN_DEPOSIT = float(os.getenv("MIN_DEPOSIT", "0.1"))
 MAX_DEPOSIT = float(os.getenv("MAX_DEPOSIT", "100"))
-DB_PATH = os.getenv("DB_PATH", "shop.db")
-SHOP_NAME = os.getenv("SHOP_NAME", "Digital Shop")
 # Public link of the admin/API website, shown in the bot's "🔑 API" screen.
 API_BASE_URL = (os.getenv("API_BASE_URL") or os.getenv("PUBLIC_URL")
                 or (("https://" + os.getenv("RAILWAY_PUBLIC_DOMAIN")) if os.getenv("RAILWAY_PUBLIC_DOMAIN") else "")).strip().rstrip("/")
 # Optional mandatory channel join + order announcements. Bot must be admin in the channel.
-REQUIRED_CHANNEL_ID = os.getenv("REQUIRED_CHANNEL_ID", "").strip()
-REQUIRED_CHANNEL_URL = os.getenv("REQUIRED_CHANNEL_URL", "").strip()
-SALES_CHANNEL_ID = os.getenv("SALES_CHANNEL_ID", REQUIRED_CHANNEL_ID).strip()
 MANUAL_ALERTS = os.getenv("MANUAL_ALERTS", "1") != "0"   # tell the owner about new made-to-order orders
 TIERS_ENV = os.getenv("TIERS", "")                        # e.g. "10:Bronze,50:Silver,200:Gold"; empty = no tiers
 HTML = ParseMode.HTML
@@ -50,7 +41,30 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("digital-shop")
 
-db = ShopDB(DB_PATH)
+# ---- the shop (seller) that is handling the current update. `db` and `binance` always point at it.
+db = tenancy.db
+binance = tenancy.binance
+
+
+def owner_id():
+    return tenancy.cur().owner_id
+
+
+def shop_name():
+    return tenancy.cur().name
+
+
+def required_channel():
+    return tenancy.cur().required_channel_id
+
+
+def required_channel_url():
+    return tenancy.cur().required_channel_url
+
+
+def sales_channel():
+    return tenancy.cur().sales_channel_id
+
 
 
 # ---- values the admin can change on the website (Settings page); env vars are only the defaults
@@ -78,8 +92,8 @@ def welcome_text(language):
     """Greeting under the bottom menu: the admin's own text (Settings page) or the built-in one."""
     custom = (db.get_setting("welcome_text", "") or "").strip()
     if custom:
-        return esc(custom).replace("{shop}", esc(SHOP_NAME))
-    return tt(language, "menu_ready", shop=esc(SHOP_NAME))
+        return esc(custom).replace("{shop}", esc(shop_name()))
+    return tt(language, "menu_ready", shop=esc(shop_name()))
 
 
 def shop_closed_for(uid):
@@ -92,7 +106,6 @@ def closed_text():
     if custom:
         return esc(custom)
     return "🔧 <b>The shop is closed right now.</b>\n\nWe will be back soon. Please try again later."
-binance = BinancePayClient()
 
 # ---------------------------------------------------------------- texts
 # Every key exists in English; the Chinese table only needs the keys it translates
@@ -179,7 +192,7 @@ TEXT = {
         "btn_api": "🔑 API",
         "btn_api_docs": "📖 API Docs",
         "btn_docs_dl": "📄 Download docs",
-        "api_docs_1": "📖 <b>API Docs · 1/3 · Quick start</b>\n\n1️⃣ Create your key: <b>🔑 Reseller API → Create API key</b>\n2️⃣ Top up your wallet with <b>Add Funds</b>\n3️⃣ Paste this in your panel or bot:\n\n<b>API URL</b>\n<code>{url}/api/v1/index.php</code>\n<b>API key</b>\n<code>{key}</code> (starts with rs_live_)\n\n4️⃣ Test it in your browser:\n<code>{url}/api/v1/index.php?action=balance&amp;api_key={key}</code>\n\nYou can send the key as header <code>Authorization: Bearer {key}</code>, header <code>X-API-Key</code>, or field <code>api_key</code>.\n\nUse https:// and the full path, not only the domain.",
+        "api_docs_1": "📖 <b>API Docs · 1/3 · Quick start</b>\n\n1️⃣ Create your key: <b>🔑 Reseller API → Create API key</b>\n2️⃣ Top up your wallet with <b>Add Funds</b>\n3️⃣ Paste this in your panel or bot:\n\n<b>API URL</b>\n<code>{url}/api/v1/index.php</code>\n<b>API key</b>\n<code>{key}</code> (starts with rs_)\n\n4️⃣ Test it in your browser:\n<code>{url}/api/v1/index.php?action=balance&amp;api_key={key}</code>\n\nYou can send the key as header <code>Authorization: Bearer {key}</code>, header <code>X-API-Key</code>, or field <code>api_key</code>.\n\nUse https:// and the full path, not only the domain.",
         "api_docs_2": "📖 <b>API Docs · 2/3 · Actions</b>\n\nOne URL, choose with <code>action</code>:\n\n<code>action=products</code> products, price, stock\n<code>action=balance</code> wallet balance\n<code>action=buy</code> place an order\n<code>action=order</code> one order (<code>order_id</code>)\n<code>action=orders</code> last 100 orders\n\n<b>Buy example</b>\n<code>{url}/api/v1/index.php?action=buy&amp;product_id=1&amp;quantity=2&amp;idempotency_key=order-1001&amp;api_key={key}</code>\n\nMax 20 per order. Always send a unique <code>idempotency_key</code>: if you retry after a timeout you get the same order back and are not charged twice.\n\nREST also works: <code>GET /api/v1/products</code>, <code>GET /api/v1/balance</code>, <code>POST /api/v1/orders</code>.",
         "api_docs_3": "📖 <b>API Docs · 3/3 · Replies and errors</b>\n\nEvery reply is JSON.\nSuccess: <code>{{\"ok\": true, ...}}</code>\nError: <code>{{\"ok\": false, \"error\": \"code\"}}</code>\n\nBuy reply has <code>order.items</code> = your delivered accounts and <code>balance</code> = wallet left.\n\n<b>Errors</b>\n401 <code>missing_api_key</code> / <code>invalid_api_key</code>\n402 <code>insufficient_balance</code> (top up)\n409 <code>insufficient_stock</code>\n404 <code>product_not_found</code> / <code>not_found</code>\n400 bad quantity or unknown action\n403 <code>reseller_disabled</code> (contact Support)\n\nPress <b>📄 Download docs</b> for the full guide with curl, Python and PHP examples.",
         "btn_api_new": "🔑 Create API key",
@@ -303,7 +316,7 @@ def lang(user_id: int) -> str:
 
 
 def is_owner(user_id: int) -> bool:
-    return user_id == OWNER_ID
+    return user_id == owner_id()
 
 
 def is_admin(user_id: int) -> bool:
@@ -314,8 +327,8 @@ def admin_ids():
     c = db.conn()
     ids = {r["user_id"] for r in c.execute("SELECT user_id FROM admins").fetchall()}
     c.close()
-    if OWNER_ID:
-        ids.add(OWNER_ID)
+    if owner_id():
+        ids.add(owner_id())
     return ids
 
 
@@ -444,7 +457,7 @@ def product_button(uid: int, p):
 def shop_view(uid: int, language: str, category: str = None):
     products = db.list_products()
     if not products:
-        return tt(language, "no_products", shop=esc(SHOP_NAME)), Markup([[Btn(tt(language, "btn_search"), callback_data="search", style="primary")]])
+        return tt(language, "no_products", shop=esc(shop_name())), Markup([[Btn(tt(language, "btn_search"), callback_data="search", style="primary")]])
     rows = []
     if category is None:
         avail = sum(1 for p in products if is_available(p))
@@ -532,9 +545,9 @@ def wallet_view(uid: int, language: str):
     text = tt(language, "wallet", bal=money(bal), inr=inr(bal), rate=rate_text(),
               min=f"{min_deposit():g}", max=f"{max_deposit():g}")
     rows = []
-    if BINANCE_ENABLED:
+    if binance.binance_enabled:
         rows.append([Btn(tt(language, "btn_bpay"), callback_data="fm:bpay")])
-    if BSC_ENABLED:
+    if binance.bsc_enabled:
         rows.append([Btn(tt(language, "btn_crypto"), callback_data="fm:bsc")])
     if db.upi_active_count() > 0:
         rows.append([Btn(tt(language, "btn_upi"), callback_data="fm:upi")])
@@ -587,7 +600,7 @@ def referral_view(uid: int, bot_username: str, language: str):
     acct = db.get_account(uid)
     text = tt(language, "referral", n=db.referral_count(uid), earned=money(acct["ref_earned"] or 0), paid="0.00",
               pct=f"{db.referral_percent():g}", link=esc(link), code=code)
-    share = f"https://t.me/share/url?url={quote(link)}&text={quote(tt(language, 'share_text', shop=SHOP_NAME))}"
+    share = f"https://t.me/share/url?url={quote(link)}&text={quote(tt(language, 'share_text', shop=shop_name()))}"
     return text, Markup([[Btn(tt(language, "btn_share"), url=share, style="success")]])
 
 
@@ -625,9 +638,9 @@ def delivery_text(language: str, order, items) -> str:
 
 def payment_details(method: str) -> str:
     if method == "bpay":
-        return f"🟡 Binance Pay ID / UID:\n<code>{esc(PAY_ID)}</code>\n\nBinance app → Pay → Send → Pay ID, then send the exact amount in USDT."
-    net = f" ({esc(DEPOSIT_NETWORK)})" if DEPOSIT_NETWORK else ""
-    return f"💳 USDT{net} address:\n<code>{esc(DEPOSIT_ADDRESS)}</code>"
+        return f"🟡 Binance Pay ID / UID:\n<code>{esc(binance.pay_id)}</code>\n\nBinance app → Pay → Send → Pay ID, then send the exact amount in USDT."
+    net = f" ({esc(binance.deposit_network)})" if binance.deposit_network else ""
+    return f"💳 USDT{net} address:\n<code>{esc(binance.deposit_address)}</code>"
 
 
 async def notify_admins(context, text, ticket_id=None, photo_id=None):
@@ -645,10 +658,10 @@ async def notify_admins(context, text, ticket_id=None, photo_id=None):
 
 # ---------------------------------------------------------------- channel join gate + sales announcements
 async def is_required_channel_member(bot, user_id: int) -> bool:
-    if not REQUIRED_CHANNEL_ID:
+    if not required_channel():
         return True
     try:
-        member = await bot.get_chat_member(REQUIRED_CHANNEL_ID, user_id)
+        member = await bot.get_chat_member(required_channel(), user_id)
         return member.status in ("member", "administrator", "creator") or (member.status == "restricted" and getattr(member, "is_member", False))
     except Exception as exc:
         log.warning("Required channel membership check failed: %s", exc)
@@ -658,18 +671,18 @@ async def is_required_channel_member(bot, user_id: int) -> bool:
 
 def join_channel_markup():
     rows = []
-    if REQUIRED_CHANNEL_URL:
-        rows.append([Btn("📢 Join channel", url=REQUIRED_CHANNEL_URL)])
+    if required_channel_url():
+        rows.append([Btn("📢 Join channel", url=required_channel_url())])
     rows.append([Btn("✅ I've joined — Check", callback_data="joincheck", style="success")])
     return Markup(rows)
 
 
 async def announce_sale(bot, product_name: str, quantity: int, order_id: str, source: str = "Shop"):
-    if not SALES_CHANNEL_ID:
+    if not sales_channel():
         return
     try:
         await bot.send_message(
-            chat_id=SALES_CHANNEL_ID,
+            chat_id=sales_channel(),
             text=(f"🛒 <b>New order completed</b>\n\n"
                   f"📦 Product: <b>{esc(product_name)}</b>\n"
                   f"🔢 Quantity sold: <b>{int(quantity)}</b>\n"
@@ -679,14 +692,14 @@ async def announce_sale(bot, product_name: str, quantity: int, order_id: str, so
             disable_web_page_preview=True,
         )
     except Exception:
-        log.exception("Could not post sale update to channel %s", SALES_CHANNEL_ID)
+        log.exception("Could not post sale update to channel %s", sales_channel())
 
 
 async def send_start_screen(message, user, context):
     created = db.ensure_user(user.id, user.username)
     language = db.get_user_language(user.id)
     if not language:
-        await message.reply_text(tt("en", "welcome", shop=esc(SHOP_NAME)), reply_markup=kb_lang(), parse_mode=HTML)
+        await message.reply_text(tt("en", "welcome", shop=esc(shop_name())), reply_markup=kb_lang(), parse_mode=HTML)
         return
     await message.reply_text(welcome_text(language),
                              reply_markup=main_keyboard(), parse_mode=HTML)
@@ -701,7 +714,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if shop_closed_for(u.id):
         await update.effective_message.reply_text(closed_text(), parse_mode=HTML)
         return
-    if REQUIRED_CHANNEL_ID and not await is_required_channel_member(context.bot, u.id):
+    if required_channel() and not await is_required_channel_member(context.bot, u.id):
         prompt = "📢 <b>Join our channel first</b>\n\nPlease join the channel and then tap <b>I've joined — Check</b> to use the bot."
         await update.effective_message.reply_text(prompt, reply_markup=join_channel_markup(), parse_mode=HTML)
         return
@@ -952,7 +965,7 @@ async def cb_fund_method(update, context, arg):
         await edit(q, tt(language, "ask_amount_upi", rate=rate_text(), min=f"{min_deposit():g}", max=f"{max_deposit():g}"),
                    Markup([[Btn(tt(language, "back"), callback_data="fund", style="primary")]]))
         return
-    if (arg == "bsc" and not BSC_ENABLED) or (arg == "bpay" and not BINANCE_ENABLED) or arg not in ("bsc", "bpay"):
+    if (arg == "bsc" and not binance.bsc_enabled) or (arg == "bpay" and not binance.binance_enabled) or arg not in ("bsc", "bpay"):
         await q.answer(tt(language, "not_configured"), show_alert=True)
         return
     await q.answer()
@@ -1190,7 +1203,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.exception("Could not send the shop-closed message")
         return
     if action == "joincheck":
-        if REQUIRED_CHANNEL_ID and not await is_required_channel_member(context.bot, q.from_user.id):
+        if required_channel() and not await is_required_channel_member(context.bot, q.from_user.id):
             await q.answer("I can't see your channel membership yet. Join the channel first.", show_alert=True)
             return
         await q.answer("Membership verified!")
@@ -1211,11 +1224,11 @@ async def create_deposit_flow(update, context, method: str, amount: float):
     expires = datetime.now(timezone.utc) + timedelta(minutes=deposit_timeout())
     dep_id = db.create_deposit(uid, amount, method, expires)
     try:
-        pay = await asyncio.to_thread(binance.create_order, dep_id, amount, f"{SHOP_NAME} deposit {dep_id}", method)
+        pay = await asyncio.to_thread(binance.create_order, dep_id, amount, f"{shop_name()} deposit {dep_id}", method)
     except Exception:
         log.exception("Deposit creation failed (%s)", method)
         db.fail_deposit(dep_id)
-        await update.message.reply_text(tt(language, "bpay_down" if (method == "bpay" and BSC_ENABLED) else "pay_down"))
+        await update.message.reply_text(tt(language, "bpay_down" if (method == "bpay" and binance.bsc_enabled) else "pay_down"))
         return
     if method == "bsc":
         markup = Markup([[Btn("🧾 Submit TXN Hash", callback_data=f"ftx:{dep_id}", style="success")],
@@ -1607,7 +1620,7 @@ def _make_backup_file() -> str:
     tmp = os.path.join(tempfile.gettempdir(), "shop_backup.db")
     if os.path.exists(tmp):
         os.remove(tmp)
-    src = sqlite3.connect(DB_PATH)
+    src = sqlite3.connect(db.path)
     dst = sqlite3.connect(tmp)
     with dst:
         src.backup(dst)
@@ -1635,7 +1648,7 @@ async def backup_job(context: ContextTypes.DEFAULT_TYPE):
         path = await asyncio.to_thread(_make_backup_file)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
         with open(path, "rb") as fh:
-            await context.bot.send_document(OWNER_ID, fh, filename=f"shop_{stamp}.db", caption="🗂 Daily backup")
+            await context.bot.send_document(owner_id(), fh, filename=f"shop_{stamp}.db", caption="🗂 Daily backup")
     except Exception:
         log.exception("daily backup failed")
 
@@ -1643,6 +1656,10 @@ async def backup_job(context: ContextTypes.DEFAULT_TYPE):
 async def restore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Owner only: /restore - then send the backup .db file."""
     if not is_owner(update.effective_user.id):
+        return
+    if not tenancy.cur().is_main:
+        await update.message.reply_text("♻️ Restore is only available on the main shop. "
+                                        "Your /backup file is safe - ask the platform owner to restore it.")
         return
     context.bot_data["await_restore"] = True
     await update.message.reply_text("♻️ Restore mode ON.\nNow send your backup file (.db) as a document.\n"
@@ -1661,6 +1678,8 @@ async def restore_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import sqlite3, shutil, tempfile
     if not is_owner(update.effective_user.id) or not context.bot_data.get("await_restore"):
         return
+    if not tenancy.cur().is_main:
+        return
     doc = update.message.document
     tmp = os.path.join(tempfile.gettempdir(), "restore_in.db")
     try:
@@ -1673,15 +1692,15 @@ async def restore_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if ok != "ok" or not {"users", "products", "stock"} <= tables:
             await update.message.reply_text("❌ This file is not a valid shop database. Nothing changed.")
             return
-        d = os.path.dirname(os.path.abspath(DB_PATH))
+        d = os.path.dirname(os.path.abspath(db.path))
         os.makedirs(d, exist_ok=True)
-        if os.path.exists(DB_PATH):
-            shutil.copy2(DB_PATH, DB_PATH + ".pre_restore")
+        if os.path.exists(db.path):
+            shutil.copy2(db.path, db.path + ".pre_restore")
         for ext in ("-wal", "-shm"):
-            if os.path.exists(DB_PATH + ext):
-                os.remove(DB_PATH + ext)
-        shutil.copy2(tmp, DB_PATH + ".new")
-        os.replace(DB_PATH + ".new", DB_PATH)
+            if os.path.exists(db.path + ext):
+                os.remove(db.path + ext)
+        shutil.copy2(tmp, db.path + ".new")
+        os.replace(db.path + ".new", db.path)
         context.bot_data.pop("await_restore", None)
         await update.message.reply_text("✅ Database restored. Restarting the bot now (if it does not come back in a minute, press Restart in Railway).")
         await asyncio.sleep(1)
@@ -1694,8 +1713,8 @@ async def apitest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Owner only: /apitest - check Binance Pay API and BSC RPC connectivity."""
     if not is_owner(update.effective_user.id):
         return
-    out = [f"BINANCE_ENABLED={BINANCE_ENABLED}  BSC_ENABLED={BSC_ENABLED}"]
-    if BINANCE_ENABLED:
+    out = [f"Binance Pay set up: {binance.binance_enabled}   BEP20 set up: {binance.bsc_enabled}"]
+    if binance.binance_enabled:
         try:
             rows = await asyncio.to_thread(binance._bpay_history, True)
             out.append(f"Binance Pay history OK: {len(rows)} rows (last 1h)")
@@ -1703,7 +1722,7 @@ async def apitest(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 out.append(f"  {t.get('orderType')} {t.get('currency')} {t.get('amount')} @ {t.get('transactionTime')}")
         except Exception as e:
             out.append(f"Binance Pay ERROR: {str(e)[:300]}")
-    if BSC_ENABLED:
+    if binance.bsc_enabled:
         try:
             n = int(await asyncio.to_thread(binance._rpc, "eth_blockNumber", []), 16)
             out.append(f"BSC RPC OK, latest block {n}")
@@ -1842,11 +1861,31 @@ async def provider_job(context: ContextTypes.DEFAULT_TYPE):
     seen.intersection_update(alerts)     # a fixed problem can alert again if it returns
 
 
-def main():
-    if not BOT_TOKEN or not OWNER_ID:
-        raise RuntimeError("Set BOT_TOKEN and OWNER_ID environment variables.")
-    db.init()
-    app = Application.builder().token(BOT_TOKEN).build()
+# ---------------------------------------------------------------- one bot per seller
+async def _bind(update, context):
+    """Runs first for every update: point `db`, `binance`, owner id... at THIS bot's shop."""
+    t = tenancy.get_tenant(context.application.bot_data["tenant_id"])
+    if t is None or t.status != "active":
+        raise ApplicationHandlerStop
+    tenancy.set_current(t)          # same task as the real handler, so it stays set until it ends
+
+
+def _in_shop(fn):
+    """Wrap a repeating job so it also runs inside its own shop."""
+    async def run(context):
+        t = tenancy.get_tenant(context.application.bot_data["tenant_id"])
+        if t is None or t.status != "active":
+            return
+        with tenancy.use(t):
+            await fn(context)
+    run.__name__ = getattr(fn, "__name__", "job")
+    return run
+
+
+def build_application(tenant):
+    app = Application.builder().token(tenant.bot_token).build()
+    app.bot_data["tenant_id"] = tenant.id
+    app.add_handler(TypeHandler(Update, _bind), group=-1)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(CommandHandler("owner", owner_cmd))
@@ -1873,11 +1912,84 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(MENU_RE), menu_text))
     app.add_handler(MessageHandler(filters.PHOTO, photo_msg))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_msg))
-    app.job_queue.run_repeating(expiry_job, interval=20, first=10)
-    app.job_queue.run_repeating(outbox_job, interval=10, first=5)
-    app.job_queue.run_repeating(provider_job, interval=120, first=15)
-    app.job_queue.run_repeating(backup_job, interval=86400, first=600)
-    app.run_polling()
+    app.job_queue.run_repeating(_in_shop(expiry_job), interval=20, first=10)
+    app.job_queue.run_repeating(_in_shop(outbox_job), interval=10, first=5)
+    app.job_queue.run_repeating(_in_shop(provider_job), interval=120, first=15)
+    app.job_queue.run_repeating(_in_shop(backup_job), interval=86400, first=600)
+    return app
 
-if __name__ == "__main__":
-    main()
+
+async def _start_bot(tenant):
+    app = build_application(tenant)
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    return app
+
+
+async def _stop_bot(app):
+    for step in (app.updater.stop, app.stop, app.shutdown):
+        try:
+            await step()
+        except Exception:
+            log.exception("error while stopping a bot")
+
+
+MANAGER_INTERVAL = 10      # seconds between checks for new / changed / suspended shops
+
+
+async def run_all():
+    """Keeps one running bot per active seller. Checks every 10 s, so a seller who just saved
+    their bot token on the website (or was approved/suspended) goes live without a restart."""
+    import signal
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except NotImplementedError:
+            pass
+    running = {}      # tenant id -> (application, token hash)
+    failed = {}       # tenant id -> token hash that failed to start (do not retry until it changes)
+    log.info("bot manager started")
+    while not stop.is_set():
+        try:
+            wanted = {t.id: t for t in await asyncio.to_thread(tenancy.runnable_tenants)}
+        except Exception:
+            log.exception("could not read the shop list")
+            wanted = None
+        if wanted is not None:
+            for tid in list(running):
+                app, tok = running[tid]
+                t = wanted.get(tid)
+                if t is None or tenancy._hash(t.bot_token) != tok:
+                    log.info("stopping bot of shop %s", tid)
+                    await _stop_bot(app)
+                    del running[tid]
+                    tenancy.set_bot_state(tid, "stopped")
+            for tid, t in wanted.items():
+                tok = tenancy._hash(t.bot_token)
+                if tid in running or failed.get(tid) == tok:
+                    continue
+                try:
+                    running[tid] = (await _start_bot(t), tok)
+                    failed.pop(tid, None)
+                    tenancy.set_bot_state(tid, "running")
+                    log.info("bot of shop %s started", tid)
+                except Exception as e:
+                    failed[tid] = tok
+                    log.exception("bot of shop %s could not start", tid)
+                    tenancy.set_bot_state(tid, "error", str(e))
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=MANAGER_INTERVAL)
+        except asyncio.TimeoutError:
+            pass
+    for tid, (app, _) in list(running.items()):
+        await _stop_bot(app)
+
+
+def main():
+    tenancy.init_all()
+    if not tenancy.get_tenant(tenancy.MAIN_ID).can_run_bot:
+        log.warning("Main shop: BOT_TOKEN / OWNER_ID not set - only seller bots will run.")
+    return run_all()

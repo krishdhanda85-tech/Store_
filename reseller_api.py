@@ -9,23 +9,26 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import sqlite3
 from datetime import datetime, timezone
 from flask import Blueprint, jsonify, request, g
+
+import tenancy
 try:
     from cryptography.fernet import Fernet
 except Exception:   # library missing -> keys are simply not stored for re-display
     Fernet = None
 
-DB_PATH = os.getenv("DB_PATH", "shop.db")
 api = Blueprint("reseller_api", __name__)
 log = logging.getLogger("reseller_api")
 MAX_QTY = 20
 
 
 def connect():
-    c = sqlite3.connect(DB_PATH, timeout=15)
+    """Database of the shop that is handling this call (each seller has their own)."""
+    c = sqlite3.connect(tenancy.cur().db_path, timeout=15)
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA busy_timeout=15000")
     return c
@@ -105,7 +108,20 @@ def get_key_for_user(user_id):
 
 
 def _new_key():
-    return "rs_live_" + secrets.token_urlsafe(32)
+    # The key says which shop it belongs to, so one API URL can serve every seller.
+    tid = tenancy.cur().id
+    prefix = "rs_live_" if tid == tenancy.MAIN_ID else f"rs_t{tid}_"
+    return prefix + secrets.token_urlsafe(32)
+
+
+_KEY_SHOP = re.compile(r"^rs_t(\d+)_")
+
+
+def _shop_for_key(key):
+    """The active shop a key belongs to (old rs_live_ keys belong to the main shop), or None."""
+    m = _KEY_SHOP.match(key or "")
+    t = tenancy.get_tenant(int(m.group(1)) if m else tenancy.MAIN_ID)
+    return t if t and t.status == "active" else None
 
 
 def get_reseller_by_user(user_id):
@@ -195,6 +211,10 @@ def auth_reseller():
     key = _extract_key()
     if not key:
         return _error("missing_api_key", 401)
+    shop = _shop_for_key(key)
+    if not shop:
+        return _error("invalid_api_key", 401)
+    g._tenant_tok = tenancy.set_current(shop)      # reset by web.py's teardown_request
     digest = hashlib.sha256(key.encode()).hexdigest()
     c = connect()
     row = c.execute("SELECT * FROM api_resellers WHERE key_hash=? AND active=1", (digest,)).fetchone()
@@ -322,7 +342,7 @@ def create_order():
     try:
         from provider import ShopDB
         if True:
-            shop = ShopDB(DB_PATH)
+            shop = tenancy.cur().db
             link = shop._link(pid)
             if link:
                 local = connect()

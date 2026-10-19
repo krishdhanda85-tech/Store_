@@ -43,7 +43,7 @@ def register(app, db):
                     if not name:
                         flash('Reseller name is required.', 'err')
                     else:
-                        key = 'rs_live_' + secrets.token_urlsafe(32)
+                        key = reseller_api._new_key()
                         try: discount = float(request.form.get('discount', '0') or 0)
                         except ValueError: discount = 0
                         discount = max(0.0, min(90.0, discount))

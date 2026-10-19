@@ -51,7 +51,16 @@ ENABLED = True            # suppliers are managed on the admin site now
 MAX_QTY = 500
 
 _buy_lock = threading.RLock()
-_cat_cache = {}           # supplier id -> (time, [normalized products])
+_cat_cache = {}           # (supplier id, base_url, key) -> (time, [normalized products]); key parts keep shops apart
+
+
+def _ck(s):
+    return (s["id"], s.get("base_url") or "", s.get("key") or "")
+
+
+def _cache_drop(sid):
+    for k in [k for k in _cat_cache if k[0] == sid]:
+        _cat_cache.pop(k, None)
 
 
 class ProviderError(Exception):
@@ -292,11 +301,11 @@ def _adapter(s):
 
 def catalog_for(s, max_age=0):
     """Normalized product list of one supplier: [{key, name, cost, stock}]."""
-    hit = _cat_cache.get(s["id"])
+    hit = _cat_cache.get(_ck(s))
     if max_age and hit and time.time() - hit[0] < max_age:
         return hit[1]
     data = _adapter(s)[0](s)
-    _cat_cache[s["id"]] = (time.time(), data)
+    _cat_cache[_ck(s)] = (time.time(), data)
     return data
 
 
@@ -321,8 +330,12 @@ def _supplier(r):
 class ShopDB(Database):
     """Database + supplier-linked products. Drop-in replacement for Database."""
 
-    def __init__(self, *a, **k):
-        super().__init__(*a, **k)
+    def __init__(self, path, main=None):
+        # The main shop is the one living in DB_PATH. Only it may use the owner's CUPPON_API_KEY.
+        if main is None:
+            main = os.path.abspath(path) == os.path.abspath(os.getenv("DB_PATH", "shop.db"))
+        self.is_main = bool(main)
+        super().__init__(path)
         try:
             self._ensure_tables()
         except Exception:
@@ -403,6 +416,13 @@ class ShopDB(Database):
         r = c.execute("SELECT id FROM suppliers WHERE from_env=1").fetchone()
         if r:
             return r["id"]
+        if not self.is_main:
+            # A seller's shop never gets the owner's supplier (CupponHub / coupon API).
+            if not force:
+                return None
+            cur = c.execute("INSERT INTO suppliers(name,fmt,from_env,enabled,created) VALUES(?,?,?,?,?)",
+                            ("Supplier", "cupponhub", 0, 0, _now()))
+            return cur.lastrowid
         if not ENV_KEY and not force:
             return None
         cur = c.execute("INSERT INTO suppliers(name,fmt,from_env,enabled,created) VALUES(?,?,?,?,?)",
@@ -499,7 +519,7 @@ class ShopDB(Database):
             c.execute(f"UPDATE suppliers SET {', '.join(sets)} WHERE id=?", (*vals, sid))
             c.commit()
             c.close()
-            _cat_cache.pop(sid, None)
+            _cache_drop(sid)
 
     def set_supplier_enabled(self, sid, on):
         c = self.conn()
@@ -519,7 +539,7 @@ class ShopDB(Database):
         c.execute("DELETE FROM suppliers WHERE id=?", (sid,))
         c.commit()
         c.close()
-        _cat_cache.pop(sid, None)
+        _cache_drop(sid)
         self.refresh_all_maps()
 
     def test_supplier(self, sid):
@@ -696,7 +716,7 @@ class ShopDB(Database):
             try:
                 return s, catalog_for(s, max_age=max_age), None
             except Exception as e:
-                stale = _cat_cache.get(s["id"])
+                stale = _cat_cache.get(_ck(s))
                 return s, (stale[1] if stale else []), str(e)[:150]
 
         with ThreadPoolExecutor(max_workers=min(8, len(sups))) as ex:

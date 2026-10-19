@@ -1,3 +1,46 @@
+=====================================================================
+MULTI-SELLER PLATFORM (new)  -  one site, many sellers
+=====================================================================
+New files: tenancy.py, sellers_web.py.   Changed: bot.py, web.py, binance_pay.py, provider.py,
+reseller_api.py, reseller_admin.py.   Deploy ALL files together. Your existing shop.db is kept:
+it becomes the MAIN shop (id 1) and is configured exactly as before with Railway variables.
+
+Each seller gets (completely separate from you and from other sellers):
+  - their own database file  (<DB_PATH folder>/sellers/s<id>.db): products, stock, coupon/user prices,
+    customers, wallets, orders, tickets, UPI accounts, settings, reseller API keys
+  - their own Telegram bot (their BOT TOKEN) and their own owner Telegram ID
+  - their own Binance API key + secret + Binance Pay ID and their own BEP20 address
+    (customer money goes straight to the seller; keys are stored ENCRYPTED with API_KEY_SECRET)
+  - their own admin login on this same website (e-mail + password)
+Sellers do NOT get your supplier/coupon API (CUPPON_API_KEY), products, customers or coupons,
+and the Suppliers API page is owner-only. Your owner Telegram ID is not an admin inside sellers' bots.
+
+Flow
+  1. Seller opens  https://YOUR-SITE/register  -> creates an account.
+  2. Seller opens "Bot & payments" and saves: bot token, Telegram ID, Binance key/secret/Pay ID,
+     BEP20 address (optional), channels (optional). "Test payments" checks the Binance/BSC connection.
+  3. You open "Sellers" in the menu and press Approve. The seller's bot goes live within ~10 seconds,
+     no redeploy needed. Suspend stops their bot, API keys and login at once.
+  4. Seller adds products and manages everything on the site / in their bot like you do.
+
+New Railway variables (all optional)
+  SELLER_SIGNUP=approval   approval (default: you approve each seller) | open | closed
+  MAX_SELLERS=50           how many seller bots one service may run (each bot polls Telegram)
+  MASTER_DB_PATH, SELLER_DATA_DIR   default: next to DB_PATH
+  NODEREAL_RPC_URL, USDT_CONTRACT_ADDRESS, USDT_DECIMALS, BSC_CONFIRMATIONS, BINANCE_PROXY, BINANCE_API_BASE
+     are shared by all shops (same chain, same server). Binance keys and addresses are per shop.
+
+IMPORTANT
+  - Put DB_PATH on a Railway VOLUME (e.g. DB_PATH=/data/shop.db). master.db and sellers/ are created in
+    the same folder, so one volume keeps everything. Without a volume, a redeploy wipes all sellers.
+  - Log in to the admin site once after updating (old sessions are signed out). You still log in with
+    ADMIN_PASSWORD and an EMPTY e-mail field.
+  - Reseller API keys of sellers' customers look like rs_t<id>_..., yours stay rs_live_... ; the same
+    /api/v1/index.php URL serves every shop (the key tells which shop).
+  - /restore works only on the main shop (it restarts the whole service). /backup works for everyone.
+  - Binance keys must be READ-ONLY ("Enable Reading" only). Tell sellers never to enable withdrawals.
+  - Binance blocks US servers (HTTP 451): the same region/proxy rule applies to every seller.
+
 Digital Shop bot: BSC BEP20 USDT + Binance Pay (UID)
 
 Files: bot.py, binance_pay.py, db.py, requirements.txt  (deploy all four, keep shop.db)
