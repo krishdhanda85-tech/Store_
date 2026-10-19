@@ -4,6 +4,8 @@ Buy digital products from our store automatically. Every reply is JSON.
 
 ## 1. Quick start
 
+Open `https://YOUR-DOMAIN/api/docs` for the redesigned interactive developer portal and a safe header-based connection test. The API key is sent in a request header there, not placed in the URL.
+
 1. Open the Telegram bot → **Reseller API** → create your API key (shown only once, copy it).
 2. Top up your wallet with **Add Funds** in the bot. Orders are paid from this wallet.
 3. Test in your browser:
@@ -12,9 +14,11 @@ Buy digital products from our store automatically. Every reply is JSON.
 https://YOUR-DOMAIN/api/v1/index.php?action=balance&api_key=YOUR_KEY
 ```
 
-If you see `{"ok":true,"balance":...}`, you are connected.
+If you see `{"ok":true,"balance":...}`, you are connected. If you see `missing_api_key`, the request did not include the key in a supported header or parameter. If you see `invalid_api_key`, the key was received but is not active in this shop database.
 
-**API URL (paste into your panel):** `https://YOUR-DOMAIN/api/v1/index.php`
+**API URL (paste into your panel URL field):** `https://YOUR-DOMAIN/api/v1/index.php`
+
+Put the key in the panel’s separate **API Key** field. Do not append it to the endpoint URL unless the panel specifically requires query-string authentication.
 
 ## 2. Authentication
 
