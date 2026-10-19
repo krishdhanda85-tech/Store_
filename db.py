@@ -214,6 +214,12 @@ class Database:
         cur=c.execute("DELETE FROM stock WHERE id=? AND product_id=? AND sold=0",(sid,pid))
         c.commit(); c.close(); return cur.rowcount
 
+    def edit_stock_item(self, pid, sid, link):
+        """Edit one UNSOLD stock line. Sold lines are never changed."""
+        c=self.conn()
+        cur=c.execute("UPDATE stock SET link=? WHERE id=? AND product_id=? AND sold=0",(link,sid,pid))
+        c.commit(); c.close(); return cur.rowcount
+
     def clear_stock(self, pid):
         """Remove all UNSOLD stock lines of a product."""
         c=self.conn()
