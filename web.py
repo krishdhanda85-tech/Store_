@@ -488,7 +488,6 @@ function googleTranslateElementInit(){new google.translate.TranslateElement({pag
 <textarea name="description" rows="4">{{ p.description or '' }}</textarea>
 <button type="submit">Save changes</button>
 </form>
-{% if p.kind != 'manual' %}
 {% set src = sources.get(p.id) %}
 <div style="margin-top:14px">
 <label>Suppliers (API) {% if p.api_key %}<span class="muted">· active cost ${{ '%.2f' % p.api_cost }} · profit ${{ '%.2f' % (p.price - p.api_cost) }}/item</span>{% endif %}</label>
@@ -525,7 +524,6 @@ function googleTranslateElementInit(){new google.translate.TranslateElement({pag
 <button type="submit">Add</button></form>
 {% else %}<p class="muted" style="margin-top:8px">No supplier connected yet. <a href="{{ url_for('suppliers_admin.suppliers') }}">Add a supplier</a>.</p>{% endif %}
 </div>
-{% endif %}
 </div></details>
 
 <form method="post" action="{{ url_for('delete_product', pid=p.id) }}" onsubmit="return confirm('Delete this product? It disappears from the shop. Old orders keep their history.')" style="margin-top:14px">
