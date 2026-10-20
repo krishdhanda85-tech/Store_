@@ -1,4 +1,5 @@
 import hashlib
+import json
 import secrets
 import reseller_api
 from flask import Blueprint, request, redirect, url_for, flash, render_template_string
@@ -26,6 +27,7 @@ PAGE = r"""{% extends 'base.html' %}{% block body %}
 <section class="api-card" style="margin-bottom:16px"><h3>Made-to-order queue</h3><p class="sub">Order aane par pending rahega. Pehle OTP bhej, phir profile aur PIN. OTP requests reseller bot se aayengi only when you are online.</p><div class="scroll api-table"><table>
 <tr><th>Order</th><th>Product</th><th>Reseller</th><th>Qty</th><th>Customer reference</th><th>Contact</th><th>Status / Action</th></tr>
 {% for o in mto_orders %}<tr><td><strong>{{o.id}}</strong><div class="muted">{{o.created_at}}</div></td><td>{{o.product_name}}</td><td>{{o.reseller_name}}</td><td>{{o.quantity}}</td><td>{{o.customer_ref or '-'}}</td><td>{{o.contact or '-'}}</td><td>
+{% if o.status in ('processing','otp_requested','otp_ready') %}<form method="post" action="{{url_for('reseller_admin.resellers')}}"><input type="hidden" name="action" value="complete_simple"><input type="hidden" name="order_id" value="{{o.id}}"><label>Product ready? Delivery details (1 line per item)</label><textarea name="details" required maxlength="5000" rows="2" placeholder="email:password / link / code"></textarea><button class="green" type="submit" onclick="return confirm('Mark DONE and send to reseller customer?')">Done - send to reseller</button></form><hr>{% endif %}
 {% if o.status in ('processing','otp_requested') %}<form method="post" action="{{url_for('reseller_admin.resellers')}}"><input type="hidden" name="action" value="send_otp"><input type="hidden" name="order_id" value="{{o.id}}"><label>OTP to send first</label><input name="otp" required maxlength="500" autocomplete="off" placeholder="Enter current OTP"><button class="green" type="submit" {% if not online %}disabled{% endif %}>Send OTP to reseller API</button></form>{% if not online %}<div class="muted">Set status online to accept/request OTP.</div>{% endif %}
 {% elif o.status == 'otp_ready' %}<span class="badge">OTP sent</span><form method="post" action="{{url_for('reseller_admin.resellers')}}"><input type="hidden" name="action" value="complete_mto"><input type="hidden" name="order_id" value="{{o.id}}"><label>Profile / login details</label><textarea name="profile" required maxlength="5000" rows="2" placeholder="Profile details"></textarea><label>PIN</label><input name="pin" required maxlength="1000" autocomplete="off" placeholder="Enter PIN"><button class="green" type="submit" onclick="return confirm('Publish profile and PIN to this reseller order?')">Send Profile + PIN & Complete</button></form>
 {% else %}<span class="badge">{{o.status}}</span><details><summary>Delivered details</summary><p><b>OTP:</b> <code>{{o.otp_text or '—'}}</code></p><p><b>Profile:</b> <pre style="white-space:pre-wrap;overflow-wrap:anywhere">{{o.profile_text or '—'}}</pre></p><p><b>PIN:</b> <code>{{o.pin_text or '—'}}</code></p></details>{% endif %}</td></tr>
@@ -124,6 +126,27 @@ def register(app, db):
                                 oc.execute("UPDATE api_reseller_orders SET profile_text=?,pin_text=?,status='completed' WHERE id=? AND status='otp_ready'", (profile, pin, order_id))
                                 oc.commit()
                                 flash('Profile and PIN are now available to the reseller API. Order completed.')
+                        except Exception:
+                            oc.rollback(); flash('Could not complete order. Check server logs.', 'err')
+                        finally:
+                            oc.close()
+                elif action == 'complete_simple':
+                    order_id = request.form.get('order_id', '').strip()[:80]
+                    details = request.form.get('details', '').strip()[:5000]
+                    if not order_id or not details:
+                        flash('Order ID and delivery details are required.', 'err')
+                    else:
+                        items = [ln.strip() for ln in details.splitlines() if ln.strip()]
+                        oc = reseller_api.connect()
+                        try:
+                            oc.execute('BEGIN IMMEDIATE')
+                            order = oc.execute("SELECT * FROM api_reseller_orders WHERE id=? AND status IN ('processing','otp_requested','otp_ready')", (order_id,)).fetchone()
+                            if not order:
+                                oc.rollback(); flash('Order is not pending.', 'err')
+                            else:
+                                oc.execute("UPDATE api_reseller_orders SET items_json=?,status='completed' WHERE id=?", (json.dumps(items), order_id))
+                                oc.commit()
+                                flash('Order done. The reseller bot will receive the details and send them to its customer.')
                         except Exception:
                             oc.rollback(); flash('Could not complete order. Check server logs.', 'err')
                         finally:

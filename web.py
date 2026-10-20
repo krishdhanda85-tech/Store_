@@ -574,7 +574,20 @@ if(location.hash){var t=document.querySelector(location.hash);if(t&&t.tagName===
 <button class="grey" formaction="{{ url_for('manual_note', oid=o.id) }}">Send note only</button>
 <button class="red" formaction="{{ url_for('manual_reject', oid=o.id) }}" onclick="return confirm('Refund this order to the customer wallet?')">Refund</button>
 </div></form></div>
-{% else %}<div class="card">Nothing to deliver right now.</div>{% endfor %}{% endblock %}""",
+{% else %}{% if not rrows %}<div class="card">Nothing to deliver right now.</div>{% endif %}{% endfor %}
+{% if rrows %}<h3 style="margin-top:18px">Reseller API orders</h3>
+<p class="muted">Orders placed by your resellers' bots. Mark done = the details go to the reseller API automatically and their bot sends them to its customer. Refund returns the money to the reseller.</p>{% endif %}
+{% for o in rrows %}
+<div class="card">
+<b>{{ o.product or o.product_id }}</b> <span class="muted">· x{{ o.quantity }} · ${{ '%.2f'|format(o.amount) }} · {{ o.id }} · {{ (o.created_at or '')[:16].replace('T',' ') }}</span><br>
+<span class="muted">Reseller: {{ o.reseller_name }} · Customer ref: {{ o.customer_ref or '-' }} · Contact: {{ o.contact or '-' }}</span>
+<form method="post" style="margin-top:8px">
+<textarea name="details" rows="2" placeholder="Delivery details for the customer (1 line per item, e.g. email:password / link)"></textarea>
+<div class="row">
+<button class="green" formaction="{{ url_for('manual_reseller_done', oid=o.id) }}" onclick="return confirm('Mark DONE and send to the reseller customer?')">Mark done</button>
+<button class="red" formaction="{{ url_for('manual_reseller_reject', oid=o.id) }}" onclick="return confirm('Refund this order to the reseller?')">Refund</button>
+</div></form></div>
+{% endfor %}{% endblock %}""",
     "users.html": """{% extends 'base.html' %}{% block body %}
 <style>
 [hidden]{display:none!important}
@@ -852,7 +865,7 @@ def _ctx(kw):
     kw.setdefault("shop", t.name if t else tenancy.PLATFORM_NAME)
     kw.setdefault("signup", tenancy.signup_mode())
     if t and session.get("ok"):
-        kw.setdefault("pending_count", len(db.pending_manual()))
+        kw.setdefault("pending_count", len(db.pending_manual()) + len(_reseller_pending()))
         kw.setdefault("open_tickets", len(db.all_tickets("open")))
         kw.setdefault("upi_pending", db.upi_review_count())
         kw.setdefault("shop_closed", not db.get_setting("shop_open", 1))
@@ -1387,9 +1400,70 @@ def _msg(uid, en, zh):
 
 
 # ------------------------------------------------- made-to-order orders
+def _reseller_pending():
+    """Made-to-order orders placed through the reseller API that still have to be delivered."""
+    try:
+        import reseller_api
+        c = reseller_api.connect()
+        try:
+            return c.execute("""SELECT o.*, p.name AS product, r.name AS reseller_name FROM api_reseller_orders o
+                LEFT JOIN products p ON p.id=o.product_id LEFT JOIN api_resellers r ON r.id=o.reseller_id
+                WHERE o.status IN ('processing','otp_requested','otp_ready') ORDER BY o.created_at""").fetchall()
+        finally:
+            c.close()
+    except Exception:
+        return []
+
+
 @app.route("/manual")
 def manual():
-    return render("manual.html", rows=db.pending_manual())
+    return render("manual.html", rows=db.pending_manual(), rrows=_reseller_pending())
+
+
+@app.route("/manual/reseller/<oid>/done", methods=["POST"])
+def manual_reseller_done(oid):
+    import json, reseller_api
+    items = [ln.strip() for ln in request.form.get("details", "").strip()[:5000].splitlines() if ln.strip()]
+    if not items:
+        flash("Write the delivery details first.", "err")
+        return redirect(url_for("manual"))
+    c = reseller_api.connect()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        cur = c.execute("UPDATE api_reseller_orders SET items_json=?, status='completed' "
+                        "WHERE id=? AND status IN ('processing','otp_requested','otp_ready')", (json.dumps(items), oid))
+        c.commit()
+    finally:
+        c.close()
+    if cur.rowcount:
+        flash(f"Order {oid} done - the reseller bot will pick it up and send it to its customer.")
+    else:
+        flash("That order is not waiting any more.", "err")
+    return redirect(url_for("manual"))
+
+
+@app.route("/manual/reseller/<oid>/reject", methods=["POST"])
+def manual_reseller_reject(oid):
+    import reseller_api
+    c = reseller_api.connect()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        o = c.execute("SELECT * FROM api_reseller_orders WHERE id=? AND status IN ('processing','otp_requested','otp_ready')", (oid,)).fetchone()
+        if not o:
+            c.rollback()
+            flash("That order is not waiting any more.", "err")
+            return redirect(url_for("manual"))
+        r = c.execute("SELECT user_id FROM api_resellers WHERE id=?", (o["reseller_id"],)).fetchone()
+        if r and r["user_id"]:
+            c.execute("UPDATE users SET balance=ROUND(COALESCE(balance,0)+?,2) WHERE user_id=?", (o["amount"], r["user_id"]))
+        else:
+            c.execute("UPDATE api_resellers SET balance=ROUND(balance+?,2) WHERE id=?", (o["amount"], o["reseller_id"]))
+        c.execute("UPDATE api_reseller_orders SET status='refunded' WHERE id=?", (oid,))
+        c.commit()
+    finally:
+        c.close()
+    flash(f"Order {oid} refunded to the reseller.")
+    return redirect(url_for("manual"))
 
 
 @app.route("/manual/<oid>/done", methods=["POST"])

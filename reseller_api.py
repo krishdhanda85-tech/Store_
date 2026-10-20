@@ -26,6 +26,7 @@ except Exception:   # library missing -> keys are simply not stored for re-displ
 api = Blueprint("reseller_api", __name__)
 log = logging.getLogger("reseller_api")
 MAX_QTY = 20
+MTO_STOCK = int(os.getenv("MTO_STOCK", "999") or 999)   # stock shown for made-to-order products
 
 
 def connect():
@@ -415,8 +416,9 @@ def products():
         unit = round(float(r["price"]) * (1 - discount / 100), 2)
         out.append({"id": r["id"], "name": r["name"], "description": r["description"],
                     "category": r["category"], "kind": r["kind"], "price": unit,
-                    # -1 is the common reseller API convention for made-to-order/unlimited availability.
-                    "stock": (-1 if is_manual else stock), "available": (True if is_manual else bool(stock > 0)),
+                    # Many reseller bots/panels treat stock <= 0 (including -1) as OUT OF STOCK,
+                    # so made-to-order products report a positive number. Change with env MTO_STOCK.
+                    "stock": (MTO_STOCK if is_manual else stock), "available": (True if is_manual else bool(stock > 0)),
                     "made_to_order": is_manual, "stock_note": ("made_to_order" if is_manual else None)})
     return jsonify({"ok": True, "currency": "shop_balance_units", "products": out})
 
@@ -453,8 +455,8 @@ def create_order():
     is_manual = str(product["kind"] or "").lower() not in ("auto", "automatic")
     if is_manual:
         contact = str(body.get("contact") or body.get("email") or body.get("customer_email") or "").strip()[:200] or None
-        if not contact:
-            return _error("contact_required_for_made_to_order", 400)
+        if not contact and not customer_ref:
+            return _error("contact_or_customer_ref_required_for_made_to_order", 400)
         c = connect()
         c.execute("BEGIN IMMEDIATE")
         if idem:
