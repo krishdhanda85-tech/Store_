@@ -1,4 +1,5 @@
 import html as htmllib
+import logging
 import os
 import hmac
 import hashlib
@@ -865,7 +866,7 @@ def _ctx(kw):
     kw.setdefault("shop", t.name if t else tenancy.PLATFORM_NAME)
     kw.setdefault("signup", tenancy.signup_mode())
     if t and session.get("ok"):
-        kw.setdefault("pending_count", len(db.pending_manual()) + len(_reseller_pending()))
+        kw.setdefault("pending_count", len(db.pending_manual()) + len(_reseller_pending() or []))
         kw.setdefault("open_tickets", len(db.all_tickets("open")))
         kw.setdefault("upi_pending", db.upi_review_count())
         kw.setdefault("shop_closed", not db.get_setting("shop_open", 1))
@@ -1412,12 +1413,17 @@ def _reseller_pending():
         finally:
             c.close()
     except Exception:
-        return []
+        logging.getLogger("web").exception("could not load reseller API orders")
+        return None          # None = the query FAILED (an empty list means "no orders")
 
 
 @app.route("/manual")
 def manual():
-    return render("manual.html", rows=db.pending_manual(), rrows=_reseller_pending())
+    rr = _reseller_pending()
+    if rr is None:
+        flash("Reseller API orders could not be loaded - check the server logs.", "err")
+        rr = []
+    return render("manual.html", rows=db.pending_manual(), rrows=rr)
 
 
 @app.route("/manual/reseller/<oid>/done", methods=["POST"])
