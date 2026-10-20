@@ -471,7 +471,8 @@ def create_order():
             is_manual = True
     if is_manual:
         contact = str(body.get("contact") or body.get("email") or body.get("customer_email") or "").strip()[:200] or None
-        # contact / customer_ref are optional: the order is still queued for the owner without them.
+        if not contact and not customer_ref:
+            return _error("contact_or_customer_ref_required_for_made_to_order", 400)
         c = connect()
         c.execute("BEGIN IMMEDIATE")
         if idem:

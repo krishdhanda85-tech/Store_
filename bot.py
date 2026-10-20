@@ -356,6 +356,71 @@ def esc(x) -> str:
     return html.escape(str(x))
 
 
+# Telegram custom-emoji IDs supplied by the shop owner. Railway variables can override them.
+CUSTOM_EMOJI_IDS = {
+    "netflix": os.getenv("EMOJI_NETFLIX_ID", "5069081919279334693").strip(),
+    "crunchyroll": os.getenv("EMOJI_CRUNCHYROLL_ID", "5091632048066528487").strip(),
+    "spotify": os.getenv("EMOJI_SPOTIFY_ID", "5068818526114939895").strip(),
+    "apple_music": os.getenv("EMOJI_APPLE_MUSIC_ID", "5287380220578372452").strip(),
+    "duolingo": os.getenv("EMOJI_DUOLINGO_ID", "5069087043175318384").strip(),
+    "hbo_max": os.getenv("EMOJI_HBO_MAX_ID", "5298588152485651370").strip(),
+    "adobe_express": os.getenv("EMOJI_ADOBE_EXPRESS_ID", "5278589573574703984").strip(),
+    "muse_ai": os.getenv("EMOJI_MUSE_AI_ID", "5170554095060124363").strip(),
+    "office_365": os.getenv("EMOJI_OFFICE_365_ID", "5267375637303145924").strip(),
+    "ilovepdf": os.getenv("EMOJI_ILOVEPDF_ID", "5793968666794005095").strip(),
+    "capcut": os.getenv("EMOJI_CAPCUT_ID", "6008121985349979345").strip(),
+    "instagram": os.getenv("EMOJI_INSTAGRAM_ID", "5312476345849094587").strip(),
+    "canva": os.getenv("EMOJI_CANVA_ID", "5076038705441932295").strip(),
+    "nordvpn": os.getenv("EMOJI_NORDVPN_ID", "5460709303755221342").strip(),
+    "linkedin": os.getenv("EMOJI_LINKEDIN_ID", "5866084676682125789").strip(),
+    "amazon_prime": os.getenv("EMOJI_AMAZON_PRIME_ID", "4947457194304996489").strip(),
+    "windows": os.getenv("EMOJI_WINDOWS_ID", "5933550168996581523").strip(),
+    "coursera": os.getenv("EMOJI_COURSERA_ID", "5924826149820567437").strip(),
+    "protonvpn": os.getenv("EMOJI_PROTONVPN_ID", "5848177124074066676").strip(),
+    "steam": os.getenv("EMOJI_STEAM_ID", "5453902695419104908").strip(),
+    "gemini": os.getenv("EMOJI_GEMINI_ID", "5262838511161076891").strip(),
+    # HMA VPN ID not provided yet.
+    "hma": os.getenv("EMOJI_HMA_ID", "").strip(),
+}
+
+
+def product_name_html(name) -> str:
+    """Return a safely escaped product name prefixed with its configured Telegram custom emoji."""
+    raw = str(name or "")
+    key = raw.lower().replace("+", " plus ").replace("&", " and ")
+    aliases = (
+        (("crunchyroll",), "crunchyroll"),
+        (("netflix",), "netflix"),
+        (("spotify",), "spotify"),
+        (("apple music",), "apple_music"),
+        (("duolingo",), "duolingo"),
+        (("hbo max", "max subscription", "max account"), "hbo_max"),
+        (("adobe express",), "adobe_express"),
+        (("muse ai",), "muse_ai"),
+        (("microsoft office", "office 365"), "office_365"),
+        (("hma", "hidemyass"), "hma"),
+        (("ilovepdf", "i love pdf"), "ilovepdf"),
+        (("capcut",), "capcut"),
+        (("instagram",), "instagram"),
+        (("canva",), "canva"),
+        (("nordvpn", "nord vpn"), "nordvpn"),
+        (("linkedin",), "linkedin"),
+        (("amazon prime", "prime video"), "amazon_prime"),
+        (("windows 11",), "windows"),
+        (("coursera",), "coursera"),
+        (("proton vpn", "protonvpn"), "protonvpn"),
+        (("steam",), "steam"),
+        (("gemini",), "gemini"),
+    )
+    for terms, emoji_key in aliases:
+        if any(term in key for term in terms):
+            emoji_id = CUSTOM_EMOJI_IDS.get(emoji_key, "")
+            if emoji_id.isdigit():
+                return f'<tg-emoji emoji-id="{emoji_id}">🔹</tg-emoji> {esc(raw)}'
+            break
+    return esc(raw)
+
+
 def money(x) -> str:
     return f"{float(x):.2f}"
 
@@ -518,7 +583,7 @@ def card_view(uid: int, p, language: str):
     lines = [l.strip() for l in (p["description"] or "").splitlines() if l.strip()]
     lines = [("✅ " + l) if l[0].isalnum() else l for l in lines]   # one ✅ per point unless it already has an icon
     desc_block = tt(language, "card_desc", desc=esc("\n".join(lines))) if lines else ""
-    text = tt(language, "card", name=esc(p["name"]), price=money(price), inr=inr(price), disc=disc, stock=stock,
+    text = tt(language, "card", name=product_name_html(p["name"]), price=money(price), inr=inr(price), disc=disc, stock=stock,
               delivery=delivery, warranty=warranty, desc=desc_block)
     cat = (p["category"] or "").strip()
     back = f"cat:{cat_key(cat)}" if cat else "shop"
@@ -532,7 +597,7 @@ def card_view(uid: int, p, language: str):
 def qty_view(uid: int, p, language: str):
     unit = db.get_effective_price(uid, p["id"], p["price"])
     acct = db.get_account(uid)
-    text = tt(language, "qty_head", name=esc(p["name"]), unit=money(unit), inr=inr(unit), bal=money(acct["balance"] or 0))
+    text = tt(language, "qty_head", name=product_name_html(p["name"]), unit=money(unit), inr=inr(unit), bal=money(acct["balance"] or 0))
     sizes = [n for n in QTY_PRESETS if n <= p["stock"]]
     rows = [[Btn(str(n), callback_data=f"qty:{p['id']}:{n}", style="primary") for n in sizes[i:i + 3]]
             for i in range(0, len(sizes), 3)]
@@ -549,7 +614,7 @@ def calc_view(uid: int, pid: int, qty: int, language: str):
     unit = db.get_effective_price(uid, pid, p["price"])
     total = round(unit * qty, 2)
     bal = float(db.get_account(uid)["balance"] or 0)
-    text = tt(language, "calc", name=esc(p["name"]), qty=qty, unit=money(unit), total=money(total), inr=inr(total), bal=money(bal))
+    text = tt(language, "calc", name=product_name_html(p["name"]), qty=qty, unit=money(unit), total=money(total), inr=inr(total), bal=money(bal))
     rows = []
     if bal + 1e-9 >= total:
         rows.append([Btn(tt(language, "btn_pay", total=money(total)), callback_data=f"bal:{pid}:{qty}", style="success")])
@@ -953,7 +1018,7 @@ async def cb_manual_ok(update, context, arg):
     await q.answer()
     context.user_data.pop("manual", None)
     delivery = (p["delivery"] or "").strip() or tt(language, "default_manual_delivery")
-    await edit(q, tt(language, "placed", order=esc(result), name=esc(p["name"]), contact=esc(pending["contact"]),
+    await edit(q, tt(language, "placed", order=esc(result), name=product_name_html(p["name"]), contact=esc(pending["contact"]),
                      delivery=esc(delivery)),
                Markup([main_menu_row(language)]))
     if manual_alerts():
@@ -1354,7 +1419,7 @@ async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("await", None)
         markup = Markup([[Btn(tt(language, "btn_confirm", price=money(unit)), callback_data="mok", style="success")],
                          [Btn(tt(language, "btn_cancel"), callback_data="cx", style="danger")]])
-        await msg.reply_text(tt(language, "confirm", name=esc(p["name"]), contact=esc(text), price=money(unit),
+        await msg.reply_text(tt(language, "confirm", name=product_name_html(p["name"]), contact=esc(text), price=money(unit),
                                 delivery=esc(delivery)), reply_markup=markup, parse_mode=HTML)
 
     elif kind == "amount":
