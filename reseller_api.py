@@ -27,6 +27,8 @@ api = Blueprint("reseller_api", __name__)
 log = logging.getLogger("reseller_api")
 MAX_QTY = 20
 MTO_STOCK = int(os.getenv("MTO_STOCK", "999") or 999)   # stock shown for made-to-order products
+# Auto-delivery products that run out of stock become made-to-order for resellers (set OOS_MTO=0 to turn off).
+OOS_MTO = os.getenv("OOS_MTO", "1") != "0"
 
 
 def connect():
@@ -412,14 +414,17 @@ def products():
     out = []
     for r in rows:
         stock = int(r["local_stock"] or 0) + provider_stock.get(int(r["id"]), 0)
-        is_manual = str(r["kind"] or "").lower() not in ("auto", "automatic")
+        is_auto = str(r["kind"] or "").lower() in ("auto", "automatic")
+        oos_mto = OOS_MTO and is_auto and stock <= 0      # sold out -> you make it by hand
+        is_manual = (not is_auto) or oos_mto
         unit = round(float(r["price"]) * (1 - discount / 100), 2)
         out.append({"id": r["id"], "name": r["name"], "description": r["description"],
                     "category": r["category"], "kind": r["kind"], "price": unit,
                     # Many reseller bots/panels treat stock <= 0 (including -1) as OUT OF STOCK,
                     # so made-to-order products report a positive number. Change with env MTO_STOCK.
                     "stock": (MTO_STOCK if is_manual else stock), "available": (True if is_manual else bool(stock > 0)),
-                    "made_to_order": is_manual, "stock_note": ("made_to_order" if is_manual else None)})
+                    "made_to_order": is_manual,
+                    "stock_note": ("made_to_order" if is_manual else None)})
     return jsonify({"ok": True, "currency": "shop_balance_units", "products": out})
 
 @api.post("/api/v1/orders")
@@ -453,6 +458,17 @@ def create_order():
     if not product:
         return _error("product_not_found", 404)
     is_manual = str(product["kind"] or "").lower() not in ("auto", "automatic")
+    if not is_manual and OOS_MTO:
+        # Not enough ready stock (local + supplier) -> take the order as made-to-order instead of failing.
+        c = connect()
+        have = int(c.execute("SELECT COUNT(*) n FROM stock WHERE product_id=? AND sold=0", (pid,)).fetchone()["n"] or 0)
+        try:
+            have += int((c.execute("SELECT provider_stock FROM provider_map WHERE product_id=?", (pid,)).fetchone() or {"provider_stock": 0})["provider_stock"] or 0)
+        except sqlite3.OperationalError:
+            pass
+        c.close()
+        if have < qty:
+            is_manual = True
     if is_manual:
         contact = str(body.get("contact") or body.get("email") or body.get("customer_email") or "").strip()[:200] or None
         if not contact and not customer_ref:
