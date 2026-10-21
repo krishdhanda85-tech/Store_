@@ -245,10 +245,43 @@ def _g_catalog(s):
     return out
 
 
+_BALANCE_GUESSES = ("balance", "balance_usdt", "balance_usd", "wallet", "wallet_balance", "available_balance",
+                    "credit", "credits", "funds", "amount", "data.balance", "data.wallet", "data.credits",
+                    "data.amount", "data.available_balance", "result.balance", "user.balance",
+                    "account.balance", "profile.balance", "data.user.balance", "data.0.balance")
+
+
+def _to_number(v):
+    """float from 1.5 / "1.5" / "$1,234.50" / {"balance": 1.5}; None when it is not a number."""
+    if isinstance(v, bool) or v is None:
+        return None
+    if isinstance(v, dict):
+        for k in ("balance", "amount", "usdt", "usd", "value", "available"):
+            n = _to_number(v.get(k))
+            if n is not None:
+                return n
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    t = "".join(ch for ch in str(v) if ch.isdigit() or ch in ".-")
+    try:
+        return float(t) if t not in ("", ".", "-") else None
+    except ValueError:
+        return None
+
+
 def _g_balance(s):
     sec = _gcfg(s)["balance"]
-    v = _dig(_g_req(s, "balance"), sec.get("field"))
-    return float(v)
+    data = _g_req(s, "balance")
+    # the configured field first, then the usual names, so a different field name still works
+    for path in [sec.get("field"), *_BALANCE_GUESSES]:
+        if path in (None, ""):
+            continue
+        n = _to_number(_dig(data, path))
+        if n is not None:
+            return n
+    keys = ", ".join(list(data.keys())[:8]) if isinstance(data, dict) else type(data).__name__
+    raise ProviderError(200, f"no balance field found. Response keys: {keys}", rejected=False)
 
 
 def _g_purchase(s, key, qty, idem):
@@ -552,7 +585,7 @@ class ShopDB(Database):
         try:
             msg += f", wallet {balance_for(s):.4f}"
         except Exception as e:
-            msg += f" (balance not available: {str(e)[:60]})"
+            msg += f" (balance not available: {str(e)[:200]})"
         return msg
 
     def supplier_link_counts(self):
