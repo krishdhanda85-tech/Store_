@@ -40,6 +40,7 @@ PAGE = r"""{% extends 'base.html' %}{% block body %}
 <td><form method="post"><input type="hidden" name="action" value="discount"><input type="hidden" name="reseller_id" value="{{r.id}}"><input name="discount" type="number" min="0" max="90" step="0.1" value="{{r.price_discount}}" aria-label="Discount percentage"><button>Save %</button></form></td>
 <td><span class="badge" style="background:{{ '#d9f7e8' if r.active else '#fde2e2' }};color:{{ '#126b45' if r.active else '#a12424' }}">{{'Active' if r.active else 'Disabled'}}</span></td>
 <td><div class="api-actions"><form method="post"><input type="hidden" name="action" value="topup"><input type="hidden" name="reseller_id" value="{{r.id}}"><input name="amount" type="number" min="0.01" step="0.01" required placeholder="Amount" aria-label="Top-up amount"><button>Add balance</button></form>
+{% if not r.user_id %}<form method="post"><input type="hidden" name="action" value="link"><input type="hidden" name="reseller_id" value="{{r.id}}"><input name="user_id" type="number" required placeholder="Telegram ID" aria-label="Telegram ID"><button>Link bot wallet</button></form>{% endif %}
 <form method="post"><input type="hidden" name="action" value="toggle"><input type="hidden" name="reseller_id" value="{{r.id}}"><button class="{{ 'red' if r.active else 'green' }}">{{'Disable access' if r.active else 'Enable access'}}</button></form></div></td></tr>
 {% else %}<tr><td colspan="7"><div class="api-empty">No resellers yet. Create your first reseller above.</div></td></tr>{% endfor %}
 </table></div></section>
@@ -165,6 +166,23 @@ def register(app, db):
                             cur = c.execute('UPDATE api_resellers SET balance=ROUND(balance+?,2) WHERE id=? AND active=1', (amount, rid))
                             c.commit()
                             flash('Reseller balance topped up.' if cur.rowcount else 'Reseller not found or disabled.', '' if cur.rowcount else 'err')
+                elif action == 'link':
+                    try: rid, tg = int(request.form.get('reseller_id', '0')), int(request.form.get('user_id', '0'))
+                    except ValueError: rid, tg = 0, 0
+                    row = c.execute('SELECT user_id, balance FROM api_resellers WHERE id=?', (rid,)).fetchone()
+                    if not row or tg <= 0:
+                        flash('Reseller or Telegram ID is invalid.', 'err')
+                    elif row['user_id']:
+                        flash('This reseller is already linked.', 'err')
+                    elif c.execute('SELECT 1 FROM api_resellers WHERE user_id=?', (tg,)).fetchone():
+                        flash('That Telegram ID already has a reseller account.', 'err')
+                    else:
+                        old = float(row['balance'] or 0)
+                        c.execute('UPDATE api_resellers SET user_id=?, balance=0 WHERE id=?', (tg, rid))
+                        c.commit()
+                        if old > 0:
+                            db.admin_topup(tg, old)      # carry the old separate balance into the bot wallet
+                        flash('Linked. This reseller API now uses the bot wallet balance automatically.')
                 elif action == 'discount':
                     try: rid, d = int(request.form.get('reseller_id', '0')), float(request.form.get('discount', '0') or 0)
                     except ValueError: rid, d = 0, 0
