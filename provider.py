@@ -194,13 +194,15 @@ def _gcfg(s):
     return cfg
 
 
-def _g_req(s, section, params=None, body=None, idem=None):
+def _g_req(s, section, params=None, body=None, idem=None, path=None):
     cfg = _gcfg(s)
     sec = cfg[section]
+    params = {**(sec.get("params") or {}), **(params or {})}     # fixed query params from the config
     headers = {cfg["auth_header"]: f"{cfg['auth_prefix']}{s['key']}"}
     if idem and sec.get("idem_header"):
         headers[sec["idem_header"]] = idem
-    url = s["base_url"].rstrip("/") + "/" + str(sec["path"]).lstrip("/")
+    use_path = sec["path"] if path is None else path
+    url = s["base_url"].rstrip("/") + (("/" + str(use_path).lstrip("/")) if str(use_path) else "")
     kw = {"headers": headers, "timeout": 20}
     send = sec.get("send", "json")
     if body is not None:
@@ -272,16 +274,27 @@ def _to_number(v):
 
 def _g_balance(s):
     sec = _gcfg(s)["balance"]
-    data = _g_req(s, "balance")
-    # the configured field first, then the usual names, so a different field name still works
-    for path in [sec.get("field"), *_BALANCE_GUESSES]:
-        if path in (None, ""):
+    # 1) as configured, 2) same URL with ?action=balance, 3) the base URL itself with ?action=balance
+    # (some suppliers answer every path with the product list unless action=balance is sent)
+    attempts = [(None, None), (None, {"action": "balance"}), ("", {"action": "balance"})]
+    first_keys, last_err = None, None
+    for path, params in attempts:
+        try:
+            data = _g_req(s, "balance", params=params, path=path)
+        except (ProviderError, requests.RequestException) as e:
+            last_err = e
             continue
-        n = _to_number(_dig(data, path))
-        if n is not None:
-            return n
-    keys = ", ".join(list(data.keys())[:8]) if isinstance(data, dict) else type(data).__name__
-    raise ProviderError(200, f"no balance field found. Response keys: {keys}", rejected=False)
+        if first_keys is None:
+            first_keys = ", ".join(list(data.keys())[:8]) if isinstance(data, dict) else type(data).__name__
+        for fld in [sec.get("field"), *_BALANCE_GUESSES]:
+            if fld in (None, ""):
+                continue
+            n = _to_number(_dig(data, fld))
+            if n is not None:
+                return n
+    if first_keys is None and last_err is not None:
+        raise last_err
+    raise ProviderError(200, f"no balance field found. Response keys: {first_keys}", rejected=False)
 
 
 def _g_purchase(s, key, qty, idem):
