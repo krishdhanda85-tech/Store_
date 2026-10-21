@@ -11,13 +11,26 @@ PAGE = r"""{% extends 'base.html' %}{% block body %}
 .api-hero{display:flex;justify-content:space-between;align-items:flex-start;gap:18px;flex-wrap:wrap;padding:22px;border-radius:18px;background:linear-gradient(135deg,#102b35,#142034);color:#f5fbff;margin-bottom:18px;border:1px solid #294353}
 .api-hero h2{margin:0 0 7px;color:#fff}.api-hero p{margin:0;color:#b6c7d5;max-width:640px}.api-chip{border:1px solid #386b62;color:#78e5c8;background:#13382f;padding:6px 10px;border-radius:99px;font-size:12px;font-weight:800;white-space:nowrap}
 .api-grid{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(280px,.85fr);gap:16px;margin-bottom:16px}.api-card{border:1px solid var(--line);border-radius:15px;padding:20px;background:var(--surface);min-width:0}.api-card h3{font-size:17px;margin-bottom:5px}.api-card .sub{color:var(--muted);font-size:13px;margin-bottom:16px}.api-form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.api-form .wide{grid-column:1/-1}.api-form label{display:block;font-size:13px;font-weight:700;margin-bottom:5px}.api-form input{width:100%;min-width:0}.api-form button{width:100%;padding:11px}.api-endpoints{display:grid;gap:9px}.api-endpoint{display:flex;align-items:center;gap:9px;flex-wrap:wrap;border:1px solid var(--line);border-radius:10px;padding:10px}.api-method{font-size:10px;font-weight:900;padding:3px 6px;border-radius:5px;background:var(--accent-soft);color:var(--link)}.api-endpoint code{overflow-wrap:anywhere}.api-note{font-size:12px;color:var(--muted);margin-top:12px}.api-table form{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:4px 0}.api-table input{min-width:85px;width:100px}.api-table button{white-space:nowrap}.api-actions{display:grid;gap:6px}.api-empty{padding:20px;text-align:center;color:var(--muted)}@media(max-width:760px){.api-grid{grid-template-columns:1fr}.api-form{grid-template-columns:1fr}.api-form .wide{grid-column:auto}.api-hero{padding:18px}.api-card{padding:15px}.api-table table{min-width:760px}}
+.rs-wrap{margin-bottom:18px}.rs-head h3{font-size:19px;margin:0 0 4px}.rs-head .sub{color:var(--muted);font-size:13px;margin:0 0 14px}
+.rs-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:14px}.rs-stat{border:1px solid var(--line);background:var(--surface);border-radius:14px;padding:12px 14px}.rs-stat span{display:block;font-size:24px;font-weight:800;line-height:1.1}.rs-stat small{color:var(--muted);font-size:12px}.rs-stat.warn{border-color:#8a5a1f;background:rgba(240,165,60,.10)}
+.rs-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:14px}
+.rs-card{border:1px solid var(--line);background:var(--surface);border-radius:18px;padding:16px;display:flex;flex-direction:column;gap:12px;min-width:0}.rs-card.off{opacity:.62}
+.rs-top{display:flex;align-items:center;gap:12px}.rs-avatar{width:42px;height:42px;border-radius:13px;background:linear-gradient(135deg,#1f8f7a,#2b6cb0);color:#fff;font-weight:800;font-size:18px;display:flex;align-items:center;justify-content:center;flex:none}
+.rs-id{flex:1;min-width:0}.rs-id strong{display:block;overflow-wrap:anywhere;font-size:16px}.rs-tg{font-size:12px;color:var(--muted);margin-top:2px}.rs-tg code{font-size:13px;color:inherit;background:var(--accent-soft);padding:1px 6px;border-radius:6px;user-select:all}.rs-tg.unl{color:#e0a040;font-weight:700}
+.rs-pill{font-size:11px;font-weight:800;padding:4px 10px;border-radius:99px;flex:none}.rs-pill.on{background:#d9f7e8;color:#126b45}.rs-pill.no{background:#fde2e2;color:#a12424}
+.rs-bal{border-radius:14px;background:var(--accent-soft);padding:12px 14px}.rs-bal small{color:var(--muted);font-size:12px}.rs-amt{font-size:30px;font-weight:800;letter-spacing:-.5px;line-height:1.15}
+.rs-warn{font-size:12.5px;line-height:1.45;border-radius:12px;padding:10px 12px;background:rgba(240,165,60,.13);border:1px solid #8a5a1f;color:#f0c27a}.rs-warn.soft{background:transparent;border-color:var(--line);color:var(--muted)}
+.rs-acts{display:grid;gap:10px}.rs-acts form{margin:0}.rs-acts label{display:block;font-size:12px;font-weight:700;color:var(--muted);margin-bottom:4px}.rs-row{display:flex;gap:8px}.rs-row input[type=number]{flex:1;min-width:0;width:auto}.rs-row button{flex:none;min-width:76px}.rs-toggle{width:100%}
+.rs-foot{font-size:11px;color:var(--muted);margin-top:auto}
+@media(max-width:760px){.rs-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.rs-grid{grid-template-columns:1fr}}
+.rs-bots{border:1px dashed var(--line);border-radius:14px;padding:10px 12px;display:grid;gap:8px}.rs-bots small{color:var(--muted);font-size:12px;font-weight:700}.rs-chips{display:flex;flex-wrap:wrap;gap:6px}.rs-chip{display:inline-flex;align-items:center;gap:4px;margin:0;border-radius:99px;background:var(--accent-soft);padding:3px 4px 3px 10px}.rs-chip code{font-size:13px;color:inherit;background:none;padding:0;user-select:all}.rs-chip button{border:0;background:transparent;color:var(--muted);padding:0 7px;min-width:0;font-size:16px;line-height:1;cursor:pointer}.rs-chip.dupe{outline:1px solid #8a5a1f}.rs-none{font-size:12px;color:var(--muted)}
 </style>
 <div class="api-hero"><div><h2>Reseller API</h2><p>Create and manage API access for resellers, adjust their discounts or balance, and connect external Telegram bots or websites to your shop.</p></div><span class="api-chip">API v1 · JSON</span></div>
 <section class="api-card" style="margin-bottom:16px"><div class="page-head"><div><h3>Seller availability</h3><p class="sub" style="margin:4px 0 0">Reseller bots can check this status before showing a Request OTP button.</p></div><span class="badge" style="background:{{ '#d9f7e8' if online else '#fde2e2' }};color:{{ '#126b45' if online else '#a12424' }}">{{ 'ONLINE' if online else 'OFFLINE' }}</span></div><form method="post" class="inline"><input type="hidden" name="action" value="presence"><input type="hidden" name="online" value="{{ 0 if online else 1 }}"><button class="{{ 'red' if online else 'green' }}" style="max-width:220px">{{ 'Go Offline' if online else 'I’m Online — Accept OTP Requests' }}</button><span class="muted">{{ presence_updated or 'Not changed yet' }}</span></form></section>
 <div class="api-grid"><section class="api-card"><h3>Create reseller</h3><p class="sub">Generate a private API key for a new reseller.</p>
 <form method="post" class="api-form"><input type="hidden" name="action" value="create">
 <div class="wide"><label>Reseller name</label><input name="name" required maxlength="80" placeholder="e.g. Partner Shop"></div>
-<div class="wide"><label>Telegram user ID <span class="muted">(optional; orders use this user's bot wallet)</span></label><input name="user_id" type="number" placeholder="e.g. 7095639003"></div>
+<div class="wide"><label>Telegram user ID <span class="muted">(required; the reseller API uses this user's bot wallet)</span></label><input name="user_id" type="number" required placeholder="e.g. 7095639003"></div>
 <div><label>Discount from base price (%)</label><input name="discount" type="number" min="0" max="90" step="0.1" value="0"></div>
 <div style="display:flex;align-items:end"><button type="submit">Create API key</button></div></form>
 <p class="api-note">The key is shown after creation. Copy it privately; never post it in a public channel.</p></section>
@@ -33,17 +46,39 @@ PAGE = r"""{% extends 'base.html' %}{% block body %}
 {% else %}<span class="badge">{{o.status}}</span><details><summary>Delivered details</summary><p><b>OTP:</b> <code>{{o.otp_text or '—'}}</code></p><p><b>Profile:</b> <pre style="white-space:pre-wrap;overflow-wrap:anywhere">{{o.profile_text or '—'}}</pre></p><p><b>PIN:</b> <code>{{o.pin_text or '—'}}</code></p></details>{% endif %}</td></tr>
 {% else %}<tr><td colspan="7"><div class="api-empty">No made-to-order reseller orders yet.</div></td></tr>{% endfor %}
 </table></div><p class="api-note">The reseller bot must poll <code>GET /api/v1/orders/ORDER_ID</code>: status <code>otp_ready</code> means send OTP; status <code>completed</code> means send profile and PIN. It can check <code>GET /api/v1/seller-status</code> for online/offline.</p></section>
-<section class="api-card"><h3>Reseller accounts</h3><p class="sub">Manage access, wallet balance, and pricing. Disabling a reseller immediately blocks their API key.</p><div class="scroll api-table"><table>
-<tr><th>ID</th><th>Reseller</th><th>Telegram ID</th><th>Balance</th><th>Discount</th><th>Status</th><th>Actions</th></tr>
-{% for r in rows %}<tr><td>{{r.id}}</td><td><strong>{{r.name}}</strong></td><td>{{r.user_id or '-'}}</td>
-<td><strong>{{'%.2f'|format(r.wallet if r.user_id else r.balance)}}</strong>{% if r.user_id %}<div class="muted">Bot wallet</div>{% endif %}</td>
-<td><form method="post"><input type="hidden" name="action" value="discount"><input type="hidden" name="reseller_id" value="{{r.id}}"><input name="discount" type="number" min="0" max="90" step="0.1" value="{{r.price_discount}}" aria-label="Discount percentage"><button>Save %</button></form></td>
-<td><span class="badge" style="background:{{ '#d9f7e8' if r.active else '#fde2e2' }};color:{{ '#126b45' if r.active else '#a12424' }}">{{'Active' if r.active else 'Disabled'}}</span></td>
-<td><div class="api-actions"><form method="post"><input type="hidden" name="action" value="topup"><input type="hidden" name="reseller_id" value="{{r.id}}"><input name="amount" type="number" min="0.01" step="0.01" required placeholder="Amount" aria-label="Top-up amount"><button>Add balance</button></form>
-{% if not r.user_id %}<form method="post"><input type="hidden" name="action" value="link"><input type="hidden" name="reseller_id" value="{{r.id}}"><input name="user_id" type="number" required placeholder="Telegram ID" aria-label="Telegram ID"><button>Link bot wallet</button></form>{% endif %}
-<form method="post"><input type="hidden" name="action" value="toggle"><input type="hidden" name="reseller_id" value="{{r.id}}"><button class="{{ 'red' if r.active else 'green' }}">{{'Disable access' if r.active else 'Enable access'}}</button></form></div></td></tr>
-{% else %}<tr><td colspan="7"><div class="api-empty">No resellers yet. Create your first reseller above.</div></td></tr>{% endfor %}
-</table></div></section>
+<section class="rs-wrap">
+<div class="rs-head"><div><h3>Reseller accounts</h3><p class="sub">Each reseller is matched by <b>API key → Telegram ID → bot wallet</b>. The name is only a label.</p></div></div>
+<div class="rs-stats">
+<div class="rs-stat"><span>{{ rows|length }}</span><small>Resellers</small></div>
+<div class="rs-stat"><span>{{ rows|selectattr('active')|list|length }}</span><small>Active</small></div>
+<div class="rs-stat"><span>{{ rows|selectattr('user_id')|list|length }}</span><small>Wallet linked</small></div>
+<div class="rs-stat {{ 'warn' if rows|rejectattr('user_id')|list|length }}"><span>{{ rows|rejectattr('user_id')|list|length }}</span><small>Not linked</small></div>
+</div>
+<div class="rs-grid">
+{% for r in rows %}
+<article class="rs-card {{ '' if r.active else 'off' }}">
+<div class="rs-top">
+<div class="rs-avatar">{{ (r.name or '?')[:1]|upper }}</div>
+<div class="rs-id"><strong>{{r.name}}</strong>
+{% if r.user_id %}<div class="rs-tg">Telegram ID <code>{{r.user_id}}</code></div>{% else %}<div class="rs-tg unl">Not linked to a Telegram ID</div>{% endif %}</div>
+<span class="rs-pill {{ 'on' if r.active else 'no' }}">{{'Active' if r.active else 'Disabled'}}</span>
+</div>
+<div class="rs-bots"><small>Bot IDs</small>
+<div class="rs-chips">{% for b in r.bots %}<form method="post" class="rs-chip {{ 'dupe' if b in r.bot_warn else '' }}"><input type="hidden" name="action" value="remove_bot"><input type="hidden" name="reseller_id" value="{{r.id}}"><input type="hidden" name="bot_id" value="{{b}}"><code>{{b}}</code><button title="Remove" aria-label="Remove bot ID {{b}}" onclick="return confirm('Remove bot ID {{b}}?')">×</button></form>{% else %}<span class="rs-none">none added</span>{% endfor %}</div>
+{% if r.bot_warn %}<div class="rs-warn">⚠️ {{ r.bot_warn|join(', ') }} also exists as its own reseller account. Disable that extra account to avoid confusion.</div>{% endif %}
+<form method="post" class="rs-row"><input type="hidden" name="action" value="add_bot"><input type="hidden" name="reseller_id" value="{{r.id}}"><input name="bot_id" type="number" required placeholder="Add bot ID" aria-label="Add bot ID"><button>Add</button></form></div>
+<div class="rs-bal"><small>{{ 'Bot wallet balance' if r.user_id else 'Separate API balance' }}</small><div class="rs-amt">${{'%.2f'|format(r.wallet if r.user_id else r.balance)}}</div></div>
+{% if r.dup %}<div class="rs-warn">⚠️ Another linked account has this same name. Make sure the reseller's bot uses the key of the <b>linked</b> one, otherwise it will show no balance.</div>{% elif not r.user_id %}<div class="rs-warn soft">This account has its own balance. Link a Telegram ID to use the bot wallet automatically.</div>{% endif %}
+<div class="rs-acts">
+<form method="post"><label>Discount %</label><div class="rs-row"><input type="hidden" name="action" value="discount"><input type="hidden" name="reseller_id" value="{{r.id}}"><input name="discount" type="number" min="0" max="90" step="0.1" value="{{r.price_discount}}" aria-label="Discount percentage"><button>Save</button></div></form>
+<form method="post"><label>Add balance</label><div class="rs-row"><input type="hidden" name="action" value="topup"><input type="hidden" name="reseller_id" value="{{r.id}}"><input name="amount" type="number" min="0.01" step="0.01" required placeholder="Amount" aria-label="Top-up amount"><button>Add</button></div></form>
+{% if not r.user_id %}<form method="post"><label>Link bot wallet</label><div class="rs-row"><input type="hidden" name="action" value="link"><input type="hidden" name="reseller_id" value="{{r.id}}"><input name="user_id" type="number" required placeholder="Telegram ID" aria-label="Telegram ID"><button>Link</button></div></form>{% endif %}
+<form method="post"><input type="hidden" name="action" value="toggle"><input type="hidden" name="reseller_id" value="{{r.id}}"><button class="rs-toggle {{ 'red' if r.active else 'green' }}">{{'Disable access' if r.active else 'Enable access'}}</button></form>
+</div>
+<div class="rs-foot">ID #{{r.id}} · created {{ (r.created_at or '')[:10] }}</div>
+</article>
+{% else %}<div class="api-empty">No resellers yet. Create your first reseller above.</div>{% endfor %}
+</div></section>
 <script>
 // While the reseller dashboard is open, refresh the seller-online heartbeat.
 (function(){
@@ -73,8 +108,12 @@ def register(app, db):
             try:
                 if action == 'create':
                     name = request.form.get('name', '').strip()[:80]
+                    try: tg_check = int(request.form.get('user_id', '').strip() or 0)
+                    except ValueError: tg_check = 0
                     if not name:
                         flash('Reseller name is required.', 'err')
+                    elif tg_check <= 0:
+                        flash('Telegram user ID is required, so the reseller always uses their bot wallet.', 'err')
                     else:
                         key = reseller_api._new_key()
                         try: discount = float(request.form.get('discount', '0') or 0)
@@ -183,6 +222,32 @@ def register(app, db):
                         if old > 0:
                             db.admin_topup(tg, old)      # carry the old separate balance into the bot wallet
                         flash('Linked. This reseller API now uses the bot wallet balance automatically.')
+                elif action in ('add_bot', 'remove_bot'):
+                    try: rid, bid = int(request.form.get('reseller_id', '0')), int(request.form.get('bot_id', '0'))
+                    except ValueError: rid, bid = 0, 0
+                    reseller_api.init_schema()
+                    row = c.execute('SELECT bot_ids FROM api_resellers WHERE id=?', (rid,)).fetchone()
+                    if not row or bid <= 0:
+                        flash('Reseller or bot ID is invalid.', 'err')
+                    else:
+                        mine = [x for x in str(row['bot_ids'] or '').split(',') if x.strip()]
+                        if action == 'remove_bot':
+                            mine = [x for x in mine if x != str(bid)]
+                            c.execute('UPDATE api_resellers SET bot_ids=? WHERE id=?', (','.join(mine), rid))
+                            c.commit(); flash('Bot ID removed.')
+                        else:
+                            taken = None
+                            for o in c.execute('SELECT id,name,bot_ids FROM api_resellers WHERE id!=?', (rid,)).fetchall():
+                                if str(bid) in [x.strip() for x in str(o['bot_ids'] or '').split(',')]:
+                                    taken = o; break
+                            if str(bid) in mine:
+                                flash('That bot ID is already added here.', 'err')
+                            elif taken:
+                                flash('Bot ID %s is already added to reseller #%s (%s).' % (bid, taken['id'], taken['name']), 'err')
+                            else:
+                                mine.append(str(bid))
+                                c.execute('UPDATE api_resellers SET bot_ids=? WHERE id=?', (','.join(mine), rid))
+                                c.commit(); flash('Bot ID added.')
                 elif action == 'discount':
                     try: rid, d = int(request.form.get('reseller_id', '0')), float(request.form.get('discount', '0') or 0)
                     except ValueError: rid, d = 0, 0
@@ -197,10 +262,20 @@ def register(app, db):
             finally:
                 c.close()
             return redirect(url_for('reseller_admin.resellers'))
+        try: reseller_api.init_schema()   # makes sure the bot_ids column exists
+        except Exception: pass
         c = db.conn()
-        rows = c.execute('SELECT r.id,r.name,r.balance,r.active,r.price_discount,r.created_at,r.user_id,COALESCE(u.balance,0) AS wallet '
+        rows = c.execute('SELECT r.id,r.name,r.balance,r.active,r.price_discount,r.created_at,r.user_id,r.bot_ids,COALESCE(u.balance,0) AS wallet '
                          'FROM api_resellers r LEFT JOIN users u ON u.user_id=r.user_id ORDER BY r.id DESC').fetchall()
         c.close()
+        rows = [dict(r) for r in rows]
+        linked_names = {(r['name'] or '').strip().lower() for r in rows if r['user_id']}
+        wallet_ids = {str(r['user_id']) for r in rows if r['user_id']}
+        for r in rows:
+            r['bots'] = [x.strip() for x in str(r.get('bot_ids') or '').split(',') if x.strip()]
+            r['bot_warn'] = [b for b in r['bots'] if b in wallet_ids and b != str(r['user_id'])]
+        for r in rows:
+            r['dup'] = (not r['user_id']) and (r['name'] or '').strip().lower() in linked_names
         oc = reseller_api.connect()
         try:
             mto_orders = oc.execute("""SELECT o.*,p.name AS product_name,r.name AS reseller_name

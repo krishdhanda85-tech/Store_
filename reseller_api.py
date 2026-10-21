@@ -91,6 +91,8 @@ def init_schema():
         c.execute("ALTER TABLE api_resellers ADD COLUMN user_id INTEGER")
     if "key_enc" not in cols:   # encrypted copy of the key so the bot can show it again
         c.execute("ALTER TABLE api_resellers ADD COLUMN key_enc TEXT")
+    if "bot_ids" not in cols:   # reseller's bot IDs, added by hand by the admin (labels only; money always follows user_id)
+        c.execute("ALTER TABLE api_resellers ADD COLUMN bot_ids TEXT")
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_api_resellers_user ON api_resellers(user_id) WHERE user_id IS NOT NULL")
     c.commit(); c.close()
 
