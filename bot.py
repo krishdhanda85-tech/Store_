@@ -417,7 +417,7 @@ CUSTOM_EMOJI_IDS = {
 
 
 EMOJI_ALIASES = (
-    (("crunchyroll",), "crunchyroll"),
+    (("crunchyroll", "crunchy roll", "crunchy"), "crunchyroll"),
     (("netflix",), "netflix"),
     (("spotify",), "spotify"),
     (("apple music",), "apple_music"),
@@ -433,7 +433,7 @@ EMOJI_ALIASES = (
     (("canva",), "canva"),
     (("nordvpn", "nord vpn"), "nordvpn"),
     (("linkedin",), "linkedin"),
-    (("amazon prime", "prime video"), "amazon_prime"),
+    (("amazon prime", "prime video", "prime"), "amazon_prime"),
     (("windows 11",), "windows"),
     (("coursera",), "coursera"),
     (("proton vpn", "protonvpn"), "protonvpn"),
@@ -602,10 +602,17 @@ GRID_PAGE_SIZE = 30            # 10 rows x 3 columns
 SHORT_NAME = 18
 
 
-def grid_button(uid: int, p):
-    """Compact product button for the 3-column grid: premium icon + name (red = sold out)."""
+CAT_PAGE_SIZE = 15             # inside a category: one full-width button per row
+
+
+def grid_button(uid: int, p, full: bool = False):
+    """Product button: premium icon + name (red = sold out). full=True keeps the whole name
+    (used inside a category, one button per row, so the plan length e.g. '1 Month' stays visible)."""
     name = (p["name"] or "").strip()
-    label = name if len(name) <= SHORT_NAME else name[:SHORT_NAME - 1].rstrip() + "…"
+    if full:
+        label = name if len(name) <= 60 else name[:59].rstrip() + "…"
+    else:
+        label = name if len(name) <= SHORT_NAME else name[:SHORT_NAME - 1].rstrip() + "…"
     icon = product_icon_id(p["name"])
     if is_available(p):
         return Btn(label, callback_data=f"prod:{p['id']}", icon=icon)
@@ -643,11 +650,14 @@ def shop_view(uid: int, language: str, category: str = None, page: int = 0):
         shown = [p for p in products if (p["category"] or "").strip() == category]
         nav_key = f"cat:{cat_key(category)}~"
     shown.sort(key=lambda p: (p["name"] or "").lower())
-    pages = max(1, (len(shown) + GRID_PAGE_SIZE - 1) // GRID_PAGE_SIZE)
+    in_cat = category is not None
+    cols = 1 if in_cat else GRID_COLS
+    per_page = CAT_PAGE_SIZE if in_cat else GRID_PAGE_SIZE
+    pages = max(1, (len(shown) + per_page - 1) // per_page)
     page = min(max(page, 0), pages - 1)
-    chunk = shown[page * GRID_PAGE_SIZE:(page + 1) * GRID_PAGE_SIZE]
-    for i in range(0, len(chunk), GRID_COLS):
-        rows.append([grid_button(uid, p) for p in chunk[i:i + GRID_COLS]])
+    chunk = shown[page * per_page:(page + 1) * per_page]
+    for i in range(0, len(chunk), cols):
+        rows.append([grid_button(uid, p, full=in_cat) for p in chunk[i:i + cols]])
     if pages > 1:
         def target(n):
             return f"shop:{n}" if category is None else f"cat:{cat_key(category)}~{n}"
