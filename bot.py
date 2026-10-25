@@ -845,15 +845,42 @@ async def notify_admins(context, text, ticket_id=None, photo_id=None):
 
 
 # ---------------------------------------------------------------- channel join gate + sales announcements
+_channel_cfg_error = {"msg": ""}
+
+
+def _normalized_channel():
+    """Accept @name, -100id, or a pasted https://t.me/name link."""
+    ch = (required_channel() or "").strip()
+    m = re.match(r"^(?:https?://)?t\.me/([A-Za-z0-9_]{4,})/?$", ch)
+    if m:
+        return "@" + m.group(1)
+    if re.fullmatch(r"[A-Za-z0-9_]{4,}", ch) and not ch.isdigit():
+        return "@" + ch
+    return ch
+
+
 async def is_required_channel_member(bot, user_id: int) -> bool:
+    """True if joined. False if not joined OR if the check itself failed
+    (in that case _channel_cfg_error['msg'] is set so users get a clear message)."""
+    _channel_cfg_error["msg"] = ""
     if not required_channel():
         return True
     try:
-        member = await bot.get_chat_member(required_channel(), user_id)
-        return member.status in ("member", "administrator", "creator") or (member.status == "restricted" and getattr(member, "is_member", False))
+        member = await bot.get_chat_member(_normalized_channel(), user_id)
+        if member.status in ("member", "administrator", "creator"):
+            return True
+        if member.status == "restricted" and getattr(member, "is_member", False):
+            return True
+        return False  # left / kicked / never joined
     except Exception as exc:
-        log.warning("Required channel membership check failed: %s", exc)
-        # Fail closed when a required channel is configured; ensure bot is admin there.
+        err = str(exc)
+        low = err.lower()
+        if "user not found" in low or "participant_id_invalid" in low:
+            return False
+        log.error("Required channel membership check FAILED for channel %r: %s. "
+                  "Fix: make the bot an ADMIN of the channel and use @username or -100... ID.",
+                  _normalized_channel(), err)
+        _channel_cfg_error["msg"] = err
         return False
 
 
@@ -904,6 +931,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if required_channel() and not await is_required_channel_member(context.bot, u.id):
         prompt = "📢 <b>Join our channel first</b>\n\nPlease join the channel and then tap <b>I've joined — Check</b> to use the bot."
+        if _channel_cfg_error["msg"]:
+            prompt += "\n\n⚠️ <i>Channel check is not set up correctly yet. Please tell the shop admin.</i>"
         await update.effective_message.reply_text(prompt, reply_markup=join_channel_markup(), parse_mode=HTML)
         return
     created = db.ensure_user(u.id, u.username)
@@ -1404,7 +1433,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if action == "joincheck":
         if required_channel() and not await is_required_channel_member(context.bot, q.from_user.id):
-            await q.answer("I can't see your channel membership yet. Join the channel first.", show_alert=True)
+            if _channel_cfg_error["msg"]:
+                await q.answer("⚠️ Bot setup problem: the shop's bot cannot check the channel "
+                               "(it must be an admin there). Please tell the shop admin.", show_alert=True)
+            else:
+                await q.answer("I can't see your channel membership yet. Join the channel first.", show_alert=True)
             return
         await q.answer("Membership verified!")
         await send_start_screen(q.message, q.from_user, context)
