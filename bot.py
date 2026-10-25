@@ -136,7 +136,11 @@ TEXT = {
         "main_menu": "Main menu",
         "browse": "Browse the shop",
         "other_qty": "✏️ Other quantity",
-        "qty_head": "🛒 <b>{name}</b>\n\n🔢 <b>Choose quantity</b>\n💵 Price each: <b>${unit}</b> (₹{inr})\n👛 Wallet balance: <b>${bal}</b>\n\n📦 Available stock is checked automatically.",
+        "qty_head": "🛒 <b>{name}</b>\n\n📦 Status: <b>{status}</b>\n🔢 Quantity: <b>1–{maxq}</b>\n💵 Price each: <b>${unit}</b> (₹{inr})\n👛 Wallet balance: <b>${bal}</b>\n\n<i>Select a quantity:</i>",
+        "terms": "\n\n📋 <b>Terms of Service</b>\n<blockquote>{terms}</blockquote>\n\nTap <b>I Agree — Pay Now</b> to confirm.",
+        "btn_agree": "✅ I Agree — Pay Now · ${total}",
+        "warranty": "🛡 <b>Warranty</b>\n\n{text}",
+        "warranty_default": "Every product has its own warranty, shown on the product page before you pay.\nIf something does not work, open Support and send your order number — we will replace or refund it.",
         "ask_qty": "✏️ Send the quantity you want (a number):",
         "calc": "🧮 <b>Order summary</b>\n\n📦 {name}\n🔢 Quantity: <b>{qty}</b>\n💵 Price each: ${unit}\n💰 Total: <b>${total}</b> (₹{inr})\n👛 Balance: ${bal}",
         "btn_pay": "💰 Pay ${total} from balance",
@@ -302,33 +306,61 @@ def tt(language: str, key: str, /, **kw) -> str:
     return s.format(**kw) if kw else s
 
 
-def Btn(text, callback_data=None, style=None, url=None):
-    """Inline button with optional colour: 'primary' (blue), 'success' (green), 'danger' (red).
-    Colours need a Telegram app released after 9 Feb 2026; older apps just show a normal button."""
+BUTTON_ICONS = os.getenv("BUTTON_ICONS", "1") != "0"   # premium emoji inside buttons (needs Telegram Premium on the bot owner)
+
+
+def Btn(text, callback_data=None, style=None, url=None, icon=None):
+    """Inline button with optional colour ('primary' blue, 'success' green, 'danger' red) and an
+    optional premium custom emoji shown before the text (icon = custom emoji ID).
+    Colours/icons need a Telegram app released after 9 Feb 2026; older apps show a normal button."""
     kwargs = {"callback_data": callback_data} if url is None else {"url": url}
-    if not style:
-        return _Btn(text, **kwargs)
-    try:
-        return _Btn(text, style=style, **kwargs)
-    except TypeError:  # older python-telegram-bot without the style field
-        return _Btn(text, api_kwargs={"style": style}, **kwargs)
+    extra = {}
+    if icon and BUTTON_ICONS and str(icon).isdigit():
+        extra["icon_custom_emoji_id"] = str(icon)
+    if style:
+        try:
+            return _Btn(text, style=style, api_kwargs=extra or None, **kwargs)
+        except TypeError:  # older python-telegram-bot without the style field
+            extra["style"] = style
+    return _Btn(text, api_kwargs=extra or None, **kwargs)
+
+
+def strip_icons(markup):
+    """Same keyboard without premium button icons (used when Telegram refuses them)."""
+    if not isinstance(markup, Markup):
+        return markup
+    rows, changed = [], False
+    for row in markup.inline_keyboard:
+        new_row = []
+        for b in row:
+            d = b.to_dict()
+            if d.pop("icon_custom_emoji_id", None):
+                changed = True
+                b = _Btn.de_json(d, None)
+            new_row.append(b)
+        rows.append(new_row)
+    return Markup(rows) if changed else markup
 
 
 # ---------------------------------------------------------------- small helpers
 MENU = {
-    "shop": "🛍 Shop", "funds": "💳 Add Funds", "profile": "👤 Profile", "orders": "🧾 My Orders",
-    "ref": "🎁 Referral", "support": "🎧 Support", "settings": "⚙️ Settings",
-    "api": "🔑 Reseller API",
+    "shop": "🛍 Products", "support": "🎧 Support", "funds": "👛 Wallet", "api": "🔑 API",
+    "warranty": "🛡 Warranty",
+}
+# labels of the old bottom menu still open the right screen for customers who did not send /start yet
+LEGACY_MENU = {
+    "🛍 Shop": "shop", "💳 Add Funds": "funds", "👤 Profile": "profile", "🧾 My Orders": "orders",
+    "🎁 Referral": "ref", "🎧 Support": "support", "⚙️ Settings": "settings", "🔑 Reseller API": "api",
 }
 MENU_BY_LABEL = {v: k for k, v in MENU.items()}
-MENU_RE = "^(" + "|".join(re.escape(v) for v in MENU.values()) + ")$"
+MENU_BY_LABEL.update(LEGACY_MENU)
+MENU_RE = "^(" + "|".join(re.escape(v) for v in MENU_BY_LABEL) + ")$"
 
 
 def main_keyboard():
     return ReplyKeyboardMarkup(
-        [[MENU["shop"]], [MENU["funds"], MENU["profile"]], [MENU["orders"], MENU["ref"]],
-         [MENU["support"], MENU["settings"]], [MENU["api"]]],
-        resize_keyboard=True, is_persistent=True)
+        [[MENU["shop"], MENU["support"]], [MENU["funds"], MENU["api"]], [MENU["warranty"]]],
+        resize_keyboard=True, is_persistent=True, input_field_placeholder="Choose a quick menu b…")
 
 
 def lang(user_id: int) -> str:
@@ -384,40 +416,48 @@ CUSTOM_EMOJI_IDS = {
 }
 
 
+EMOJI_ALIASES = (
+    (("crunchyroll",), "crunchyroll"),
+    (("netflix",), "netflix"),
+    (("spotify",), "spotify"),
+    (("apple music",), "apple_music"),
+    (("duolingo",), "duolingo"),
+    (("hbo max", "max subscription", "max account"), "hbo_max"),
+    (("adobe express",), "adobe_express"),
+    (("muse ai",), "muse_ai"),
+    (("microsoft office", "office 365"), "office_365"),
+    (("hma", "hidemyass"), "hma"),
+    (("ilovepdf", "i love pdf"), "ilovepdf"),
+    (("capcut",), "capcut"),
+    (("instagram",), "instagram"),
+    (("canva",), "canva"),
+    (("nordvpn", "nord vpn"), "nordvpn"),
+    (("linkedin",), "linkedin"),
+    (("amazon prime", "prime video"), "amazon_prime"),
+    (("windows 11",), "windows"),
+    (("coursera",), "coursera"),
+    (("proton vpn", "protonvpn"), "protonvpn"),
+    (("steam",), "steam"),
+    (("gemini",), "gemini"),
+)
+
+
+def product_icon_id(name) -> str:
+    """Telegram custom-emoji ID for a product name ('' when none is configured)."""
+    key = str(name or "").lower().replace("+", " plus ").replace("&", " and ")
+    for terms, emoji_key in EMOJI_ALIASES:
+        if any(term in key for term in terms):
+            emoji_id = CUSTOM_EMOJI_IDS.get(emoji_key, "")
+            return emoji_id if emoji_id.isdigit() else ""
+    return ""
+
+
 def product_name_html(name) -> str:
     """Return a safely escaped product name prefixed with its configured Telegram custom emoji."""
     raw = str(name or "")
-    key = raw.lower().replace("+", " plus ").replace("&", " and ")
-    aliases = (
-        (("crunchyroll",), "crunchyroll"),
-        (("netflix",), "netflix"),
-        (("spotify",), "spotify"),
-        (("apple music",), "apple_music"),
-        (("duolingo",), "duolingo"),
-        (("hbo max", "max subscription", "max account"), "hbo_max"),
-        (("adobe express",), "adobe_express"),
-        (("muse ai",), "muse_ai"),
-        (("microsoft office", "office 365"), "office_365"),
-        (("hma", "hidemyass"), "hma"),
-        (("ilovepdf", "i love pdf"), "ilovepdf"),
-        (("capcut",), "capcut"),
-        (("instagram",), "instagram"),
-        (("canva",), "canva"),
-        (("nordvpn", "nord vpn"), "nordvpn"),
-        (("linkedin",), "linkedin"),
-        (("amazon prime", "prime video"), "amazon_prime"),
-        (("windows 11",), "windows"),
-        (("coursera",), "coursera"),
-        (("proton vpn", "protonvpn"), "protonvpn"),
-        (("steam",), "steam"),
-        (("gemini",), "gemini"),
-    )
-    for terms, emoji_key in aliases:
-        if any(term in key for term in terms):
-            emoji_id = CUSTOM_EMOJI_IDS.get(emoji_key, "")
-            if emoji_id.isdigit():
-                return f'<tg-emoji emoji-id="{emoji_id}">🔹</tg-emoji> {esc(raw)}'
-            break
+    emoji_id = product_icon_id(raw)
+    if emoji_id:
+        return f'<tg-emoji emoji-id="{emoji_id}">🔹</tg-emoji> {esc(raw)}'
     return esc(raw)
 
 
@@ -495,6 +535,10 @@ async def edit(q, text, markup=None):
         err = str(e).lower()
         if "not modified" in err:
             return
+        if markup is not None and strip_icons(markup) is not markup:
+            log.warning("Telegram refused button icons (%s) - sending without them", e)
+            await edit(q, text, strip_icons(markup))
+            return
         if "no text in the message" in err:   # the UPI screen is a photo (QR): replace it with a new message
             chat = q.message.chat
             try:
@@ -512,8 +556,15 @@ async def respond(update, text, markup=None):
     if q:
         await edit(q, text, markup)
     else:
-        await update.effective_message.reply_text(text, reply_markup=markup, parse_mode=HTML,
-                                                  disable_web_page_preview=True)
+        try:
+            await update.effective_message.reply_text(text, reply_markup=markup, parse_mode=HTML,
+                                                      disable_web_page_preview=True)
+        except BadRequest as e:
+            if markup is None or strip_icons(markup) is markup:
+                raise
+            log.warning("Telegram refused button icons (%s) - sending without them", e)
+            await update.effective_message.reply_text(text, reply_markup=strip_icons(markup), parse_mode=HTML,
+                                                      disable_web_page_preview=True)
 
 
 def clear_await(context):
@@ -539,7 +590,22 @@ def product_button(uid: int, p):
     return Btn("🔴 " + label.removeprefix("🟢 ") + " · SOLD OUT", callback_data=f"prod:{p['id']}", style="danger")
 
 
-def shop_view(uid: int, language: str, category: str = None):
+GRID_COLS = 3
+GRID_PAGE_SIZE = 30            # 10 rows x 3 columns
+SHORT_NAME = 18
+
+
+def grid_button(uid: int, p):
+    """Compact product button for the 3-column grid: premium icon + name (red = sold out)."""
+    name = (p["name"] or "").strip()
+    label = name if len(name) <= SHORT_NAME else name[:SHORT_NAME - 1].rstrip() + "…"
+    icon = product_icon_id(p["name"])
+    if is_available(p):
+        return Btn(label, callback_data=f"prod:{p['id']}", icon=icon)
+    return Btn(label, callback_data=f"prod:{p['id']}", style="danger", icon=icon)
+
+
+def shop_view(uid: int, language: str, category: str = None, page: int = 0):
     products = db.list_products()
     if not products:
         return tt(language, "no_products", shop=esc(shop_name())), Markup([[Btn(tt(language, "btn_search"), callback_data="search", style="primary")]])
@@ -547,25 +613,34 @@ def shop_view(uid: int, language: str, category: str = None):
     if category is None:
         avail = sum(1 for p in products if is_available(p))
         text = tt(language, "shop_head", avail=avail, total=len(products))
+        shown = list(products)
+        nav_key = "shop"
         cats = db.list_categories()
-        pair = []
-        for c in cats:
-            pair.append(Btn("📂 " + c, callback_data=f"cat:{cat_key(c)}", style="primary"))
-            if len(pair) == 2:
-                rows.append(pair); pair = []
-        if pair:
-            rows.append(pair)
-        for p in products:
-            if not (p["category"] or "").strip():
-                rows.append([product_button(uid, p)])
+        if cats and page == 0:        # categories (if the admin uses them) are one row of buttons above the grid
+            for i in range(0, len(cats), GRID_COLS):
+                rows.append([Btn("📂 " + c, callback_data=f"cat:{cat_key(c)}", style="primary") for c in cats[i:i + GRID_COLS]])
+            shown = [p for p in products if not (p["category"] or "").strip()] or []
+            # products that belong to a category are opened through that category
     else:
         text = tt(language, "cat_head", cat=esc(category))
-        for p in products:
-            if (p["category"] or "").strip() == category:
-                rows.append([product_button(uid, p)])
+        shown = [p for p in products if (p["category"] or "").strip() == category]
+        nav_key = f"cat:{cat_key(category)}~"
+    shown.sort(key=lambda p: (p["name"] or "").lower())
+    pages = max(1, (len(shown) + GRID_PAGE_SIZE - 1) // GRID_PAGE_SIZE)
+    page = min(max(page, 0), pages - 1)
+    chunk = shown[page * GRID_PAGE_SIZE:(page + 1) * GRID_PAGE_SIZE]
+    for i in range(0, len(chunk), GRID_COLS):
+        rows.append([grid_button(uid, p) for p in chunk[i:i + GRID_COLS]])
+    if pages > 1:
+        def target(n):
+            return f"shop:{n}" if category is None else f"cat:{cat_key(category)}~{n}"
+        rows.append([Btn("‹", callback_data=target(max(page - 1, 0)), style="primary"),
+                     Btn(f"{page + 1}/{pages}", callback_data="noop"),
+                     Btn("›", callback_data=target(min(page + 1, pages - 1)), style="primary")])
+    if category is None:
+        rows.append([Btn(tt(language, "btn_search"), callback_data="search", style="primary")])
+    else:
         rows.append([Btn(tt(language, "back"), callback_data="shop", style="primary")])
-        return text, Markup(rows)
-    rows.append([Btn(tt(language, "btn_search"), callback_data="search", style="primary")])
     return text, Markup(rows)
 
 
@@ -597,13 +672,29 @@ def card_view(uid: int, p, language: str):
 def qty_view(uid: int, p, language: str):
     unit = db.get_effective_price(uid, p["id"], p["price"])
     acct = db.get_account(uid)
-    text = tt(language, "qty_head", name=product_name_html(p["name"]), unit=money(unit), inr=inr(unit), bal=money(acct["balance"] or 0))
+    status = tt(language, "in_stock") + f" · {p['stock']}" if p["stock"] > 0 else tt(language, "sold_out")
+    text = tt(language, "qty_head", name=product_name_html(p["name"]), unit=money(unit), inr=inr(unit),
+              bal=money(acct["balance"] or 0), status=status, maxq=p["stock"])
     sizes = [n for n in QTY_PRESETS if n <= p["stock"]]
-    rows = [[Btn(str(n), callback_data=f"qty:{p['id']}:{n}", style="primary") for n in sizes[i:i + 3]]
-            for i in range(0, len(sizes), 3)]
+    rows = []
+    for chunk in (sizes[:4], sizes[4:]):
+        if chunk:
+            rows.append([Btn(str(n), callback_data=f"qty:{p['id']}:{n}", style="primary") for n in chunk])
     rows.append([Btn(tt(language, "other_qty"), callback_data=f"qtyo:{p['id']}", style="success")])
     rows.append([Btn(tt(language, "back"), callback_data=f"prod:{p['id']}", style="primary")])
     return text, Markup(rows)
+
+
+def terms_block(p, language: str) -> str:
+    """Short 'Terms of Service' box under the order summary (taken from the product's own fields)."""
+    lines = []
+    delivery = (p["delivery"] or "").strip()
+    warranty = (p["warranty"] or "").strip()
+    lines.append("🚀 Delivery: " + (esc(delivery) if delivery else ("Instant" if not is_manual(p) else "After you order")))
+    lines.append("🛡 Warranty: " + (esc(warranty) if warranty else tt(language, "none")))
+    for l in [x.strip() for x in (p["description"] or "").splitlines() if x.strip()][:6]:
+        lines.append(("✅ " + esc(l)) if l[0].isalnum() else esc(l))
+    return tt(language, "terms", terms="\n".join(lines))
 
 
 def calc_view(uid: int, pid: int, qty: int, language: str):
@@ -617,7 +708,8 @@ def calc_view(uid: int, pid: int, qty: int, language: str):
     text = tt(language, "calc", name=product_name_html(p["name"]), qty=qty, unit=money(unit), total=money(total), inr=inr(total), bal=money(bal))
     rows = []
     if bal + 1e-9 >= total:
-        rows.append([Btn(tt(language, "btn_pay", total=money(total)), callback_data=f"bal:{pid}:{qty}", style="success")])
+        text += terms_block(p, language)
+        rows.append([Btn(tt(language, "btn_agree", total=money(total)), callback_data=f"bal:{pid}:{qty}", style="success")])
     else:
         text += tt(language, "need_more", need=money(total - bal))
         rows.append([Btn(tt(language, "btn_addfunds"), callback_data="fund", style="success")])
@@ -638,8 +730,18 @@ def wallet_view(uid: int, language: str):
         rows.append([Btn(tt(language, "btn_upi"), callback_data="fm:upi")])
     if not rows:
         text += tt(language, "no_methods")
+    rows.append([Btn("👤 Profile", callback_data="menu:profile"), Btn("🧾 My Orders", callback_data="menu:orders")])
+    rows.append([Btn("🎁 Referral", callback_data="menu:ref"), Btn("⚙️ Settings", callback_data="menu:settings")])
     rows.append(main_menu_row(language))
     return text, Markup(rows)
+
+
+def warranty_view(uid: int, language: str):
+    custom = (db.get_setting("warranty_text", "") or "").strip()
+    body = esc(custom) if custom else tt(language, "warranty_default")
+    return tt(language, "warranty", text=body), Markup([
+        [Btn("🎧 " + MENU["support"].split(" ", 1)[1], callback_data="menu:support", style="primary")],
+        main_menu_row(language)])
 
 
 def profile_view(user, language: str):
@@ -834,6 +936,8 @@ async def show_menu(update, context, key):
         text, markup = support_view(uid, language)
     elif key == "settings":
         text, markup = settings_view(uid, language)
+    elif key == "warranty":
+        text, markup = warranty_view(uid, language)
     elif key == "api":
         try:
             text, markup = api_view(uid, language)
@@ -882,8 +986,17 @@ async def cb_menu(update, context, arg):
 
 
 async def cb_shop(update, context, arg):
-    await update.callback_query.answer()
+    q = update.callback_query
+    await q.answer()
+    if arg.isdigit():                       # page buttons of the product grid
+        text, markup = shop_view(q.from_user.id, lang(q.from_user.id), None, int(arg))
+        await edit(q, text, markup)
+        return
     await show_menu(update, context, "shop")
+
+
+async def cb_noop(update, context, arg):
+    await update.callback_query.answer()
 
 
 async def cb_fund(update, context, arg):
@@ -895,11 +1008,12 @@ async def cb_cat(update, context, arg):
     q = update.callback_query
     await q.answer()
     language = lang(q.from_user.id)
-    category = next((c for c in db.list_categories() if cat_key(c) == arg), None)
+    key, _, pg = arg.partition("~")
+    category = next((c for c in db.list_categories() if cat_key(c) == key), None)
     if category is None:
         await show_menu(update, context, "shop")
         return
-    text, markup = shop_view(q.from_user.id, language, category)
+    text, markup = shop_view(q.from_user.id, language, category, int(pg) if pg.isdigit() else 0)
     await edit(q, text, markup)
 
 
@@ -1274,7 +1388,7 @@ CALLBACKS = {
     "cat": cb_cat, "prod": cb_prod, "buy": cb_buy, "qty": cb_qty, "qtyo": cb_qty_other, "bal": cb_bal,
     "cx": cb_cancel_flow, "mok": cb_manual_ok, "search": cb_search, "fm": cb_fund_method,
     "fc": cb_dep_check, "ftx": cb_dep_txhash, "fx": cb_dep_cancel, "sup": cb_support,
-    "fu": cb_upi_paid, "api": cb_api,
+    "fu": cb_upi_paid, "api": cb_api, "noop": cb_noop,
 }
 
 

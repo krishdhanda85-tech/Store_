@@ -239,6 +239,21 @@ function googleTranslateElementInit(){new google.translate.TranslateElement({pag
     "dashboard.html": """{% extends 'base.html' %}{% block body %}
 <div class="page-head"><h2>Dashboard</h2>
 <div class="seg">{% for k, lbl in ranges %}<a href="{{ url_for('dashboard', range=k) }}" class="{{ 'on' if k == rng }}">{{ lbl }}</a>{% endfor %}</div></div>
+<style>
+.todo{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 16px}
+.todo a{display:flex;align-items:center;gap:8px;padding:9px 14px;border-radius:12px;background:var(--surface);border:1px solid var(--line);color:var(--ink);font-weight:700;font-size:14px;text-decoration:none;box-shadow:var(--shadow)}
+.todo a b{min-width:24px;text-align:center;border-radius:99px;padding:1px 8px;background:var(--errbg);color:var(--fail)}
+.todo a.warn b{background:#f0b84a33;color:var(--pend)}
+.todo .ok{color:var(--paid);font-weight:700;padding:9px 2px}
+</style>
+{% set low_n = d.low|length %}
+<div class="todo">
+{% if pending_count %}<a href="{{ url_for('manual') }}"><b>{{ pending_count }}</b>Orders to deliver</a>{% endif %}
+{% if upi_pending %}<a href="{{ url_for('upipay') }}"><b>{{ upi_pending }}</b>UPI payments to check</a>{% endif %}
+{% if open_tickets %}<a href="{{ url_for('tickets') }}"><b>{{ open_tickets }}</b>Open support tickets</a>{% endif %}
+{% if low_n %}<a class="warn" href="{{ url_for('products') }}"><b>{{ low_n }}</b>Products low on stock</a>{% endif %}
+{% if not (pending_count or upi_pending or open_tickets or low_n) %}<span class="ok">Nothing needs your attention right now.</span>{% endif %}
+</div>
 {% if d.nocost %}<div class="msg">{{ d.nocost }} sale{{ '' if d.nocost == 1 else 's' }} in this period {{ 'has' if d.nocost == 1 else 'have' }} no cost price, so the full sale amount is counted as profit (this is why profit looks too high). <a href="{{ url_for('products') }}">Set the cost price</a> on the product and the real profit shows up, old sales included.</div>{% endif %}
 <div class="lead2">
 <div><small>Revenue (USDT)</small><div class="big">{{ '%.2f'|format(d.rev) }}</div><div class="sub">{{ d.n }} paid order{{ '' if d.n == 1 else 's' }}, {{ d.units }} item{{ '' if d.units == 1 else 's' }} sold</div></div>
@@ -414,6 +429,13 @@ function googleTranslateElementInit(){new google.translate.TranslateElement({pag
 <input name="category" list="cats" placeholder="e.g. Streaming">
 <button type="submit">Add product</button>
 </form></div>
+
+{% if products %}<details class="card" style="margin-bottom:14px"><summary style="cursor:pointer;font-weight:800">How customers see your products in the bot</summary>
+<style>.pv{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;margin-top:12px;max-width:520px}
+.pv span{background:var(--grey);color:var(--greyink);border-radius:9px;padding:9px 8px;font-size:13px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pv span.x{background:var(--errbg);color:var(--fail)}</style>
+<div class="pv">{% for p in products|sort(attribute='name', case_sensitive=false) %}<span class="{{ 'x' if p['kind'] != 'manual' and p['stock'] <= 0 }}" title="{{ p['name'] }}">{{ p['name'] }}</span>{% endfor %}</div>
+<p class="muted" style="margin:10px 0 0">A to Z, 3 per row. Red = out of stock. Names that are too long get cut in the bot, so keep them short.</p></details>{% endif %}
 
 {% if products|length > 6 %}<div class="pbar"><input type="search" placeholder="Search products..." oninput="filt(this.value)"></div>{% endif %}
 
@@ -763,6 +785,8 @@ if(location.hash){var t=document.querySelector(location.hash);if(t&&t.tagName===
 <p class="muted">Plain text. Use {shop} for your shop name. Leave empty to use the built-in message.</p>
 <label>Welcome message <span class="def">shown after /start, under the bottom menu</span></label>
 <textarea name="welcome_text" rows="5" maxlength="1500" placeholder="Welcome to {shop}! Premium subscriptions at the best price.">{{ s.welcome_text }}</textarea>
+<label>Warranty text <span class="def">shown when a customer taps Warranty in the bot</span></label>
+<textarea name="warranty_text" rows="4" maxlength="1500" placeholder="Replacement within 7 days if the account stops working. Send your order number to Support.">{{ s.warranty_text }}</textarea>
 <label>Shop closed message <span class="def">shown to customers while the shop is closed</span></label>
 <textarea name="closed_message" rows="3" maxlength="600" placeholder="We are closed for maintenance. Back in 1 hour.">{{ s.closed_message }}</textarea></div>
 
@@ -1650,6 +1674,7 @@ def settings():
     s["shop_open"] = db.get_setting("shop_open", 1)
     s["welcome_text"] = db.get_setting("welcome_text", "")
     s["closed_message"] = db.get_setting("closed_message", "")
+    s["warranty_text"] = db.get_setting("warranty_text", "")
     s["quick_replies"] = "\n".join(_quick_replies())
     return render("settings.html", s=s, d=d)
 
@@ -1695,6 +1720,7 @@ def save_settings():
     if "welcome_text" in f:
         db.set_setting("welcome_text", f.get("welcome_text", "").strip()[:1500])
         db.set_setting("closed_message", f.get("closed_message", "").strip()[:600])
+        db.set_setting("warranty_text", f.get("warranty_text", "").strip()[:1500])
         replies = "\n".join(x.strip() for x in f.get("quick_replies", "").splitlines() if x.strip())
         db.set_setting("quick_replies", replies[:3000] if replies else DEFAULT_QUICK_REPLIES)
     flash("Settings saved. They are live in the bot now.")
@@ -1703,7 +1729,7 @@ def save_settings():
 
 @app.route("/settings/reset", methods=["POST"])
 def reset_settings():
-    db.del_settings(list(SETTING_DEFAULTS) + ["referral_percent", "welcome_text", "closed_message", "quick_replies"])
+    db.del_settings(list(SETTING_DEFAULTS) + ["referral_percent", "welcome_text", "closed_message", "warranty_text", "quick_replies"])
     flash("All settings are back to their defaults.")
     return redirect(url_for("settings"))
 
