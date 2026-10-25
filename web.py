@@ -205,6 +205,7 @@ h2{font-size:22px}
 {{ nl('suppliers_admin.suppliers','Suppliers API','link') }}
 {{ nl('reseller_admin.resellers','Resellers API','key') }}
 {{ nl('admins','Admins','shield') }}
+{{ nl('emojis','Premium emojis','tag') }}
 {{ nl('settings','Settings','sliders') }}
 <div class="out">{{ nl('logout','Log out','out') }}</div>
 </aside>
@@ -829,6 +830,33 @@ function mark(){
 }
 mark();
 </script>
+{% endblock %}""",
+    "emojis.html": """{% extends 'base.html' %}{% block body %}
+<h2>Premium emojis</h2>
+<div class="card"><h3>How it works</h3>
+<p class="muted">When a product or category <b>name contains the keyword</b>, the bot shows that premium emoji in front of it (buttons, product cards, promo posts). Your rules are checked first, then the built-in ones. Changes are live in the bot immediately, no restart.</p>
+<p class="muted"><b>Get an emoji ID:</b> in Telegram send the premium emoji to <b>@RawDataBot</b> (or @getidsbot). Copy the number called <code>custom_emoji_id</code>.</p>
+<p class="muted">Buttons only show premium icons when the bot owner has Telegram Premium. If Telegram refuses an emoji, the bot falls back to a normal button.</p></div>
+
+<div class="card"><h3>Add / update a rule</h3>
+<form method="post" action="{{ url_for('emoji_add') }}">
+<div class="two">
+<div><label>Keyword <span class="muted">(part of the product / category name)</span></label><input name="keyword" maxlength="40" placeholder="disney" required></div>
+<div><label>Emoji ID</label><input name="emoji_id" inputmode="numeric" pattern="[0-9]{5,30}" maxlength="30" placeholder="5069081919279334693" required></div>
+</div>
+<button type="submit">Save rule</button></form></div>
+
+<div class="card"><h3>Your rules ({{ rules|length }})</h3>
+{% if rules %}<div class="scroll"><table><tr><th>Keyword</th><th>Emoji ID</th><th></th></tr>
+{% for r in rules %}<tr><td><b>{{ r.k }}</b></td><td><code>{{ r.id }}</code></td>
+<td><form method="post" action="{{ url_for('emoji_delete') }}" style="margin:0" onsubmit="return confirm('Delete this rule?')"><input type="hidden" name="keyword" value="{{ r.k }}"><button type="submit" class="red sm">Delete</button></form></td></tr>{% endfor %}
+</table></div>{% else %}<p class="muted">No rules yet. Add one above.</p>{% endif %}</div>
+
+<div class="card"><h3>Built-in emojis</h3>
+<p class="muted">Already configured in the bot. To override one, add a rule with the same keyword.</p>
+<div class="scroll"><table><tr><th>Keywords</th><th>Emoji ID</th></tr>
+{% for terms, eid in builtin %}<tr><td>{{ terms }}</td><td>{% if eid %}<code>{{ eid }}</code>{% else %}<span class="muted">not set</span>{% endif %}</td></tr>{% endfor %}
+</table></div></div>
 {% endblock %}""",
     "upi.html": """{% extends 'base.html' %}{% block body %}
 <h2>UPI setup</h2>
@@ -1732,6 +1760,56 @@ def reset_settings():
     db.del_settings(list(SETTING_DEFAULTS) + ["referral_percent", "welcome_text", "closed_message", "warranty_text", "quick_replies"])
     flash("All settings are back to their defaults.")
     return redirect(url_for("settings"))
+
+
+# ------------------------------------------------- premium emojis (keyword -> custom emoji id)
+EMOJI_SETTING = "custom_emojis"
+
+
+def _emoji_rules():
+    import json
+    try:
+        data = json.loads(db.get_setting(EMOJI_SETTING, "[]") or "[]")
+    except Exception:
+        data = []
+    return [r for r in data if isinstance(r, dict) and r.get("k") and str(r.get("id", "")).isdigit()]
+
+
+@app.route("/emojis")
+def emojis():
+    import bot as _bot
+    builtin = [(", ".join(terms), _bot.CUSTOM_EMOJI_IDS.get(key, "")) for terms, key in _bot.EMOJI_ALIASES]
+    return render("emojis.html", rules=_emoji_rules(), builtin=builtin)
+
+
+@app.route("/emojis/add", methods=["POST"])
+def emoji_add():
+    import json
+    k = " ".join((request.form.get("keyword") or "").lower().split())[:40]
+    eid = (request.form.get("emoji_id") or "").strip()
+    if len(k) < 2:
+        flash("Keyword must be at least 2 characters.", "err")
+        return redirect(url_for("emojis"))
+    if not (eid.isdigit() and 5 <= len(eid) <= 30):
+        flash("Emoji ID must be a number (copy custom_emoji_id from @RawDataBot).", "err")
+        return redirect(url_for("emojis"))
+    rules = [r for r in _emoji_rules() if r["k"] != k]
+    if len(rules) >= 100:
+        flash("Maximum 100 rules.", "err")
+        return redirect(url_for("emojis"))
+    rules.append({"k": k, "id": eid})
+    db.set_setting(EMOJI_SETTING, json.dumps(rules))
+    flash(f"Saved: \u201c{k}\u201d now uses emoji {eid}.")
+    return redirect(url_for("emojis"))
+
+
+@app.route("/emojis/delete", methods=["POST"])
+def emoji_delete():
+    import json
+    k = " ".join((request.form.get("keyword") or "").lower().split())
+    db.set_setting(EMOJI_SETTING, json.dumps([r for r in _emoji_rules() if r["k"] != k]))
+    flash("Rule deleted.")
+    return redirect(url_for("emojis"))
 
 
 # ------------------------------------------------- UPI (accounts, QR, rate, payments to verify)

@@ -445,6 +445,13 @@ EMOJI_ALIASES = (
 def product_icon_id(name) -> str:
     """Telegram custom-emoji ID for a product name ('' when none is configured)."""
     key = str(name or "").lower().replace("+", " plus ").replace("&", " and ")
+    try:                                   # rules the admin added on the website (Premium emojis page)
+        import json
+        for r in json.loads(db.get_setting("custom_emojis", "[]") or "[]"):
+            if r.get("k") and r["k"] in key and str(r.get("id", "")).isdigit():
+                return str(r["id"])
+    except Exception:
+        pass
     for terms, emoji_key in EMOJI_ALIASES:
         if any(term in key for term in terms):
             emoji_id = CUSTOM_EMOJI_IDS.get(emoji_key, "")
@@ -605,6 +612,16 @@ def grid_button(uid: int, p):
     return Btn(label, callback_data=f"prod:{p['id']}", style="danger", icon=icon)
 
 
+def category_button(c: str):
+    """Category button styled exactly like the product grid buttons (dark, premium icon + name)."""
+    name = (c or "").strip()
+    label = name if len(name) <= SHORT_NAME else name[:SHORT_NAME - 1].rstrip() + "…"
+    icon = product_icon_id(name)
+    if not icon:
+        label = "📂 " + label          # no premium icon configured for this name -> plain folder emoji
+    return Btn(label, callback_data=f"cat:{cat_key(c)}", icon=icon)
+
+
 def shop_view(uid: int, language: str, category: str = None, page: int = 0):
     products = db.list_products()
     if not products:
@@ -618,7 +635,7 @@ def shop_view(uid: int, language: str, category: str = None, page: int = 0):
         cats = db.list_categories()
         if cats and page == 0:        # categories (if the admin uses them) are one row of buttons above the grid
             for i in range(0, len(cats), GRID_COLS):
-                rows.append([Btn("📂 " + c, callback_data=f"cat:{cat_key(c)}", style="primary") for c in cats[i:i + GRID_COLS]])
+                rows.append([category_button(c) for c in cats[i:i + GRID_COLS]])
             shown = [p for p in products if not (p["category"] or "").strip()] or []
             # products that belong to a category are opened through that category
     else:
@@ -893,21 +910,35 @@ def join_channel_markup():
 
 
 async def announce_sale(bot, product_name: str, quantity: int, order_id: str, source: str = "Shop"):
+    """Post the sale announcement to the sales GROUP (SALES_GROUP_ID). Bot must be a member of the group
+    and allowed to send messages there."""
     if not sales_channel():
         return
     try:
+        markup = None
+        uname = (getattr(tenancy.cur(), "bot_username", "") or "").lstrip("@")
+        if not uname:
+            try:
+                uname = (await bot.get_me()).username or ""
+            except Exception:
+                uname = ""
+        if uname:
+            markup = Markup([[Btn("🛒 Buy Now", url=f"https://t.me/{uname}", style="success")]])
         await bot.send_message(
             chat_id=sales_channel(),
-            text=(f"🛒 <b>New order completed</b>\n\n"
+            text=(f"🚀 <b>New Purchase!</b>\n\n"
                   f"📦 Product: <b>{esc(product_name)}</b>\n"
-                  f"🔢 Quantity sold: <b>{int(quantity)}</b>\n"
+                  f"🔢 QTY: <b>{int(quantity)}</b>\n"
                   f"🧾 Order: <code>{esc(order_id)}</code>\n"
-                  f"🔗 Source: {esc(source)}"),
+                  f"🔗 Source: {esc(source)}\n\n"
+                  f"⚡ Auto-delivered instantly!"),
             parse_mode=HTML,
+            reply_markup=markup,
             disable_web_page_preview=True,
         )
     except Exception:
-        log.exception("Could not post sale update to channel %s", sales_channel())
+        log.exception("Could not post sale update to group %s (is the bot a member of the group "
+                      "and allowed to send messages? check SALES_GROUP_ID)", sales_channel())
 
 
 async def send_start_screen(message, user, context):
@@ -2103,6 +2134,63 @@ async def _bind(update, context):
     tenancy.set_current(t)          # same task as the real handler, so it stays set until it ends
 
 
+async def chatid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/chatid -> tells the ID of the chat it is used in (use it inside your group to get SALES_GROUP_ID)."""
+    chat = update.effective_chat
+    if chat is None or update.effective_message is None:
+        return
+    await update.effective_message.reply_text(
+        f"Chat ID: <code>{chat.id}</code>\nType: {esc(chat.type)}", parse_mode=HTML)
+
+
+PROMO_ADS = os.getenv("PROMO_ADS", "1") != "0"
+PROMO_INTERVAL_MIN = max(1, int(os.getenv("PROMO_INTERVAL_MIN", "5") or 5))
+PROMO_TAGLINES = (
+    "🔥 <b>Deal alert!</b>",
+    "⚡ <b>Instant delivery available</b>",
+    "💎 <b>Featured product</b>",
+    "🛍 <b>Check this out</b>",
+    "✅ <b>Available now</b>",
+    "🎯 <b>Today's pick</b>",
+)
+
+
+async def promo_job(context: ContextTypes.DEFAULT_TYPE):
+    """Every PROMO_INTERVAL_MIN minutes post ONE random in-stock product (real name, price, stock)
+    to the sales group. Content is always true: nothing here pretends a sale happened."""
+    import random
+    target = sales_channel()
+    if not PROMO_ADS or not target:
+        return
+    try:
+        products = [p for p in db.list_products() if is_available(p)]
+        if not products:
+            return
+        last = context.application.bot_data.get("last_promo_pid")
+        pool = [p for p in products if p["id"] != last] or products
+        p = random.choice(pool)
+        context.application.bot_data["last_promo_pid"] = p["id"]
+        price = float(p["price"])
+        pct = discount_pct(p["old_price"], price)
+        lines = [random.choice(PROMO_TAGLINES), "", product_name_html(p["name"])]
+        if pct:
+            lines.append(f"💰 <s>${money(p['old_price'])}</s> → <b>${money(price)}</b>  (🔻{pct}% OFF)")
+        else:
+            lines.append(f"💰 Price: <b>${money(price)}</b>")
+        if not is_manual(p):
+            lines.append(f"📦 In stock: <b>{p['stock']}</b>")
+        lines.append("")
+        lines.append("👇 Tap <b>Buy Now</b> to order")
+        uname = (getattr(tenancy.cur(), "bot_username", "") or "").lstrip("@")
+        if not uname:
+            uname = (await context.bot.get_me()).username or ""
+        markup = Markup([[Btn("🛒 Buy Now", url=f"https://t.me/{uname}", style="success")]]) if uname else None
+        await context.bot.send_message(chat_id=target, text="\n".join(lines), parse_mode=HTML,
+                                       reply_markup=markup, disable_web_page_preview=True)
+    except Exception:
+        log.exception("Promo post to group %s failed (bot must be in the group and allowed to send)", target)
+
+
 def _in_shop(fn):
     """Wrap a repeating job so it also runs inside its own shop."""
     async def run(context):
@@ -2120,6 +2208,7 @@ def build_application(tenant):
     app.bot_data["tenant_id"] = tenant.id
     app.add_handler(TypeHandler(Update, _bind), group=-1)
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("chatid", chatid_cmd))
     app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(CommandHandler("owner", owner_cmd))
     app.add_handler(CommandHandler("addlink", addlink))
@@ -2149,6 +2238,8 @@ def build_application(tenant):
     app.job_queue.run_repeating(_in_shop(outbox_job), interval=10, first=5)
     app.job_queue.run_repeating(_in_shop(provider_job), interval=120, first=15)
     app.job_queue.run_repeating(_in_shop(backup_job), interval=86400, first=600)
+    if PROMO_ADS:
+        app.job_queue.run_repeating(_in_shop(promo_job), interval=PROMO_INTERVAL_MIN * 60, first=60)
     return app
 
 

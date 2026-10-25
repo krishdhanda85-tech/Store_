@@ -96,8 +96,8 @@ Money goes straight into your Binance; we only read the payment list to confirm 
 <input name="ch_required" value="{{ row.ch_required }}" placeholder="@YourChannel or -100...">
 <label>Join link</label>
 <input name="ch_url" value="{{ row.ch_url }}" placeholder="https://t.me/YourChannel">
-<label>Channel for sales announcements <span class="muted">(blank = same as above)</span></label>
-<input name="ch_sales" value="{{ row.ch_sales }}" placeholder="@YourSalesChannel">
+<label>Group for sales announcements <span class="muted">(blank = no announcements; add the bot to the group)</span></label>
+<input name="ch_sales" value="{{ row.ch_sales }}" placeholder="-100... (group ID) or @YourGroup">
 </div>
 
 <button type="submit">Save settings</button>

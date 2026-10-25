@@ -108,7 +108,9 @@ CHANNEL JOIN + SALES UPDATES (optional)
 Set these Railway Variables on the worker service:
   REQUIRED_CHANNEL_ID=@YourChannelUsername (or numeric channel ID, e.g. -100...)
   REQUIRED_CHANNEL_URL=https://t.me/YourChannelUsername (or private invite link)
-  SALES_CHANNEL_ID=@YourChannelUsername (defaults to REQUIRED_CHANNEL_ID)
+  SALES_GROUP_ID=-100xxxxxxxxxx   (group where sale announcements are posted; add the bot to the group)
+  PROMO_ADS=1             (1 = auto promo posts in the group, 0 = off)
+  PROMO_INTERVAL_MIN=5    (minutes between promo posts; each post is a random in-stock product with its real price/stock)
 
 Add the bot as an administrator in that channel. It needs permission to view members/check join status and post messages. With REQUIRED_CHANNEL_ID set, /start asks users to join and tap “I've joined — Check”. Each successful normal Telegram purchase and each reseller API order posts product name, quantity sold, order ID, and source to SALES_CHANNEL_ID. Customer details and delivery links are not posted. Leave REQUIRED_CHANNEL_ID blank to disable the join requirement.
 

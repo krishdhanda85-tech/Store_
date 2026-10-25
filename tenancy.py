@@ -147,7 +147,8 @@ class Tenant:
             self.owner_id = int(os.getenv("OWNER_ID", "0") or 0)
             self.required_channel_id = os.getenv("REQUIRED_CHANNEL_ID", "").strip()
             self.required_channel_url = os.getenv("REQUIRED_CHANNEL_URL", "").strip()
-            self.sales_channel_id = os.getenv("SALES_CHANNEL_ID", self.required_channel_id).strip()
+            # sale announcements go to a GROUP (SALES_GROUP_ID); no fallback to the join-channel any more
+            self.sales_channel_id = (os.getenv("SALES_GROUP_ID") or os.getenv("SALES_CHANNEL_ID") or "").strip()
             pay_cfg = None                         # None = Railway variables (old behaviour)
         else:
             self.name = row["name"] or "Shop"
@@ -155,7 +156,7 @@ class Tenant:
             self.owner_id = int(row["owner_tg_id"] or 0)
             self.required_channel_id = (row["ch_required"] or "").strip()
             self.required_channel_url = (row["ch_url"] or "").strip()
-            self.sales_channel_id = (row["ch_sales"] or self.required_channel_id).strip()
+            self.sales_channel_id = (row["ch_sales"] or "").strip()
             pay_cfg = {
                 "api_key": decrypt(row["bn_key_enc"]) if row["bn_key_enc"] else "",
                 "secret": decrypt(row["bn_secret_enc"]) if row["bn_secret_enc"] else "",
