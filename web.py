@@ -46,18 +46,18 @@ TEMPLATES = {
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#0f1a24">
+<meta name="theme-color" content="#14171f">
 <title>{{ shop }} Admin</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <script>try{var t=localStorage.getItem("theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
 <style>
-:root{--bg:#f2f4f7;--surface:#fff;--ink:#121b26;--muted:#667085;--line:#e3e7ee;--line2:#cfd6e0;--field:#fff;--accent:#0b7a75;--accent2:#096560;--accent-soft:#e3f3f1;--link:#0b6b67;--paid:#12805c;--pend:#a86a0a;--fail:#c0352b;--errbg:#fdeceb;--grey:#e7ebf1;--greyink:#223042;--side:#0f1a24;--sidetxt:#a9b6c6;--sideon:#ffffff14;--bar:#bfe3df;--shadow:0 1px 2px #10203010,0 4px 14px #10203008}
-@media(prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#0b121a;--surface:#131d28;--ink:#e8eef5;--muted:#8b99ab;--line:#213040;--line2:#2c3e52;--field:#0d1620;--accent:#12968c;--accent2:#0f8077;--accent-soft:#12312f;--link:#5fd6cb;--paid:#3ccf91;--pend:#f0b84a;--fail:#ff7b72;--errbg:#3a1d1f;--grey:#223245;--greyink:#dbe5f0;--side:#0a1119;--bar:#1d4a46;--shadow:none}}
-:root[data-theme=dark]{--bg:#0b121a;--surface:#131d28;--ink:#e8eef5;--muted:#8b99ab;--line:#213040;--line2:#2c3e52;--field:#0d1620;--accent:#12968c;--accent2:#0f8077;--accent-soft:#12312f;--link:#5fd6cb;--paid:#3ccf91;--pend:#f0b84a;--fail:#ff7b72;--errbg:#3a1d1f;--grey:#223245;--greyink:#dbe5f0;--side:#0a1119;--bar:#1d4a46;--shadow:none}
+:root{--bg:#f4f5f7;--surface:#fff;--ink:#14171f;--muted:#5b6372;--line:#e1e4ea;--line2:#cdd2db;--field:#fff;--accent:#2447d6;--accent2:#1c39ae;--accent-soft:#e8edff;--link:#2447d6;--paid:#0f7a4f;--pend:#9a5b00;--fail:#c4301f;--errbg:#fdebe8;--grey:#eceef3;--greyink:#232836;--side:#fff;--sidetxt:#4a5262;--sideon:#e8edff;--bar:#cbd5fb;--hero:#14171f;--shadow:none}
+@media(prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#0c0e13;--surface:#151922;--ink:#e9ecf3;--muted:#8d96a8;--line:#232937;--line2:#303848;--field:#0f1219;--accent:#4a69ee;--accent2:#3b57d4;--accent-soft:#1c2650;--link:#8fa6ff;--paid:#3fd08f;--pend:#f2b84b;--fail:#ff7d6e;--errbg:#3a1f1f;--grey:#222836;--greyink:#dfe4ef;--side:#10131a;--sidetxt:#9aa3b5;--sideon:#1c2650;--bar:#26335f;--hero:#1b2030;--shadow:none}}
+:root[data-theme=dark]{--bg:#0c0e13;--surface:#151922;--ink:#e9ecf3;--muted:#8d96a8;--line:#232937;--line2:#303848;--field:#0f1219;--accent:#4a69ee;--accent2:#3b57d4;--accent-soft:#1c2650;--link:#8fa6ff;--paid:#3fd08f;--pend:#f2b84b;--fail:#ff7d6e;--errbg:#3a1f1f;--grey:#222836;--greyink:#dfe4ef;--side:#10131a;--sidetxt:#9aa3b5;--sideon:#1c2650;--bar:#26335f;--hero:#1b2030;--shadow:none}
 *{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
-body{margin:0;font-family:Manrope,ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:var(--bg);color:var(--ink);line-height:1.55;font-size:15px}
+body{margin:0;font-family:'Schibsted Grotesk',ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:var(--bg);color:var(--ink);line-height:1.55;font-size:15px}
 a{color:var(--link);text-decoration:none}a:hover{text-decoration:underline}
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 h2{font-size:26px;letter-spacing:-.02em;font-weight:800;margin:0 0 18px;line-height:1.2}
@@ -214,6 +214,45 @@ th[data-dir=asc]::after{content:' \\2191'}th[data-dir=desc]::after{content:' \\2
 .tr-widget .tr-body{display:none;margin-top:8px;background:var(--surface);border:1px solid var(--line2);padding:8px 10px;border-radius:12px}
 .tr-widget.open .tr-body{display:block}
 @media(max-width:900px){button,input,select,textarea{min-height:44px}.sm,.chip,.btnlink{min-height:40px}.tr-widget{bottom:76px}}
+
+/* ui v3: redesign (Impeccable direction: flat, bordered, cobalt on cool grey, ink hero) */
+h2{font-size:28px;font-weight:700;letter-spacing:-.03em}
+h3{font-weight:650}
+.side{background:var(--side);border-right:1px solid var(--line);padding:20px 12px 16px}
+.brand{color:var(--ink);font-weight:700;font-size:17px;letter-spacing:-.02em}
+.mark{border-radius:8px;background:var(--hero);color:#fff}
+.grp{color:var(--muted);font-size:12px;font-weight:600;margin:18px 10px 6px}
+.side a.nl,.themebtn{color:var(--sidetxt);border-radius:8px}
+.side a.nl:hover,.themebtn:hover{background:var(--grey);color:var(--ink);text-decoration:none}
+.side a.nl.on{background:var(--sideon);color:var(--accent);box-shadow:none}
+.side .badge{background:var(--accent);color:#fff}
+.badge{background:var(--accent);color:#fff}
+.card{border-radius:12px;box-shadow:none;padding:22px}
+.stat{border-radius:10px;box-shadow:none}
+.stat.lead,.lead2{background:var(--hero);border-color:var(--hero);border-radius:14px}
+.lead2 .big{font-size:48px;font-weight:700;letter-spacing:-.035em}
+.lead2 small,.stat.lead small{color:#a4adbf}
+.lead2 .big.profit{color:#5ee0a1}
+.seg{border-radius:9px}.seg a.on,.tabs a.on{background:var(--hero);border-color:var(--hero);color:#fff}
+.topbar{background:var(--surface);color:var(--ink);border-bottom:1px solid var(--line)}
+.topbar button{border-color:var(--line2);color:var(--ink)}
+body.bare{background:var(--hero)}
+body.bare .card{border-color:transparent;border-radius:16px}
+.login h2{font-size:26px}
+.login .mark{width:46px;height:46px;border-radius:12px}
+.msg{border:1px solid var(--line2);border-left-width:1px;border-radius:10px;background:var(--accent-soft)}
+.msg.err,.err{border-color:var(--fail);background:var(--errbg)}
+.msg b{font-weight:700}
+th{font-size:12.5px;color:var(--muted);border-bottom:1px solid var(--line2);padding-top:9px;padding-bottom:9px}
+td{padding-top:13px;padding-bottom:13px}
+tr:hover td{background:var(--bg)}
+input,textarea,select,button{border-radius:8px}
+input:focus,textarea:focus,select:focus{box-shadow:0 0 0 3px var(--accent-soft)}
+button{font-weight:650}
+.todo a{border-radius:10px;box-shadow:none}
+.chart .bar,.chart .bar i{border-radius:3px 3px 0 0}
+code{border-radius:5px}
+@media(max-width:900px){.card{padding:16px}.lead2 .big{font-size:36px}h2{font-size:24px}}
 @media(prefers-reduced-motion:reduce){*{transition:none!important}}
 </style></head><body class="{{ 'app' if session.get('ok') else 'bare' }}">
 {% macro ico(n) %}<svg viewBox="0 0 24 24" aria-hidden="true">{% if n=='home' %}<path d="M3 11l9-8 9 8"/><path d="M5 10v10h14V10"/>{% elif n=='box' %}<path d="M21 8l-9-5-9 5 9 5 9-5z"/><path d="M3 8v8l9 5 9-5V8"/><path d="M12 13v8"/>{% elif n=='list' %}<path d="M8 6h13M8 12h13M8 18h13"/><path d="M3 6h.01M3 12h.01M3 18h.01"/>{% elif n=='clock' %}<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>{% elif n=='card' %}<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18"/>{% elif n=='qr' %}<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3zM20 14v.01M20 20v.01M17 20h-3"/>{% elif n=='users' %}<circle cx="9" cy="8" r="4"/><path d="M2 21c0-4 3-7 7-7s7 3 7 7"/><path d="M17 4a4 4 0 010 8M22 21c0-3-2-5.5-5-6.5"/>{% elif n=='help' %}<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3.5"/><path d="M5.6 5.6l3.9 3.9M14.5 14.5l3.9 3.9M18.4 5.6l-3.9 3.9M9.5 14.5l-3.9 3.9"/>{% elif n=='tag' %}<path d="M3 12V3h9l9 9-9 9-9-9z"/><circle cx="7.5" cy="7.5" r="1.2"/>{% elif n=='key' %}<circle cx="8" cy="15" r="4"/><path d="M11 12l9-9M16 7l3 3"/>{% elif n=='shield' %}<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/>{% elif n=='sliders' %}<path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/>{% elif n=='out' %}<path d="M9 21H5V3h4"/><path d="M16 17l5-5-5-5M21 12H9"/>{% elif n=='link' %}<path d="M10 14a5 5 0 007 0l3-3a5 5 0 00-7-7l-1 1"/><path d="M14 10a5 5 0 00-7 0l-3 3a5 5 0 007 7l1-1"/>{% elif n=='menu' %}<path d="M4 6h16M4 12h16M4 18h16"/>{% endif %}</svg>{% endmacro %}
