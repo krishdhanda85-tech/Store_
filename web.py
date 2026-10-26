@@ -49,7 +49,7 @@ TEMPLATES = {
 <meta name="theme-color" content="#14170f">
 <title>{{ shop }} Admin</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;600;700;800&family=Instrument+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <script>try{var t=localStorage.getItem("theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
 <style>
 :root{--bg:#f2eee6;--surface:#fffdf8;--ink:#1b1a16;--muted:#6d6a5f;--line:#e4dfd2;--line2:#d2ccbb;--field:#fffdf8;--accent:#0d6b57;--accent2:#095544;--accent-soft:#e1efe8;--link:#0d6b57;--paid:#0d7a56;--pend:#a45f00;--fail:#c2361f;--errbg:#fbe9e4;--grey:#ebe6d9;--greyink:#2b2a24;--side:#14170f;--sidetxt:#a9ad9b;--sideon:#232818;--bar:#cfe3d9;--hero:#14170f;--lime:#d4f54a;--shadow:0 1px 0 #00000008,0 8px 24px -16px #3a35201f}
@@ -105,8 +105,6 @@ input::placeholder,textarea::placeholder{color:var(--muted);opacity:.75}
 label{display:block;color:var(--muted);font-size:13px;font-weight:600;margin-top:12px}
 button{background:var(--ink);border-color:var(--ink);color:var(--surface);font-weight:650;cursor:pointer;transition:transform .12s,background .15s}
 button:hover{background:var(--accent);border-color:var(--accent);color:#fff}
-:root[data-theme=dark] button:hover{color:#14170f}
-@media(prefers-color-scheme:dark){:root:not([data-theme=light]) button:hover{color:#14170f}}
 button:active{transform:scale(.98)}
 .red{background:var(--fail);border-color:var(--fail);color:#fff}.red:hover{background:var(--fail);border-color:var(--fail);filter:brightness(.9);color:#fff}
 .green{background:#13805a;border-color:#13805a;color:#fff}.green:hover{background:#0e6a4a;border-color:#0e6a4a;color:#fff}
@@ -198,6 +196,33 @@ h2{font-size:26px}
 button,input,select,textarea{min-height:44px}.sm,.chip,.btnlink{min-height:40px}.tr-widget{bottom:76px}
 }
 @media(prefers-reduced-motion:reduce){*{transition:none!important}}
+
+/* theme v2: light dashboard like the reference */
+:root{--bg:#eef0f8;--surface:#fff;--ink:#1f2440;--muted:#7a809b;--line:#e8eaf3;--line2:#d9dcea;--field:#fff;--accent:#5b6cf0;--accent2:#4a5ae0;--accent-soft:#eceefe;--link:#4a5ae0;--grey:#eef0f8;--greyink:#2b3050;--side:#fff;--sidetxt:#5d6482;--sideon:#f3f4fb;--bar:#c9cffa;--hero:#1f2440;--shadow:0 2px 14px #5b6cf014}
+@media(prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#11132a;--surface:#1a1d3a;--ink:#eceefb;--muted:#8d93b5;--line:#2a2e52;--line2:#363b66;--field:#14172f;--accent:#7a88ff;--accent2:#6676f0;--accent-soft:#262b57;--link:#9aa5ff;--grey:#252950;--greyink:#e4e7fb;--side:#161933;--sidetxt:#9ba1c4;--sideon:#22264a;--bar:#343a78;--hero:#1a1d3a;--shadow:none}}
+:root[data-theme=dark]{--bg:#11132a;--surface:#1a1d3a;--ink:#eceefb;--muted:#8d93b5;--line:#2a2e52;--line2:#363b66;--field:#14172f;--accent:#7a88ff;--accent2:#6676f0;--accent-soft:#262b57;--link:#9aa5ff;--grey:#252950;--greyink:#e4e7fb;--side:#161933;--sidetxt:#9ba1c4;--sideon:#22264a;--bar:#343a78;--hero:#1a1d3a;--shadow:none}
+body,h2,h3,.brand,.big,.stat span,.mark,.topbar{font-family:'Plus Jakarta Sans',ui-sans-serif,system-ui,sans-serif}
+.card,.stat{border:0;border-radius:14px}
+.side{border-right:1px solid var(--line)}
+.brand{color:var(--ink)}
+.mark{background:linear-gradient(135deg,#f0457a,#e8305f);color:#fff}
+.grp{color:var(--muted)}
+.side a.nl:hover,.themebtn:hover{background:var(--sideon);color:var(--ink)}
+.side a.nl.on{background:linear-gradient(90deg,#e8305f,#f0457a);color:#fff;box-shadow:0 6px 14px -6px #e8305f99}
+.side .out{border-top:1px solid var(--line)}
+.kbd{border-color:var(--line2)}
+.side a.nl.on .badge{background:#fff;color:#e8305f}
+button{background:var(--accent);border-color:var(--accent);color:#fff}
+button:hover{background:var(--accent2);border-color:var(--accent2);color:#fff}
+.themebtn{background:transparent;color:var(--sidetxt)}.themebtn:hover{background:var(--sideon);color:var(--ink)}
+.seg a.on,.tabs a.on,.chip.on{background:var(--accent);border-color:var(--accent);color:#fff}
+.chip:hover{border-color:var(--accent);color:var(--accent)}
+.badge{background:#e8305f;color:#fff}
+.topbar{background:var(--side);color:var(--ink);border-bottom:1px solid var(--line)}
+.topbar button{color:var(--ink);border-color:var(--line2)}
+body.bare{background:linear-gradient(135deg,#5b6cf0,#8a63f0)}
+th{text-transform:none;letter-spacing:0;font-size:12.5px}
+tr:hover td{background:var(--bg)}
 </style></head><body class="{{ 'app' if session.get('ok') else 'bare' }}">
 {% macro ico(n) %}<svg viewBox="0 0 24 24" aria-hidden="true">{% if n=='home' %}<path d="M3 11l9-8 9 8"/><path d="M5 10v10h14V10"/>{% elif n=='box' %}<path d="M21 8l-9-5-9 5 9 5 9-5z"/><path d="M3 8v8l9 5 9-5V8"/><path d="M12 13v8"/>{% elif n=='list' %}<path d="M8 6h13M8 12h13M8 18h13"/><path d="M3 6h.01M3 12h.01M3 18h.01"/>{% elif n=='clock' %}<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>{% elif n=='card' %}<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18"/>{% elif n=='qr' %}<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3zM20 14v.01M20 20v.01M17 20h-3"/>{% elif n=='users' %}<circle cx="9" cy="8" r="4"/><path d="M2 21c0-4 3-7 7-7s7 3 7 7"/><path d="M17 4a4 4 0 010 8M22 21c0-3-2-5.5-5-6.5"/>{% elif n=='help' %}<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3.5"/><path d="M5.6 5.6l3.9 3.9M14.5 14.5l3.9 3.9M18.4 5.6l-3.9 3.9M9.5 14.5l-3.9 3.9"/>{% elif n=='tag' %}<path d="M3 12V3h9l9 9-9 9-9-9z"/><circle cx="7.5" cy="7.5" r="1.2"/>{% elif n=='key' %}<circle cx="8" cy="15" r="4"/><path d="M11 12l9-9M16 7l3 3"/>{% elif n=='shield' %}<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/>{% elif n=='sliders' %}<path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/>{% elif n=='out' %}<path d="M9 21H5V3h4"/><path d="M16 17l5-5-5-5M21 12H9"/>{% elif n=='link' %}<path d="M10 14a5 5 0 007 0l3-3a5 5 0 00-7-7l-1 1"/><path d="M14 10a5 5 0 00-7 0l-3 3a5 5 0 007 7l1-1"/>{% elif n=='menu' %}<path d="M4 6h16M4 12h16M4 18h16"/>{% endif %}</svg>{% endmacro %}
 {% macro nl(ep, label, icon, count=0, alt='') %}<a class="nl {{ 'on' if request.endpoint == ep or request.endpoint == alt }}" href="{{ url_for(ep) }}">{{ ico(icon) }}<span>{{ label }}</span>{% if count %}<span class="badge">{{ count }}</span>{% endif %}</a>{% endmacro %}
@@ -299,61 +324,84 @@ d.addEventListener('keydown',function(e){
 </form>
 {% if signup != 'closed' %}<p class="muted" style="margin:14px 0 0"><a href="{{ url_for('register_seller') }}">Want your own shop? Create a seller account</a></p>{% endif %}</div>{% endblock %}""",
     "dashboard.html": """{% extends 'base.html' %}{% block body %}
-<div class="page-head"><h2>Dashboard</h2>
-<div class="seg">{% for k, lbl in ranges %}<a href="{{ url_for('dashboard', range=k) }}" class="{{ 'on' if k == rng }}">{{ lbl }}</a>{% endfor %}</div></div>
 <style>
 .todo{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 16px}
-.todo a{display:flex;align-items:center;gap:8px;padding:9px 14px;border-radius:12px;background:var(--surface);border:1px solid var(--line);color:var(--ink);font-weight:700;font-size:14px;text-decoration:none;box-shadow:var(--shadow)}
+.todo a{display:flex;align-items:center;gap:8px;padding:9px 14px;border-radius:10px;background:var(--surface);border:1px solid var(--line);color:var(--ink);font-weight:700;font-size:14px;text-decoration:none;box-shadow:var(--shadow)}
 .todo a b{min-width:24px;text-align:center;border-radius:99px;padding:1px 8px;background:var(--errbg);color:var(--fail)}
-.todo a.warn b{background:#f0b84a33;color:var(--pend)}
 .todo .ok{color:var(--paid);font-weight:700;padding:9px 2px}
+.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:16px}
+.kpi{background:var(--surface);border-radius:14px;padding:18px 20px;box-shadow:var(--shadow);display:flex;gap:14px;align-items:center}
+.kpi i{width:46px;height:46px;border-radius:12px;display:grid;place-items:center;color:#fff;font-style:normal;font-weight:800;font-size:19px;flex:none}
+.kpi small{display:block;color:var(--muted);font-weight:600;font-size:13px}
+.kpi b{display:block;font-size:26px;font-weight:800;letter-spacing:-.02em;line-height:1.2;font-variant-numeric:tabular-nums}
+.kpi em{font-style:normal;font-size:12px;color:var(--muted)}
+.g2{display:grid;grid-template-columns:2fr 1fr;gap:16px}
+.g2e{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.g2 .card,.g2e .card{margin-bottom:16px}
+.area{width:100%;height:210px;display:block;margin-top:8px}
+.donutw{display:flex;align-items:center;gap:22px;flex-wrap:wrap;justify-content:center}
+.donut{width:150px;height:150px;border-radius:50%;position:relative;flex:none}
+.donut::after{content:'';position:absolute;inset:30px;background:var(--surface);border-radius:50%}
+.donut span{position:absolute;inset:0;display:grid;place-items:center;text-align:center;z-index:1;font-weight:800;font-size:22px;line-height:1.1}
+.donut span small{display:block;font-size:11px;font-weight:600;color:var(--muted)}
+.leg{flex:1;min-width:150px;display:grid;gap:9px;font-size:13.5px}
+.leg div{display:flex;align-items:center;gap:8px}.leg i{width:10px;height:10px;border-radius:3px;flex:none}.leg b{margin-left:auto}
+.leg span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cbars{display:flex;align-items:flex-end;gap:4px;height:190px;margin-top:14px}
+.cbars div{flex:1;height:100%;display:flex;align-items:flex-end}
+.cbars i{display:block;width:100%;min-height:3px;border-radius:4px 4px 0 0;background:linear-gradient(180deg,#f0457a,#f78fb0)}
+.hb{display:grid;gap:14px;margin-top:10px}
+.hb div small{display:flex;justify-content:space-between;font-weight:600;font-size:13.5px;margin-bottom:5px;gap:10px}
+.hb div small span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hb div p{height:9px;border-radius:9px;background:var(--grey);margin:0;overflow:hidden}
+.hb div p i{display:block;height:100%;border-radius:9px}
+.sub2{display:flex;gap:22px;flex-wrap:wrap;margin-top:12px;font-size:13px;color:var(--muted)}.sub2 b{color:var(--ink);font-size:16px;display:block}
+@media(max-width:900px){.kpis{grid-template-columns:1fr 1fr}.g2,.g2e{grid-template-columns:1fr}.kpi{padding:14px}.kpi b{font-size:21px}.kpi i{width:38px;height:38px}}
 </style>
+<div class="page-head"><h2>Dashboard</h2>
+<div class="seg">{% for k, lbl in ranges %}<a href="{{ url_for('dashboard', range=k) }}" class="{{ 'on' if k == rng }}">{{ lbl }}</a>{% endfor %}</div></div>
 {% set low_n = d.low|length %}
 <div class="todo">
 {% if pending_count %}<a href="{{ url_for('manual') }}"><b>{{ pending_count }}</b>Orders to deliver</a>{% endif %}
 {% if upi_pending %}<a href="{{ url_for('upipay') }}"><b>{{ upi_pending }}</b>UPI payments to check</a>{% endif %}
 {% if open_tickets %}<a href="{{ url_for('tickets') }}"><b>{{ open_tickets }}</b>Open support tickets</a>{% endif %}
-{% if low_n %}<a class="warn" href="{{ url_for('products') }}"><b>{{ low_n }}</b>Products low on stock</a>{% endif %}
+{% if low_n %}<a href="{{ url_for('products') }}"><b>{{ low_n }}</b>Products low on stock</a>{% endif %}
 {% if not (pending_count or upi_pending or open_tickets or low_n) %}<span class="ok">Nothing needs your attention right now.</span>{% endif %}
 </div>
-{% if d.nocost %}<div class="msg">{{ d.nocost }} sale{{ '' if d.nocost == 1 else 's' }} in this period {{ 'has' if d.nocost == 1 else 'have' }} no cost price, so the full sale amount is counted as profit (this is why profit looks too high). <a href="{{ url_for('products') }}">Set the cost price</a> on the product and the real profit shows up, old sales included.</div>{% endif %}
-<div class="lead2">
-<div><small>Revenue (USDT)</small><div class="big">{{ '%.2f'|format(d.rev) }}</div><div class="sub">{{ d.n }} paid order{{ '' if d.n == 1 else 's' }}, {{ d.units }} item{{ '' if d.units == 1 else 's' }} sold</div></div>
-<div><small>Profit (USDT)</small><div class="big {{ 'profit' if d.profit >= 0 else 'loss' }}">{{ '%.2f'|format(d.profit) }}</div><div class="sub">{{ '%.1f'|format(d.margin) }}% margin{% if d.net is not none %}, {{ '%.2f'|format(d.net) }} after referral payouts{% endif %}</div></div>
-<div class="mini">
-<div><span>Cost of goods</span><b>{{ '%.2f'|format(d.cost) }}</b></div>
-<div><span>Bot sales</span><b>{{ '%.2f'|format(d.bot.rev) }}</b></div>
-<div><span>Reseller API sales</span><b>{{ '%.2f'|format(d.api.rev) }}</b></div>
-</div></div>
-<div class="stats">
-<div class="stat"><small>Paid orders</small><span>{{ d.n }}</span></div>
-<div class="stat"><small>Items sold</small><span>{{ d.units }}</span></div>
-<div class="stat"><small>To deliver</small><span class="processing">{{ d.processing }}</span></div>
-<div class="stat"><small>Waiting for payment</small><span class="pending">{{ d.pending }}</span></div>
-<div class="stat"><small>Failed</small><span class="failed">{{ d.failed }}</span></div>
-<div class="stat"><small>Customers</small><span>{{ d.users }}</span></div>
-<div class="stat"><small>New customers</small><span>{{ d.new_users }}</span></div>
-<div class="stat"><small>Wallet balances held</small><span>{{ '%.2f'|format(d.wallets) }}</span></div>
-<div class="stat"><small>Deposits received</small><span>{{ '%.2f'|format(d.dep_amt) }}</span></div>
-<div class="stat"><small>Referral paid (all time)</small><span>{{ '%.2f'|format(d.ref) }}</span></div>
+{% if d.nocost %}<div class="msg">{{ d.nocost }} sale{{ '' if d.nocost == 1 else 's' }} in this period {{ 'has' if d.nocost == 1 else 'have' }} no cost price, so profit looks too high. <a href="{{ url_for('products') }}">Set the cost price</a> on the product.</div>{% endif %}
+<div class="kpis">
+<div class="kpi"><i style="background:linear-gradient(135deg,#5b6cf0,#8a63f0)">$</i><div><small>Revenue (USDT)</small><b>{{ '%.2f'|format(d.rev) }}</b><em>{{ d.n }} paid orders</em></div></div>
+<div class="kpi"><i style="background:linear-gradient(135deg,#2fc9b0,#2aa6d8)">&#8599;</i><div><small>Profit (USDT)</small><b class="{{ 'paid' if d.profit >= 0 else 'failed' }}">{{ '%.2f'|format(d.profit) }}</b><em>{{ '%.1f'|format(d.margin) }}% margin</em></div></div>
+<div class="kpi"><i style="background:linear-gradient(135deg,#f0457a,#f7798f)">#</i><div><small>Products bought</small><b>{{ d.units }}</b><em>{{ d.processing }} to deliver</em></div></div>
+<div class="kpi"><i style="background:linear-gradient(135deg,#f7a928,#f7d04a)">&#9786;</i><div><small>Customers</small><b>{{ d.users }}</b><em>+{{ d.new_users }} new in this period</em></div></div>
 </div>
-<div class="card"><div class="page-head" style="margin-bottom:0"><h3 style="margin:0">Daily sales, last {{ d.days|length }} days</h3>
-<span class="muted"><i class="dot rev"></i>Revenue <i class="dot prof"></i>Profit</span></div>
-<div class="chart">{% for x in d.days %}<div class="col" title="{{ x.label }}: revenue ${{ '%.2f'|format(x.rev) }}, profit ${{ '%.2f'|format(x.profit) }}"><div class="bar" style="height:{{ x.h }}%"><i style="height:{{ x.ph }}%"></i></div></div>{% endfor %}</div>
-<div class="xl"><span>{{ d.days[0].label }}</span><span>{{ d.days[-1].label }}</span></div></div>
-<div class="cols">
+<div class="g2">
+<div class="card"><div class="page-head" style="margin-bottom:0"><h3 style="margin:0">Revenue &amp; profit, last {{ d.days|length }} days</h3><span class="muted"><i class="dot" style="background:#5b6cf0"></i>Revenue <i class="dot" style="background:#2fc9b0"></i>Profit</span></div>
+<svg class="area" viewBox="0 0 600 190" preserveAspectRatio="none"><defs><linearGradient id="ag" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#5b6cf0" stop-opacity=".35"/><stop offset="1" stop-color="#5b6cf0" stop-opacity="0"/></linearGradient></defs>
+<path d="{{ d.rev_area }}" fill="url(#ag)"/><path d="{{ d.rev_line }}" fill="none" stroke="#5b6cf0" stroke-width="2.5" vector-effect="non-scaling-stroke" stroke-linejoin="round"/><path d="{{ d.prof_line }}" fill="none" stroke="#2fc9b0" stroke-width="2.5" vector-effect="non-scaling-stroke" stroke-linejoin="round"/></svg>
+<div class="xl"><span>{{ d.days[0].label }}</span><span>{{ d.days[-1].label }}</span></div>
+<div class="sub2"><div><b>{{ '%.2f'|format(d.bot.rev) }}</b>Bot sales</div><div><b>{{ '%.2f'|format(d.api.rev) }}</b>Reseller API</div><div><b>{{ '%.2f'|format(d.cost) }}</b>Cost of goods</div><div><b>{{ '%.2f'|format(d.dep_amt) }}</b>Deposits</div></div></div>
+<div class="card"><h3>Products bought</h3>
+<div class="donutw"><div class="donut" style="background:conic-gradient({{ d.prod_grad }})"><span><div>{{ d.units }}<small>items</small></div></span></div>
+<div class="leg">{% for x in d.prod %}<div><i style="background:{{ x.color }}"></i><span>{{ x.name }}</span><b>{{ x.pct }}%</b></div>{% else %}<span class="muted">No sales yet.</span>{% endfor %}</div></div></div>
+</div>
+<div class="g2e">
+<div class="card"><div class="page-head" style="margin-bottom:0"><h3 style="margin:0">New customers per day</h3><span class="muted">{{ d.cust_total }} joined &middot; {{ d.users }} total</span></div>
+<div class="cbars">{% for x in d.cust_days %}<div title="{{ x.label }}: {{ x.n }} new customer{{ '' if x.n == 1 else 's' }}"><i style="height:{{ x.h }}%"></i></div>{% endfor %}</div>
+<div class="xl"><span>{{ d.cust_days[0].label }}</span><span>{{ d.cust_days[-1].label }}</span></div></div>
+<div class="card"><h3>Which product sold how many</h3>
+<div class="hb">{% for x in d.prod %}<div><small><span>{{ x.name }}</span><span>{{ x.units }} sold</span></small><p><i style="width:{{ (x.units / d.prod_max * 100)|round(1) }}%;background:{{ x.color }}"></i></p></div>{% else %}<span class="muted">No sales in this period yet.</span>{% endfor %}</div></div>
+</div>
+<div class="g2e">
 <div class="card"><h3>Best sellers</h3><div class="scroll"><table>
 <tr><th>Product</th><th>Sold</th><th>Revenue</th><th>Profit</th></tr>
 {% for t in d.top %}<tr><td>{{ t.name }}</td><td>{{ t.units }}</td><td>{{ '%.2f'|format(t.rev) }}</td><td><span class="{{ 'paid' if t.profit >= 0 else 'failed' }}">{{ '%.2f'|format(t.profit) }}</span></td></tr>
 {% else %}<tr><td colspan="4">No sales in this period yet.</td></tr>{% endfor %}
 </table></div></div>
-<div class="card"><h3>Where sales come from</h3><div class="scroll"><table>
-<tr><th>Source</th><th>Orders</th><th>Revenue</th><th>Cost</th><th>Profit</th></tr>
-{% for name, r in [('Telegram bot', d.bot), ('Reseller API', d.api)] %}<tr><td>{{ name }}</td><td>{{ r.n }}</td><td>{{ '%.2f'|format(r.rev) }}</td><td>{{ '%.2f'|format(r.cost) }}</td><td><span class="{{ 'paid' if r.profit >= 0 else 'failed' }}">{{ '%.2f'|format(r.profit) }}</span></td></tr>{% endfor %}
-</table></div>
-{% if d.low %}<h3 style="margin-top:18px">Running low on stock</h3><div class="scroll"><table>
-{% for p in d.low %}<tr><td>{{ p.name }}</td><td class="{{ 'failed' if p.stock == 0 else 'pending' }}">{{ 'Out of stock' if p.stock == 0 else (p.stock ~ ' left') }}</td></tr>{% endfor %}
-</table></div><p class="muted" style="margin:10px 0 0"><a href="{{ url_for('products') }}">Add stock</a></p>{% endif %}</div>
+<div class="card"><h3>Running low on stock</h3><div class="scroll"><table>
+{% for p in d.low %}<tr><td>{{ p.name }}</td><td class="{{ 'failed' if p.stock == 0 else 'pending' }}">{{ 'Out of stock' if p.stock == 0 else (p.stock ~ ' left') }}</td></tr>
+{% else %}<tr><td class="muted">All products have enough stock.</td></tr>{% endfor %}
+</table></div><p class="muted" style="margin:10px 0 0"><a href="{{ url_for('products') }}">Add stock</a></p></div>
 </div>
 <div class="card"><h3>Latest orders</h3>
 {% include 'orders_table.html' %}</div>{% endblock %}""",
@@ -1182,11 +1230,37 @@ def dashboard_data(rng):
         nu = "SELECT COUNT(*) n FROM users" + (" WHERE created_at >= ?" if since else "")
         d["new_users"] = c.execute(nu, a).fetchone()["n"]
 
+        cu = {r["d"]: r["n"] for r in c.execute(
+            "SELECT substr(created_at,1,10) d, COUNT(*) n FROM users WHERE created_at >= ? GROUP BY d", (start.isoformat(),))}
+        mxc = max(list(cu.values()) + [1])
+        d["cust_days"] = [dict(label=x["label"], n=cu.get((start + timedelta(days=i)).strftime("%Y-%m-%d"), 0)) for i, x in enumerate(days)]
+        for x in d["cust_days"]:
+            x["h"] = round(x["n"] / mxc * 100, 1)
+        d["cust_total"] = sum(x["n"] for x in d["cust_days"])
+        cols = ["#5b6cf0", "#f0457a", "#2fc9b0", "#f7a928", "#8a63f0", "#3aa0f0"]
+        pr_ = [dict(r) for r in c.execute(_SALES + "SELECT COALESCE(MAX(pname), 'Deleted product') name, COALESCE(SUM(q),0) units FROM x" + w + " GROUP BY product_id ORDER BY units DESC LIMIT 6", a)]
+        tot = sum(x["units"] for x in pr_) or 1
+        acc, parts = 0.0, []
+        for i, x in enumerate(pr_):
+            x["color"] = cols[i]; x["pct"] = round(x["units"] / tot * 100, 1)
+            parts.append("%s %s%% %s%%" % (cols[i], round(acc, 2), round(acc + x["pct"], 2))); acc += x["pct"]
+        d["prod"] = pr_
+        d["prod_max"] = max([x["units"] for x in pr_] + [1])
+        d["prod_grad"] = ", ".join(parts) if parts else "var(--line) 0% 100%"
+
         dep = ("SELECT COALESCE(SUM(amount),0) amt FROM deposits WHERE status='paid' AND COALESCE(method,'') != 'admin'"
                + (" AND COALESCE(paid_at, created_at) >= ?" if since else ""))
         d["dep_amt"] = c.execute(dep, a).fetchone()["amt"]
     finally:
         c.close()
+    W, H = 600, 190
+    def _pts(vals, mx):
+        n = max(len(vals) - 1, 1)
+        return " L".join("%s,%s" % (round(i * W / n, 1), round(H - 10 - max(v, 0) / mx * (H - 30), 1)) for i, v in enumerate(vals))
+    mxr = max([x["rev"] for x in d["days"]] + [0.01])
+    d["rev_line"] = "M" + _pts([x["rev"] for x in d["days"]], mxr)
+    d["rev_area"] = d["rev_line"] + " L%s,%s L0,%s Z" % (W, H, H)
+    d["prof_line"] = "M" + _pts([x["profit"] for x in d["days"]], mxr)
     d["net"] = (d["profit"] - d["ref"]) if rng == "all" else None
     d["low"] = [dict(name=p["name"], stock=int(p["stock"] or 0)) for p in db.list_products()
                 if p["kind"] != "manual" and int(p["stock"] or 0) <= 3][:8]
