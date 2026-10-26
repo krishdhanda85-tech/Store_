@@ -4,11 +4,13 @@ import os
 import hmac
 import hashlib
 import time
+import csv
+import io
 from datetime import datetime, timedelta, timezone
 
 import requests
 
-from flask import Flask, request, session, redirect, url_for, render_template, render_template_string, flash
+from flask import Flask, request, session, redirect, url_for, render_template, render_template_string, flash, Response
 from jinja2 import DictLoader
 
 import provider
@@ -179,6 +181,39 @@ h2{font-size:22px}
 .stats .stat:last-child:nth-child(odd){grid-column:1/-1}
 .two{grid-template-columns:1fr}
 }
+
+/* ui v2: filters, chips, toasts, palette, touch targets */
+.tools{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:0 0 12px}
+.tools input.tf{margin:0;max-width:280px;padding:8px 12px 8px 34px;background:var(--field) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23889' stroke-width='2' stroke-linecap='round'%3E%3Ccircle cx='11' cy='11' r='7'/%3E%3Cpath d='M20 20l-4-4'/%3E%3C/svg%3E") no-repeat 11px 50%}
+.chips{display:inline-flex;gap:6px;flex-wrap:wrap}
+.chip{width:auto;margin:0;padding:6px 12px;border-radius:99px;font-size:13px;font-weight:700;background:var(--surface);color:var(--muted);border:1px solid var(--line2)}
+.chip:hover{background:var(--surface);border-color:var(--accent);color:var(--ink)}
+.chip.on{background:var(--accent);border-color:var(--accent);color:#fff}
+.btnlink{display:inline-flex;align-items:center;gap:6px;padding:8px 14px;border-radius:9px;background:var(--grey);color:var(--greyink);font-weight:700;font-size:13px;text-decoration:none}
+.btnlink:hover{background:var(--line2);text-decoration:none}
+.count{margin-left:auto;font-size:13px;color:var(--muted)}
+th[data-sort]{cursor:pointer;user-select:none}
+th[data-sort]:hover{color:var(--ink)}
+th[data-dir=asc]::after{content:' \\2191'}th[data-dir=desc]::after{content:' \\2193'}
+.scroll table thead th,.scroll table tr:first-child th{position:sticky;top:0;background:var(--surface);z-index:1}
+.empty{padding:28px 10px;text-align:center;color:var(--muted)}
+.msg.toast{transition:opacity .4s,transform .4s}
+.msg.toast.gone{opacity:0;transform:translateY(-6px)}
+.copyable{cursor:copy}.copyable.copied{outline:2px solid var(--paid)}
+.themebtn{display:flex;align-items:center;gap:11px;width:100%;margin:6px 0 0;padding:9px 10px;border:0;border-radius:9px;background:transparent;color:var(--sidetxt);font-weight:600;font-size:14px;text-align:left}
+.themebtn:hover{background:var(--sideon);color:#fff}
+.kbd{font-size:11px;border:1px solid var(--line2);border-radius:5px;padding:0 5px;color:var(--muted)}
+#pal{position:fixed;inset:0;background:#0009;z-index:10000;display:none;align-items:flex-start;justify-content:center;padding:12vh 14px 0}
+#pal.open{display:flex}
+#pal .box{width:100%;max-width:480px;background:var(--surface);border:1px solid var(--line2);border-radius:14px;padding:10px;box-shadow:0 20px 60px #0006}
+#pal input{margin:0 0 6px}
+#pal a{display:block;padding:10px 12px;border-radius:8px;color:var(--ink);font-weight:600;text-decoration:none}
+#pal a.sel,#pal a:hover{background:var(--accent-soft);text-decoration:none}
+.tr-widget{position:fixed;left:14px;bottom:14px;z-index:900}
+.tr-widget>button{width:auto;margin:0;padding:8px 12px;border-radius:99px;font-size:13px;background:var(--surface);color:var(--ink);border:1px solid var(--line2);box-shadow:var(--shadow)}
+.tr-widget .tr-body{display:none;margin-top:8px;background:var(--surface);border:1px solid var(--line2);padding:8px 10px;border-radius:12px}
+.tr-widget.open .tr-body{display:block}
+@media(max-width:900px){button,input,select,textarea{min-height:44px}.sm,.chip,.btnlink{min-height:40px}.tr-widget{bottom:76px}}
 @media(prefers-reduced-motion:reduce){*{transition:none!important}}
 </style></head><body class="{{ 'app' if session.get('ok') else 'bare' }}">
 {% macro ico(n) %}<svg viewBox="0 0 24 24" aria-hidden="true">{% if n=='home' %}<path d="M3 11l9-8 9 8"/><path d="M5 10v10h14V10"/>{% elif n=='box' %}<path d="M21 8l-9-5-9 5 9 5 9-5z"/><path d="M3 8v8l9 5 9-5V8"/><path d="M12 13v8"/>{% elif n=='list' %}<path d="M8 6h13M8 12h13M8 18h13"/><path d="M3 6h.01M3 12h.01M3 18h.01"/>{% elif n=='clock' %}<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>{% elif n=='card' %}<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18"/>{% elif n=='qr' %}<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3zM20 14v.01M20 20v.01M17 20h-3"/>{% elif n=='users' %}<circle cx="9" cy="8" r="4"/><path d="M2 21c0-4 3-7 7-7s7 3 7 7"/><path d="M17 4a4 4 0 010 8M22 21c0-3-2-5.5-5-6.5"/>{% elif n=='help' %}<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3.5"/><path d="M5.6 5.6l3.9 3.9M14.5 14.5l3.9 3.9M18.4 5.6l-3.9 3.9M9.5 14.5l-3.9 3.9"/>{% elif n=='tag' %}<path d="M3 12V3h9l9 9-9 9-9-9z"/><circle cx="7.5" cy="7.5" r="1.2"/>{% elif n=='key' %}<circle cx="8" cy="15" r="4"/><path d="M11 12l9-9M16 7l3 3"/>{% elif n=='shield' %}<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/>{% elif n=='sliders' %}<path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/>{% elif n=='out' %}<path d="M9 21H5V3h4"/><path d="M16 17l5-5-5-5M21 12H9"/>{% elif n=='link' %}<path d="M10 14a5 5 0 007 0l3-3a5 5 0 00-7-7l-1 1"/><path d="M14 10a5 5 0 00-7 0l-3 3a5 5 0 007 7l1-1"/>{% elif n=='menu' %}<path d="M4 6h16M4 12h16M4 18h16"/>{% endif %}</svg>{% endmacro %}
@@ -207,7 +242,7 @@ h2{font-size:22px}
 {{ nl('admins','Admins','shield') }}
 {{ nl('emojis','Premium emojis','tag') }}
 {{ nl('settings','Settings','sliders') }}
-<div class="out">{{ nl('logout','Log out','out') }}</div>
+<div class="out"><button type="button" class="themebtn" id="themebtn">{{ ico('sliders') }}<span>Switch theme</span></button><button type="button" class="themebtn" id="palbtn">{{ ico('list') }}<span>Quick jump</span><span class="kbd" style="margin-left:auto">Ctrl K</span></button>{{ nl('logout','Log out','out') }}</div>
 </aside>
 {% endif %}
 <div class="content"><main>
@@ -219,10 +254,53 @@ h2{font-size:22px}
 {% if session.get('ok') and shop_closed %}<div class="msg err"><b>The shop is CLOSED.</b> Customers cannot use the bot.
 <form method="post" action="{{ url_for('shop_toggle') }}" style="margin:8px 0 0"><input type="hidden" name="state" value="open"><input type="hidden" name="back" value="{{ request.path }}"><button type="submit" class="green sm">Open the shop</button></form></div>{% endif %}
 {% block body %}{% endblock %}
-</main></div><div id="google_translate_element" style="position:fixed;right:14px;bottom:14px;z-index:9999;background:var(--card,#fff);padding:7px 10px;border-radius:12px;box-shadow:0 4px 18px #0002"><span style="font-size:12px;font-weight:700">🌐 Idioma / Language</span><div id="google_translate_inner"></div></div>
+</main></div><div class="tr-widget" id="google_translate_element"><button type="button" id="trbtn" aria-expanded="false">🌐 Language</button><div class="tr-body"><div id="google_translate_inner"></div></div></div>
 <script>
 function googleTranslateElementInit(){new google.translate.TranslateElement({pageLanguage:'en',includedLanguages:'en,es',autoDisplay:false},'google_translate_inner');}
 </script><script src="https://translate.google.com/translate_a/element.js?cb=googleTranslateElementInit"></script>
+<div id="pal" role="dialog" aria-label="Quick jump"><div class="box"><input id="palin" placeholder="Jump to a page..." autocomplete="off"><div id="pallist"></div></div></div>
+<script>
+(function(){
+var d=document,$=function(q,r){return (r||d).querySelector(q)},$$=function(q,r){return Array.prototype.slice.call((r||d).querySelectorAll(q))};
+/* theme */
+var tb=$('#themebtn');if(tb)tb.addEventListener('click',function(){var cur=d.documentElement.getAttribute('data-theme');if(!cur)cur=matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light';var n=cur==='dark'?'light':'dark';d.documentElement.setAttribute('data-theme',n);try{localStorage.setItem('theme',n)}catch(e){}});
+/* translate widget toggle */
+var trb=$('#trbtn');if(trb)trb.addEventListener('click',function(){var w=$('#google_translate_element');w.classList.toggle('open');trb.setAttribute('aria-expanded',w.classList.contains('open'))});
+/* toasts */
+$$('.msg').forEach(function(m){if(m.classList.contains('err')||m.querySelector('form,a'))return;m.classList.add('toast');setTimeout(function(){m.classList.add('gone');setTimeout(function(){m.remove()},450)},5000)});
+/* copy on click */
+$$('code,.mono').forEach(function(el){el.classList.add('copyable');el.title='Click to copy';el.addEventListener('click',function(){var t=el.textContent.trim();if(navigator.clipboard)navigator.clipboard.writeText(t).then(function(){el.classList.add('copied');setTimeout(function(){el.classList.remove('copied')},700)})})});
+/* table tools: search, status chips, sort, row count */
+$$('.scroll > table').forEach(function(t){
+ var rows=$$('tr',t).filter(function(r){return !r.querySelector('th')&&r.children.length>1});
+ if(rows.length<6||t.hasAttribute('data-nofilter')||t.querySelector('input,textarea,select'))return;
+ var wrap=t.parentNode,tools=d.createElement('div');tools.className='tools';
+ var inp=d.createElement('input');inp.className='tf';inp.type='search';inp.placeholder='Filter rows (press / )';inp.setAttribute('aria-label','Filter rows');
+ var cnt=d.createElement('span');cnt.className='count';
+ tools.appendChild(inp);
+ var statuses={};rows.forEach(function(r){var c=r.querySelector('td.paid,td.pending,td.processing,td.failed,td.refunded');if(c){var k=c.className.split(' ')[0];r.setAttribute('data-st',k);statuses[k]=1}});
+ var active='';
+ var keys=Object.keys(statuses);
+ if(keys.length>1){var ch=d.createElement('span');ch.className='chips';['all'].concat(keys).forEach(function(k){var b=d.createElement('button');b.type='button';b.className='chip'+(k==='all'?' on':'');b.textContent=k==='all'?'All':k.charAt(0).toUpperCase()+k.slice(1);b.addEventListener('click',function(){active=k==='all'?'':k;$$('.chip',ch).forEach(function(x){x.classList.remove('on')});b.classList.add('on');apply()});ch.appendChild(b)});tools.appendChild(ch)}
+ tools.appendChild(cnt);wrap.parentNode.insertBefore(tools,wrap);
+ function apply(){var q=inp.value.toLowerCase().trim(),n=0;rows.forEach(function(r){var ok=(!q||r.textContent.toLowerCase().indexOf(q)>-1)&&(!active||r.getAttribute('data-st')===active);r.style.display=ok?'':'none';if(ok)n++});cnt.textContent=n+' of '+rows.length}
+ inp.addEventListener('input',apply);apply();
+ var ths=$$('th',t);ths.forEach(function(th,i){th.setAttribute('data-sort','');th.addEventListener('click',function(){var dir=th.getAttribute('data-dir')==='asc'?'desc':'asc';ths.forEach(function(x){x.removeAttribute('data-dir')});th.setAttribute('data-dir',dir);var body=rows[0].parentNode;rows.slice().sort(function(a,b){var x=(a.children[i]||{}).textContent||'',y=(b.children[i]||{}).textContent||'';var nx=parseFloat(x.replace(/[^0-9.-]/g,'')),ny=parseFloat(y.replace(/[^0-9.-]/g,''));var c=(!isNaN(nx)&&!isNaN(ny)&&/^[ @0-9.,-]*$/.test(x.trim().slice(0,1)+'0'))?nx-ny:x.localeCompare(y);return dir==='asc'?c:-c}).forEach(function(r){body.appendChild(r)})})});
+});
+/* quick jump palette */
+var pal=$('#pal'),pin=$('#palin'),pl=$('#pallist'),links=$$('.side a.nl').map(function(a){return {t:a.textContent.replace(/[0-9]+$/,'').trim(),h:a.href}});
+function draw(){var q=pin.value.toLowerCase();pl.innerHTML='';links.filter(function(l){return l.t.toLowerCase().indexOf(q)>-1}).forEach(function(l,i){var a=d.createElement('a');a.href=l.h;a.textContent=l.t;if(i===0)a.className='sel';pl.appendChild(a)})}
+function openPal(){if(!pal)return;pal.classList.add('open');pin.value='';draw();pin.focus()}
+function closePal(){pal.classList.remove('open')}
+if(pal){pin.addEventListener('input',draw);pin.addEventListener('keydown',function(e){if(e.key==='Enter'){var a=$('a',pl);if(a)location.href=a.href}});pal.addEventListener('click',function(e){if(e.target===pal)closePal()});var pb=$('#palbtn');if(pb)pb.addEventListener('click',function(){d.body.classList.remove('nav-open');openPal()})}
+d.addEventListener('keydown',function(e){
+ if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='k'){e.preventDefault();openPal();return}
+ if(e.key==='Escape'&&pal)closePal();
+ var tag=(e.target.tagName||'').toLowerCase();
+ if(e.key==='/'&&tag!=='input'&&tag!=='textarea'&&tag!=='select'){var f=$('input.tf');if(f){e.preventDefault();f.focus()}}
+});
+})();
+</script>
 </body></html>""",
     "login.html": """{% extends 'base.html' %}{% block body %}
 <div class="card login">
@@ -297,7 +375,7 @@ function googleTranslateElementInit(){new google.translate.TranslateElement({pag
 <div class="card"><h3>Latest orders</h3>
 {% include 'orders_table.html' %}</div>{% endblock %}""",
     "orders.html": """{% extends 'base.html' %}{% block body %}
-<h2>Orders</h2>
+<div class="page-head"><h2>Orders</h2><a class="btnlink" href="{{ url_for('orders_export') }}">Download CSV</a></div>
 <div class="card">{% include 'orders_table.html' %}</div>{% endblock %}""",
     "orders_table.html": """<div class="scroll"><table>
 <tr><th>Order</th><th>User</th><th>Product</th><th>Qty</th><th>Amount</th><th>Status</th><th>Created</th></tr>
@@ -309,7 +387,7 @@ function googleTranslateElementInit(){new google.translate.TranslateElement({pag
 <td>{{ '%.2f'|format(o.amount) }}</td>
 <td class="{{ o.status }}">{{ o.status }}{% if o.failure_reason %} ({{ o.failure_reason }}){% endif %}</td>
 <td>{{ (o.created_at or '')[:16].replace('T',' ') }}</td>
-</tr>{% else %}<tr><td colspan="7">No orders yet.</td></tr>{% endfor %}
+</tr>{% else %}<tr><td colspan="7" class="empty">No orders yet. They appear here as soon as a customer buys.</td></tr>{% endfor %}
 </table></div>""",
     "admins.html": """{% extends 'base.html' %}{% block body %}
 <h2>Bot admins</h2>
@@ -1143,6 +1221,28 @@ def dashboard():
 @app.route("/orders")
 def orders():
     return render("orders.html", rows=fetch_orders(200))
+
+
+def _csv_safe(v):
+    v = "" if v is None else str(v)
+    return "'" + v if v[:1] in ("=", "+", "-", "@", "\t", "\r") else v
+
+
+@app.route("/orders/export.csv")
+def orders_export():
+    rows = fetch_orders(100000)
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["order", "user", "product", "quantity", "amount", "status", "reason", "created"])
+    for o in rows:
+        w.writerow([_csv_safe(x) for x in (
+            o["id"], ("@" + o["username"]) if o["username"] else o["user_id"],
+            o["product"] or o["product_id"], o["quantity"], "%.2f" % (o["amount"] or 0),
+            o["status"], o["failure_reason"] if "failure_reason" in o.keys() else "",
+            (o["created_at"] or "")[:19].replace("T", " "))])
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    return Response(buf.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=orders-%s.csv" % stamp})
 
 
 @app.route("/products")
