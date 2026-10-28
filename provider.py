@@ -390,6 +390,14 @@ class ShopDB(Database):
     def init(self):
         super().init()
         self._ensure_tables()
+        c = self.conn()
+        try:
+            import profit
+            profit.ensure_profit_tracking(c)
+        except Exception:
+            log.exception("profit tracking setup failed")
+        finally:
+            c.close()
 
     # ------------------------------------------------------------ schema + migration
     def _ensure_tables(self):

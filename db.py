@@ -140,6 +140,11 @@ class Database:
                 if name not in have:
                     c.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
         c.execute("UPDATE users SET created_at=? WHERE created_at IS NULL", (self._now(),))
+        try:
+            import profit
+            profit.ensure_profit_tracking(c)
+        except Exception:
+            import logging; logging.getLogger(__name__).exception("profit tracking setup failed")
 
     @staticmethod
     def _now():

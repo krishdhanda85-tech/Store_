@@ -94,7 +94,13 @@ def init_schema():
     if "bot_ids" not in cols:   # reseller's bot IDs, added by hand by the admin (labels only; money always follows user_id)
         c.execute("ALTER TABLE api_resellers ADD COLUMN bot_ids TEXT")
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_api_resellers_user ON api_resellers(user_id) WHERE user_id IS NOT NULL")
-    c.commit(); c.close()
+    c.commit()
+    try:
+        import profit
+        profit.ensure_profit_tracking(c)
+    except Exception:
+        log.exception("profit tracking setup failed")
+    c.close()
 
 
 def _fernet():

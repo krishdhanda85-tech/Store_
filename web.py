@@ -236,6 +236,7 @@ tr:hover td{background:var(--bg)}
 {{ nl('orders','Orders','list') }}
 {{ nl('manual','Pending orders','clock',pending_count) }}
 {{ nl('products','Products','box') }}
+{{ nl('profit_centre','Profit centre','card') }}
 <div class="grp">Payments</div>
 {{ nl('upipay','UPI payments','card',upi_pending) }}
 {{ nl('upi','UPI setup','qr') }}
@@ -405,6 +406,37 @@ d.addEventListener('keydown',function(e){
 </div>
 <div class="card"><h3>Latest orders</h3>
 {% include 'orders_table.html' %}</div>{% endblock %}""",
+    "profit.html": """{% extends 'base.html' %}{% block body %}
+<div class="page-head"><h2>Profit centre</h2><a class="btnlink" href="{{ url_for('profit_export', range=rng, product=pid) }}">Download CSV</a></div>
+<div class="card"><form method="get" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+{% for k, label in ranges %}<button name="range" value="{{ k }}" class="chip {{ 'on' if k == rng }}" style="{{ 'font-weight:800' if k == rng }}">{{ label }}</button>{% endfor %}
+<select name="product" onchange="this.form.submit()"><option value="">All products</option>{% for p in prods %}<option value="{{ p.id }}" {{ 'selected' if p.id == pid }}>{{ p.name }}</option>{% endfor %}</select>
+<input type="hidden" name="range" value="{{ rng }}"></form>
+<p class="muted" style="margin:8px 0 0">Each sale keeps the cost it was sold at. Changing a price or cost later does <b>not</b> change old profit.</p></div>
+{% if d.nocost %}<div class="msg">{{ d.nocost }} sale{{ '' if d.nocost == 1 else 's' }} in this view {{ 'has' if d.nocost == 1 else 'have' }} no cost, so profit looks too high.
+<form method="post" action="{{ url_for('profit_fill') }}" style="display:inline"><button class="chip">Fill with current cost</button></form></div>{% endif %}
+<div class="card"><div class="kpis">
+<div class="kpi"><div><small>Revenue (USDT)</small><b>{{ '%.2f'|format(d.rev) }}</b><em>{{ d.n }} orders, {{ d.units }} items</em></div></div>
+<div class="kpi"><div><small>Cost paid</small><b>{{ '%.2f'|format(d.cost) }}</b></div></div>
+<div class="kpi"><div><small>Profit</small><b class="{{ 'paid' if d.profit >= 0 else 'failed' }}">{{ '%.2f'|format(d.profit) }}</b><em>{{ '%.1f'|format(d.margin) }}% margin, {{ '%.3f'|format(d.per_item) }} per item</em></div></div>
+</div></div>
+<div class="card"><h3 style="margin-top:0">By product</h3><div class="scroll"><table>
+<tr><th>Product</th><th>Sold</th><th>Revenue</th><th>Cost</th><th>Profit</th></tr>
+{% for r in d.by_product %}<tr><td>{{ r.name }}</td><td>{{ r.units }}</td><td>{{ '%.2f'|format(r.rev) }}</td><td>{{ '%.2f'|format(r.cost) }}</td><td><span class="{{ 'paid' if r.profit >= 0 else 'failed' }}">{{ '%.2f'|format(r.profit) }}</span></td></tr>
+{% else %}<tr><td colspan="5" class="empty">No paid sales in this period.</td></tr>{% endfor %}
+</table></div></div>
+<div class="card"><h3 style="margin-top:0">Every sale</h3><div class="scroll"><table>
+<tr><th>Date</th><th>Product</th><th>Qty</th><th>Price each</th><th>Cost each</th><th>Profit</th></tr>
+{% for r in d.ledger %}<tr><td>{{ (r.ts or '')[:16].replace('T',' ') }}{% if r.src == 'api' %} <small class="muted">API</small>{% endif %}</td><td>{{ r.name }}</td><td>{{ r.q }}</td>
+<td>{{ '%.3f'|format(r.unit_price or 0) }}</td><td>{{ '%.3f'|format(r.uc) if r.uc is not none else '-' }}</td>
+<td><span class="{{ 'paid' if r.profit >= 0 else 'failed' }}">{{ '%.2f'|format(r.profit) }}</span></td></tr>
+{% else %}<tr><td colspan="6" class="empty">No sales yet.</td></tr>{% endfor %}
+</table></div></div>
+<div class="card"><h3 style="margin-top:0">Price &amp; cost changes</h3><div class="scroll"><table>
+<tr><th>When (UTC)</th><th>Product</th><th>What</th><th>Old</th><th>New</th></tr>
+{% for r in d.changes %}<tr><td>{{ (r.ts or '')[:16] }}</td><td>{{ r.name }}</td><td>{{ r.field }}</td><td>{{ '%.3f'|format(r.old_value) if r.old_value is not none else '-' }}</td><td>{{ '%.3f'|format(r.new_value) if r.new_value is not none else '-' }}</td></tr>
+{% else %}<tr><td colspan="5" class="empty">Changes are recorded from now on.</td></tr>{% endfor %}
+</table></div></div>{% endblock %}""",
     "orders.html": """{% extends 'base.html' %}{% block body %}
 <div class="page-head"><h2>Orders</h2><a class="btnlink" href="{{ url_for('orders_export') }}">Download CSV</a></div>
 <div class="card">{% include 'orders_table.html' %}</div>{% endblock %}""",
@@ -1153,13 +1185,12 @@ RANGES = [("today", "Today"), ("7d", "7 days"), ("30d", "30 days"), ("all", "All
 # paid sales from the bot and from the reseller API, with the cost per item
 # (product cost price, else the provider cost for API-linked products)
 _SALES = """WITH s AS (
-SELECT product_id, quantity q, amount a, COALESCE(paid_at, created_at) ts, 'bot' src FROM orders WHERE status='paid'
+SELECT product_id, quantity q, amount a, COALESCE(paid_at, created_at) ts, 'bot' src, unit_cost uc FROM orders WHERE status='paid'
 UNION ALL
-SELECT product_id, quantity, amount, created_at, 'api' FROM api_reseller_orders WHERE status='paid'
+SELECT product_id, quantity, amount, created_at, 'api', unit_cost FROM api_reseller_orders WHERE status='paid'
 ), x AS (
-SELECT s.*, p.name pname, COALESCE(p.cost, pm.cost) ucost FROM s
+SELECT s.*, p.name pname, s.uc ucost FROM s
 LEFT JOIN products p ON p.id = s.product_id
-LEFT JOIN provider_map pm ON pm.product_id = s.product_id
 ) """
 
 
@@ -1300,6 +1331,60 @@ def orders_export():
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
     return Response(buf.getvalue(), mimetype="text/csv",
                     headers={"Content-Disposition": "attachment; filename=orders-%s.csv" % stamp})
+
+@app.route("/profit")
+def profit_centre():
+    import profit
+    rng = request.args.get("range", "30d")
+    if rng not in dict(RANGES):
+        rng = "30d"
+    pid = request.args.get("product", type=int)
+    c = db.conn()
+    try:
+        profit.ensure_profit_tracking(c)
+        d = profit.profit_data(c, rng, pid)
+        prods = c.execute("SELECT id, name FROM products ORDER BY name").fetchall()
+    finally:
+        c.close()
+    return render("profit.html", d=d, rng=rng, ranges=RANGES, pid=pid, prods=prods)
+
+
+@app.route("/profit/fill", methods=["POST"])
+def profit_fill():
+    import profit
+    c = db.conn()
+    try:
+        n = profit.fill_missing_costs(c)
+    finally:
+        c.close()
+    flash(f"Cost filled on {n} sale{'' if n == 1 else 's'} (using each product's current cost)." if n
+          else "Nothing to fill. Set a cost price on the product first.")
+    return redirect(url_for("profit_centre"))
+
+
+@app.route("/profit/export.csv")
+def profit_export():
+    import profit
+    rng = request.args.get("range", "30d")
+    if rng not in dict(RANGES):
+        rng = "30d"
+    pid = request.args.get("product", type=int)
+    c = db.conn()
+    try:
+        d = profit.profit_data(c, rng, pid, ledger_limit=100000)
+    finally:
+        c.close()
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["date", "source", "order", "product", "qty", "sale_price_each", "cost_each_at_sale", "revenue", "profit"])
+    for r in d["ledger"]:
+        w.writerow([_csv_safe(x) for x in (
+            (r["ts"] or "")[:16].replace("T", " "), r["src"], r["oid"], r["name"], r["q"],
+            "%.3f" % (r["unit_price"] or 0), "" if r["uc"] is None else "%.3f" % r["uc"],
+            "%.2f" % (r["a"] or 0), "%.2f" % (r["profit"] or 0))])
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    return Response(buf.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=profit-%s.csv" % stamp})
 
 
 @app.route("/products")
