@@ -659,9 +659,10 @@ def emoji_rules_text() -> str:
 EMOJI_HELP = (
     "🎨 <b>Emoji rules</b>\n\n"
     "Send a message with <b>what to change</b>, then the <b>premium emoji</b>:\n"
-    "• <code>👤 </code>+ premium emoji → every 👤 in the bot (messages + buttons) becomes it\n"
-    "• <code>Binance Pay </code>+ premium emoji → that button gets the emoji\n"
+    "• <code>👤</code> then the premium emoji → every 👤 in the bot (messages + buttons) becomes it\n"
+    "• <code>Binance Pay</code> then the premium emoji → that button gets the emoji\n"
     "• Several in one message is fine: <code>👤 [emoji] 💰 [emoji]</code>\n"
+    "• Just type the words, no \"+\" needed\n"
     "• To delete a rule send: <code>👤 -</code> or <code>Binance Pay -</code>\n\n"
     "Premium emojis in buttons show only when the bot owner has Telegram Premium.\n\n"
     "<b>Current rules</b>\n{rules}")
@@ -689,7 +690,7 @@ async def emoji_rule_text(update, context, st):
     done, prev = [], 0
     for e in sorted([e for e in (msg.entities or []) if e.type == "custom_emoji" and e.custom_emoji_id],
                     key=lambda e: e.offset):
-        left = sl(prev, e.offset).strip()
+        left = re.sub(r"[\s+=:>→\-–]+$", "", sl(prev, e.offset).strip())   # ignore a typed "+", "=", "->" ...
         prev = e.offset + e.length
         if not left:
             continue
