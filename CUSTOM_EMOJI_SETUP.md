@@ -18,3 +18,12 @@ Open any product in the bot -> tap **✏️ Edit this product** (only owner/admi
 Plain text stays in the database (website, buttons, orders); the premium-emoji version is stored in settings
 (`fmt_text`, `prod_icons`). If the name/description is later changed on the website, the plain text is used again.
 Telegram only shows premium emojis in buttons when the bot owner has Telegram Premium.
+
+## /emoji - premium emoji for every button and message (owner + admins)
+
+Send `/emoji`, then send what to change followed by a premium emoji:
+- `👤 [premium emoji]`  -> every 👤 in the bot (texts and buttons) becomes that premium emoji
+- `Binance Pay [premium emoji]` -> the button with that text gets the emoji (works even if it had none)
+- several in one message: `👤 [e1] 💰 [e2]`; delete a rule: `👤 -` or `Binance Pay -`
+Rules are live immediately. Button icons need Telegram Premium on the bot owner; the bottom reply menu
+(Products / Support / Wallet ...) is not covered.

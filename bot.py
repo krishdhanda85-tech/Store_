@@ -315,6 +315,11 @@ def Btn(text, callback_data=None, style=None, url=None, icon=None):
     Colours/icons need a Telegram app released after 9 Feb 2026; older apps show a normal button."""
     kwargs = {"callback_data": callback_data} if url is None else {"url": url}
     extra = {}
+    if not icon and BUTTON_ICONS:
+        try:
+            text, icon = ui_button_icon(text)      # rules the admin set with /emoji
+        except Exception:
+            pass
     if icon and BUTTON_ICONS and str(icon).isdigit():
         extra["icon_custom_emoji_id"] = str(icon)
     if style:
@@ -571,6 +576,150 @@ def set_category_icon(category: str, emoji_id: str):
         rules.append({"k": k, "id": emoji_id})
     db.set_setting("custom_emojis", _json.dumps(rules))
 
+
+
+# ---------------------------------------------------------------- global emoji rules (/emoji)
+# emoji_map : {"👤": id}        every 👤 in messages becomes the premium emoji; a button that starts
+#                                with 👤 gets it as its icon
+# btn_icons : {"binance pay": id}  the button with this text gets the premium emoji as icon
+def _norm_emoji(s: str) -> str:
+    return s.replace("\ufe0f", "").strip()
+
+
+def ui_button_icon(label: str):
+    """(new_label, icon_id) for a button label, applying the admin's /emoji rules."""
+    bmap = _jload("btn_icons", {})
+    emap = _jload("emoji_map", {})
+    if not bmap and not emap or not label:
+        return label, None
+    plain = re.sub(r"^[^\w]+", "", label).strip()
+    for cand in (label.strip().lower(), plain.lower()):
+        eid = str(bmap.get(cand, ""))
+        if eid.isdigit():
+            return plain or label, eid
+    norm = _norm_emoji(label)
+    for k in sorted(emap, key=len, reverse=True):
+        if k and norm.startswith(k) and str(emap[k]).isdigit():
+            rest = norm[len(k):].strip()
+            return rest or label, str(emap[k])
+    return label, None
+
+
+_PROTECTED = re.compile(r"(<tg-emoji.*?</tg-emoji>|<code>.*?</code>|<pre>.*?</pre>)", re.S)
+
+
+def apply_emoji_map(text: str) -> str:
+    emap = {k: str(v) for k, v in _jload("emoji_map", {}).items() if k and str(v).isdigit()}
+    if not emap:
+        return text
+    pat = re.compile("(" + "|".join(re.escape(k) for k in sorted(emap, key=len, reverse=True)) + ")\ufe0f?")
+    parts = _PROTECTED.split(text)
+    for i in range(0, len(parts), 2):          # odd parts are protected (code / existing premium emoji)
+        parts[i] = pat.sub(lambda m: f'<tg-emoji emoji-id="{emap[m.group(1)]}">{m.group(1)}</tg-emoji>', parts[i])
+    return "".join(parts)
+
+
+def _install_emoji_hook():
+    """Every HTML message the bot sends/edits gets the admin's emoji rules applied (safe fallback)."""
+    from telegram import Bot
+    for name in ("send_message", "edit_message_text"):
+        orig = getattr(Bot, name)
+
+        def make(orig):
+            async def wrapper(self, *a, **kw):
+                text = kw.get("text")
+                if isinstance(text, str) and kw.get("parse_mode") == "HTML":
+                    try:
+                        new = apply_emoji_map(text)
+                    except Exception:
+                        new = text
+                    if new != text:
+                        try:
+                            return await orig(self, *a, **{**kw, "text": new})
+                        except BadRequest as e:
+                            if "not modified" in str(e).lower():
+                                raise
+                return await orig(self, *a, **kw)
+            wrapper.__name__ = orig.__name__
+            wrapper.__doc__ = orig.__doc__
+            return wrapper
+        setattr(Bot, name, make(orig))
+
+
+def emoji_rules_text() -> str:
+    emap, bmap = _jload("emoji_map", {}), _jload("btn_icons", {})
+    lines = []
+    for k, v in list(emap.items())[:40]:
+        lines.append(f'{k} → <tg-emoji emoji-id="{v}">{k}</tg-emoji>')
+    for k, v in list(bmap.items())[:40]:
+        lines.append(f'button “{esc(k)}” → <tg-emoji emoji-id="{v}">🔹</tg-emoji>')
+    return "\n".join(lines) or "— no rules yet —"
+
+
+EMOJI_HELP = (
+    "🎨 <b>Emoji rules</b>\n\n"
+    "Send a message with <b>what to change</b>, then the <b>premium emoji</b>:\n"
+    "• <code>👤 </code>+ premium emoji → every 👤 in the bot (messages + buttons) becomes it\n"
+    "• <code>Binance Pay </code>+ premium emoji → that button gets the emoji\n"
+    "• Several in one message is fine: <code>👤 [emoji] 💰 [emoji]</code>\n"
+    "• To delete a rule send: <code>👤 -</code> or <code>Binance Pay -</code>\n\n"
+    "Premium emojis in buttons show only when the bot owner has Telegram Premium.\n\n"
+    "<b>Current rules</b>\n{rules}")
+
+
+async def emoji_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text(tt(lang(uid), "admin_only"))
+        return
+    context.user_data["await"] = {"type": "emojirule"}
+    await update.message.reply_text(EMOJI_HELP.format(rules=emoji_rules_text()), parse_mode=HTML,
+                                    reply_markup=Markup([[Btn("✅ Done", callback_data="adm:ed", style="success")]]))
+
+
+async def emoji_rule_text(update, context, st):
+    msg = update.message
+    if not is_admin(update.effective_user.id):
+        clear_await(context)
+        return
+    text = msg.text or ""
+    u16 = text.encode("utf-16-le")
+    sl = lambda a, b: u16[a * 2:b * 2].decode("utf-16-le", "ignore")
+    emap, bmap = _jload("emoji_map", {}), _jload("btn_icons", {})
+    done, prev = [], 0
+    for e in sorted([e for e in (msg.entities or []) if e.type == "custom_emoji" and e.custom_emoji_id],
+                    key=lambda e: e.offset):
+        left = sl(prev, e.offset).strip()
+        prev = e.offset + e.length
+        if not left:
+            continue
+        if not re.search(r"\w", left) and len(left) <= 12:
+            emap[_norm_emoji(left)] = str(e.custom_emoji_id)
+        else:
+            bmap[" ".join(left.lower().split())[:60]] = str(e.custom_emoji_id)
+        done.append(left)
+    if not done:
+        m = re.match(r"^(.+?)\s+-$", text.strip(), re.S)
+        if m:
+            t = m.group(1).strip()
+            hit = emap.pop(_norm_emoji(t), None) is not None
+            hit = (bmap.pop(" ".join(t.lower().split()), None) is not None) or hit
+            if hit:
+                done.append(t)
+                head = "🗑 Removed"
+            else:
+                await msg.reply_text("❌ No rule found for that.")
+                return
+        else:
+            await msg.reply_text("❌ Send: what to change + a premium emoji (e.g. 👤 then the emoji). Or press Done.")
+            return
+    else:
+        head = "✅ Saved"
+    db.set_setting("emoji_map", _json.dumps(emap))
+    db.set_setting("btn_icons", _json.dumps(bmap))
+    await msg.reply_text(f"{head}: {esc(', '.join(done))}\n\n<b>Current rules</b>\n{emoji_rules_text()}\n\n"
+                         "Send more, or press Done.", parse_mode=HTML,
+                         reply_markup=Markup([[Btn("✅ Done", callback_data="adm:ed", style="success")]]))
 
 
 def money(x) -> str:
@@ -1568,6 +1717,8 @@ async def cb_api(update, context, arg):
             pass
 
 
+_install_emoji_hook()
+
 ADM_FIELDS = {"name": "Name", "description": "Description", "delivery": "Delivery", "warranty": "Warranty"}
 ADM_LIMITS = {"name": 80, "description": 1000, "delivery": 200, "warranty": 200}
 
@@ -1600,6 +1751,10 @@ async def cb_admin(update, context, arg):
         return
     op, _, rest = arg.partition(":")
     await q.answer()
+    if op == "ed":
+        clear_await(context)
+        await edit(q, "✅ Done. Emoji rules are live.")
+        return
     if op in ("e", "f", "i", "ix"):
         pid_s, _, field = rest.partition(":")
         p = db.get_product(int(pid_s)) if pid_s.isdigit() else None
@@ -1842,6 +1997,9 @@ async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if kind in ("admedit", "admicon", "admcat"):
         await admin_text(update, context, st)
         return
+    if kind == "emojirule":
+        await emoji_rule_text(update, context, st)
+        return
 
     if kind == "qty":
         try:
@@ -2036,6 +2194,7 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ADMIN\n\n"
         "/addlink <product> <price> <item_link_or_code>\n"
         "/products\n"
+        "/emoji - set premium emojis for any button or emoji in the bot\n"
         "Admins can only add/manage stock items.\n"
         "Descriptions, warranty, delivery time and made-to-order orders are managed on the admin site.\n\n"
         "OWNER ONLY\n"
@@ -2485,6 +2644,7 @@ def build_application(tenant):
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("chatid", chatid_cmd))
     app.add_handler(CommandHandler("admin", admin_cmd))
+    app.add_handler(CommandHandler("emoji", emoji_cmd))
     app.add_handler(CommandHandler("owner", owner_cmd))
     app.add_handler(CommandHandler("addlink", addlink))
     app.add_handler(CommandHandler("products", products_cmd))
