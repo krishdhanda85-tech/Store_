@@ -468,6 +468,111 @@ def product_name_html(name) -> str:
     return esc(raw)
 
 
+# ---------------------------------------------------------------- in-bot editing (owner/admin)
+# Premium emojis typed by an admin are kept as HTML next to the plain text (plain text stays in the
+# products table, so buttons, the website and old orders keep working).
+import json as _json
+
+
+def _jload(key, default):
+    try:
+        data = _json.loads(db.get_setting(key, "") or "")
+        return data if isinstance(data, type(default)) else default
+    except Exception:
+        return default
+
+
+def fmt_get(pid, field, plain):
+    """HTML version of a product text (with premium emojis / formatting) or None when it is stale."""
+    e = _jload("fmt_text", {}).get(f"{pid}:{field}")
+    if isinstance(e, dict) and e.get("p") == (plain or "").strip() and e.get("h"):
+        return e["h"]
+    return None
+
+
+def fmt_set(pid, field, plain, html_text):
+    data = _jload("fmt_text", {})
+    if html_text and html_text != html.escape(plain, quote=False):
+        data[f"{pid}:{field}"] = {"p": plain, "h": html_text}
+    else:
+        data.pop(f"{pid}:{field}", None)
+    db.set_setting("fmt_text", _json.dumps(data))
+
+
+def field_html(p, field, plain=None):
+    plain = (p[field] if plain is None else plain) or ""
+    return fmt_get(p["id"], field, plain) or esc(plain.strip())
+
+
+def product_icon_for(p) -> str:
+    """Button emoji of a product: the one set from the bot first, then the keyword rules."""
+    own = str(_jload("prod_icons", {}).get(str(p["id"]), ""))
+    return own if own.isdigit() else product_icon_id(p["name"])
+
+
+def card_name_html(p) -> str:
+    """Product name for messages: admin-edited HTML (premium emojis inside) or the icon + plain name."""
+    h = fmt_get(p["id"], "name", p["name"])
+    if h:
+        return h
+    icon = product_icon_for(p)
+    raw = str(p["name"] or "")
+    if icon:
+        return f'<tg-emoji emoji-id="{icon}">🔹</tg-emoji> {esc(raw)}'
+    return esc(raw)
+
+
+def entities_to_html(text, entities):
+    """Telegram message text + entities -> Telegram HTML (keeps premium emojis, bold, italic, links...)."""
+    opens, closes = {}, {}
+    simple = {"bold": "b", "italic": "i", "underline": "u", "strikethrough": "s", "code": "code",
+              "pre": "pre", "spoiler": "tg-spoiler", "blockquote": "blockquote"}
+    for e in sorted(entities or [], key=lambda e: (e.offset, -e.length)):
+        t = e.type
+        if t == "custom_emoji" and e.custom_emoji_id:
+            o, c = f'<tg-emoji emoji-id="{e.custom_emoji_id}">', "</tg-emoji>"
+        elif t == "text_link" and e.url:
+            o, c = f'<a href="{html.escape(e.url, quote=True)}">', "</a>"
+        elif t == "expandable_blockquote":
+            o, c = "<blockquote expandable>", "</blockquote>"
+        elif t in simple:
+            o, c = f"<{simple[t]}>", f"</{simple[t]}>"
+        else:
+            continue
+        opens.setdefault(e.offset, []).append(o)
+        closes.setdefault(e.offset + e.length, []).insert(0, c)
+    out, pos = [], 0
+    for ch in text:
+        out.extend(closes.get(pos, []))
+        out.extend(opens.get(pos, []))
+        out.append(html.escape(ch, quote=False))
+        pos += 2 if ord(ch) > 0xFFFF else 1
+    out.extend(closes.get(pos, []))
+    return "".join(out).strip()
+
+
+def first_custom_emoji_id(msg) -> str:
+    for e in (msg.entities or []):
+        if e.type == "custom_emoji" and e.custom_emoji_id:
+            return str(e.custom_emoji_id)
+    t = (msg.text or "").strip()
+    return t if t.isdigit() and 5 <= len(t) <= 30 else ""
+
+
+def _cat_rule_key(category: str) -> str:
+    k = category.lower().replace("+", " plus ").replace("&", " and ")
+    return " ".join(k.split())[:40]
+
+
+def set_category_icon(category: str, emoji_id: str):
+    k = _cat_rule_key(category)
+    rules = [r for r in _jload("custom_emojis", []) if isinstance(r, dict) and r.get("k") != k]
+    if emoji_id:
+        rules.append({"k": k, "id": emoji_id})
+    db.set_setting("custom_emojis", _json.dumps(rules))
+
+
+
 def money(x) -> str:
     return f"{float(x):.2f}"
 
@@ -613,7 +718,7 @@ def grid_button(uid: int, p, full: bool = False):
         label = name if len(name) <= 60 else name[:59].rstrip() + "…"
     else:
         label = name if len(name) <= SHORT_NAME else name[:SHORT_NAME - 1].rstrip() + "…"
-    icon = product_icon_id(p["name"])
+    icon = product_icon_for(p)
     if is_available(p):
         return Btn(label, callback_data=f"prod:{p['id']}", icon=icon)
     return Btn(label, callback_data=f"prod:{p['id']}", style="danger", icon=icon)
@@ -667,6 +772,8 @@ def shop_view(uid: int, language: str, category: str = None, page: int = 0):
     if category is None:
         rows.append([Btn(tt(language, "btn_search"), callback_data="search", style="primary")])
     else:
+        if is_admin(uid):
+            rows.append([Btn("✏️ Category emoji", callback_data=f"adm:ce:{cat_key(category)}")])
         rows.append([Btn(tt(language, "back"), callback_data="shop", style="primary")])
     return text, Markup(rows)
 
@@ -680,18 +787,26 @@ def card_view(uid: int, p, language: str):
     else:
         stock = (tt(language, "in_stock") + f" · {p['stock']}") if p["stock"] > 0 else tt(language, "sold_out")
     delivery_value = (p["delivery"] or "").strip() or (tt(language, "default_manual_delivery") if is_manual(p) else "")
-    delivery = tt(language, "card_delivery", delivery=esc(delivery_value)) if delivery_value else ""
-    warranty = esc((p["warranty"] or "").strip() or tt(language, "none"))
+    delivery_html = fmt_get(p["id"], "delivery", p["delivery"]) or esc(delivery_value)
+    delivery = tt(language, "card_delivery", delivery=delivery_html) if delivery_value else ""
+    warranty = fmt_get(p["id"], "warranty", p["warranty"]) or esc((p["warranty"] or "").strip() or tt(language, "none"))
+    desc_fmt = fmt_get(p["id"], "description", p["description"])
     lines = [l.strip() for l in (p["description"] or "").splitlines() if l.strip()]
     lines = [("✅ " + l) if l[0].isalnum() else l for l in lines]   # one ✅ per point unless it already has an icon
-    desc_block = tt(language, "card_desc", desc=esc("\n".join(lines))) if lines else ""
-    text = tt(language, "card", name=product_name_html(p["name"]), price=money(price), inr=inr(price), disc=disc, stock=stock,
+    if desc_fmt:                                   # edited in the bot: keep exactly what the admin wrote
+        desc_fmt = re.sub(r"</?blockquote[^>]*>", "", desc_fmt)
+        desc_block = tt(language, "card_desc", desc=desc_fmt)
+    else:
+        desc_block = tt(language, "card_desc", desc=esc("\n".join(lines))) if lines else ""
+    text = tt(language, "card", name=card_name_html(p), price=money(price), inr=inr(price), disc=disc, stock=stock,
               delivery=delivery, warranty=warranty, desc=desc_block)
     cat = (p["category"] or "").strip()
     back = f"cat:{cat_key(cat)}" if cat else "shop"
     rows = []
     if is_available(p):
         rows.append([Btn(tt(language, "btn_buy", price=money(price)), callback_data=f"buy:{p['id']}", style="success")])
+    if is_admin(uid):
+        rows.append([Btn("✏️ Edit this product", callback_data=f"adm:e:{p['id']}")])
     rows.append([Btn(tt(language, "back"), callback_data=back, style="primary")])
     return text, Markup(rows)
 
@@ -700,7 +815,7 @@ def qty_view(uid: int, p, language: str):
     unit = db.get_effective_price(uid, p["id"], p["price"])
     acct = db.get_account(uid)
     status = tt(language, "in_stock") + f" · {p['stock']}" if p["stock"] > 0 else tt(language, "sold_out")
-    text = tt(language, "qty_head", name=product_name_html(p["name"]), unit=money(unit), inr=inr(unit),
+    text = tt(language, "qty_head", name=card_name_html(p), unit=money(unit), inr=inr(unit),
               bal=money(acct["balance"] or 0), status=status, maxq=p["stock"])
     sizes = [n for n in QTY_PRESETS if n <= p["stock"]]
     rows = []
@@ -732,7 +847,7 @@ def calc_view(uid: int, pid: int, qty: int, language: str):
     unit = db.get_effective_price(uid, pid, p["price"])
     total = round(unit * qty, 2)
     bal = float(db.get_account(uid)["balance"] or 0)
-    text = tt(language, "calc", name=product_name_html(p["name"]), qty=qty, unit=money(unit), total=money(total), inr=inr(total), bal=money(bal))
+    text = tt(language, "calc", name=card_name_html(p), qty=qty, unit=money(unit), total=money(total), inr=inr(total), bal=money(bal))
     rows = []
     if bal + 1e-9 >= total:
         text += terms_block(p, language)
@@ -1094,7 +1209,7 @@ async def cb_prod(update, context, arg):
     if not p:
         await q.answer()
         return
-    if not is_available(p):
+    if not is_available(p) and not is_admin(q.from_user.id):
         await q.answer(tt(language, "unavailable"), show_alert=True)
         return
     await q.answer()
@@ -1202,7 +1317,7 @@ async def cb_manual_ok(update, context, arg):
     await q.answer()
     context.user_data.pop("manual", None)
     delivery = (p["delivery"] or "").strip() or tt(language, "default_manual_delivery")
-    await edit(q, tt(language, "placed", order=esc(result), name=product_name_html(p["name"]), contact=esc(pending["contact"]),
+    await edit(q, tt(language, "placed", order=esc(result), name=card_name_html(p), contact=esc(pending["contact"]),
                      delivery=esc(delivery)),
                Markup([main_menu_row(language)]))
     if manual_alerts():
@@ -1453,12 +1568,158 @@ async def cb_api(update, context, arg):
             pass
 
 
+ADM_FIELDS = {"name": "Name", "description": "Description", "delivery": "Delivery", "warranty": "Warranty"}
+ADM_LIMITS = {"name": 80, "description": 1000, "delivery": 200, "warranty": 200}
+
+
+def adm_menu(p):
+    icon = str(_jload("prod_icons", {}).get(str(p["id"]), ""))
+    shown = product_icon_for(p)
+    if shown:
+        emoji_line = f'<tg-emoji emoji-id="{shown}">🔹</tg-emoji> <code>{shown}</code>' + ("" if icon else " (automatic)")
+    else:
+        emoji_line = "none"
+    text = (f"✏️ <b>Edit product</b>\n\n📦 {card_name_html(p)}\n🎨 Button emoji: {emoji_line}\n\n"
+            "Pick what to change. Premium emojis and Telegram formatting (bold, italic, quote…) "
+            "work in Name, Description, Delivery and Warranty.")
+    pid = p["id"]
+    rows = [[Btn("📝 Name", callback_data=f"adm:f:{pid}:name"), Btn("📄 Description", callback_data=f"adm:f:{pid}:description")],
+            [Btn("🚚 Delivery", callback_data=f"adm:f:{pid}:delivery"), Btn("🛡 Warranty", callback_data=f"adm:f:{pid}:warranty")],
+            [Btn("🎨 Button emoji", callback_data=f"adm:i:{pid}", style="primary")]]
+    if icon:
+        rows.append([Btn("🗑 Remove button emoji", callback_data=f"adm:ix:{pid}", style="danger")])
+    rows.append([Btn("‹ Back to product", callback_data=f"prod:{pid}", style="primary")])
+    return text, Markup(rows)
+
+
+async def cb_admin(update, context, arg):
+    q = update.callback_query
+    uid = q.from_user.id
+    if not is_admin(uid):
+        await q.answer("Admins only.", show_alert=True)
+        return
+    op, _, rest = arg.partition(":")
+    await q.answer()
+    if op in ("e", "f", "i", "ix"):
+        pid_s, _, field = rest.partition(":")
+        p = db.get_product(int(pid_s)) if pid_s.isdigit() else None
+        if not p:
+            await edit(q, "Product not found.")
+            return
+        pid = p["id"]
+        if op == "e":
+            clear_await(context)
+            text, markup = adm_menu(p)
+            await edit(q, text, markup)
+        elif op == "f" and field in ADM_FIELDS:
+            context.user_data["await"] = {"type": "admedit", "pid": pid, "field": field}
+            cur = (p[field] or "").strip()
+            hint = "" if field == "name" else "\nSend <code>-</code> to clear it."
+            await edit(q, f"✏️ <b>{ADM_FIELDS[field]}</b>\n\nCurrent:\n<code>{esc(cur) or '—'}</code>\n\n"
+                          f"Send the new text as a normal message. Paste premium emojis straight into it "
+                          f"(sending them needs Telegram Premium).{hint}",
+                       Markup([[Btn("✖ Cancel", callback_data=f"adm:e:{pid}", style="danger")]]))
+        elif op == "i":
+            context.user_data["await"] = {"type": "admicon", "pid": pid}
+            await edit(q, "🎨 <b>Button emoji</b>\n\nSend <b>one premium emoji</b> (or its numeric ID). "
+                          "It will show in front of this product's button in the shop.\n\n"
+                          "<i>Telegram only shows it if the bot owner has Telegram Premium; "
+                          "otherwise the button stays normal.</i>",
+                       Markup([[Btn("✖ Cancel", callback_data=f"adm:e:{pid}", style="danger")]]))
+        elif op == "ix":
+            clear_await(context)
+            icons = _jload("prod_icons", {})
+            icons.pop(str(pid), None)
+            db.set_setting("prod_icons", _json.dumps(icons))
+            text, markup = adm_menu(p)
+            await edit(q, text, markup)
+        return
+    if op in ("ce", "cx"):
+        category = next((c for c in db.list_categories() if cat_key(c) == rest), None)
+        if category is None:
+            await edit(q, "Category not found.")
+            return
+        if op == "cx":
+            set_category_icon(category, "")
+            text, markup = shop_view(uid, lang(uid), category)
+            await edit(q, text, markup)
+            return
+        context.user_data["await"] = {"type": "admcat", "cat": category}
+        await edit(q, f"🎨 <b>Category emoji</b> — {esc(category)}\n\nSend <b>one premium emoji</b> (or its numeric ID) "
+                      "for this category's button.",
+                   Markup([[Btn("🗑 Remove emoji", callback_data=f"adm:cx:{rest}", style="danger")],
+                           [Btn("✖ Cancel", callback_data=f"cat:{rest}", style="primary")]]))
+
+
+async def admin_text(update, context, st):
+    """Typed answer of an admin during an edit flow (kept separate so entities/premium emojis survive)."""
+    msg = update.message
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        clear_await(context)
+        return
+    kind = st["type"]
+    language = lang(uid)
+    raw = msg.text or ""
+    plain = raw.strip()
+    try:
+        if kind == "admedit":
+            pid, field = st["pid"], st["field"]
+            if not db.get_product(pid):
+                clear_await(context)
+                await msg.reply_text("Product not found.")
+                return
+            if plain == "-" and field != "name":
+                plain, html_text = "", ""
+            else:
+                if not plain or len(plain) > ADM_LIMITS[field] or (field != "description" and "\n" in plain):
+                    limit = ADM_LIMITS[field]
+                    one = "" if field == "description" else " (one line)"
+                    await msg.reply_text(f"❌ Send the text up to {limit} characters{one}, or press Cancel.")
+                    return
+                html_text = entities_to_html(raw, msg.entities)
+            if not db.update_product(pid, **{field: plain}):
+                await msg.reply_text("❌ Could not save.")
+                return
+            fmt_set(pid, field, plain, html_text)
+            clear_await(context)
+            p = db.get_product(pid)
+            text, markup = card_view(uid, p, language)
+            await msg.reply_text("✅ Saved. Preview:", parse_mode=HTML)
+            await msg.reply_text(text, reply_markup=markup, parse_mode=HTML, disable_web_page_preview=True)
+        elif kind == "admicon":
+            eid = first_custom_emoji_id(msg)
+            if not eid:
+                await msg.reply_text("❌ Send one premium emoji (or its numeric ID), or press Cancel.")
+                return
+            icons = _jload("prod_icons", {})
+            icons[str(st["pid"])] = eid
+            db.set_setting("prod_icons", _json.dumps(icons))
+            clear_await(context)
+            p = db.get_product(st["pid"])
+            text, markup = adm_menu(p)
+            await msg.reply_text("✅ Button emoji saved.\n\n" + text, reply_markup=markup, parse_mode=HTML)
+        elif kind == "admcat":
+            eid = first_custom_emoji_id(msg)
+            if not eid:
+                await msg.reply_text("❌ Send one premium emoji (or its numeric ID), or press Cancel.")
+                return
+            set_category_icon(st["cat"], eid)
+            clear_await(context)
+            text, markup = shop_view(uid, language, st["cat"])
+            await msg.reply_text("✅ Category emoji saved.", parse_mode=HTML)
+            await msg.reply_text(text, reply_markup=markup, parse_mode=HTML)
+    except BadRequest as e:
+        log.warning("Admin edit preview failed: %s", e)
+        await msg.reply_text("✅ Saved, but Telegram could not render the preview. Open the product to check it.")
+
+
 CALLBACKS = {
     "lang": cb_lang, "setlang": cb_setlang, "menu": cb_menu, "shop": cb_shop, "fund": cb_fund,
     "cat": cb_cat, "prod": cb_prod, "buy": cb_buy, "qty": cb_qty, "qtyo": cb_qty_other, "bal": cb_bal,
     "cx": cb_cancel_flow, "mok": cb_manual_ok, "search": cb_search, "fm": cb_fund_method,
     "fc": cb_dep_check, "ftx": cb_dep_txhash, "fx": cb_dep_cancel, "sup": cb_support,
-    "fu": cb_upi_paid, "api": cb_api, "noop": cb_noop,
+    "fu": cb_upi_paid, "api": cb_api, "noop": cb_noop, "adm": cb_admin,
 }
 
 
@@ -1578,6 +1839,10 @@ async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (msg.text or "").strip()
     kind = st["type"]
 
+    if kind in ("admedit", "admicon", "admcat"):
+        await admin_text(update, context, st)
+        return
+
     if kind == "qty":
         try:
             qty = int(text)
@@ -1607,7 +1872,7 @@ async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("await", None)
         markup = Markup([[Btn(tt(language, "btn_confirm", price=money(unit)), callback_data="mok", style="success")],
                          [Btn(tt(language, "btn_cancel"), callback_data="cx", style="danger")]])
-        await msg.reply_text(tt(language, "confirm", name=product_name_html(p["name"]), contact=esc(text), price=money(unit),
+        await msg.reply_text(tt(language, "confirm", name=card_name_html(p), contact=esc(text), price=money(unit),
                                 delivery=esc(delivery)), reply_markup=markup, parse_mode=HTML)
 
     elif kind == "amount":
@@ -2182,7 +2447,7 @@ async def promo_job(context: ContextTypes.DEFAULT_TYPE):
         context.application.bot_data["last_promo_pid"] = p["id"]
         price = float(p["price"])
         pct = discount_pct(p["old_price"], price)
-        lines = [random.choice(PROMO_TAGLINES), "", product_name_html(p["name"])]
+        lines = [random.choice(PROMO_TAGLINES), "", card_name_html(p)]
         if pct:
             lines.append(f"💰 <s>${money(p['old_price'])}</s> → <b>${money(price)}</b>  (🔻{pct}% OFF)")
         else:
