@@ -593,10 +593,17 @@ def ui_button_icon(label: str):
     if not bmap and not emap or not label:
         return label, None
     plain = re.sub(r"^[^\w]+", "", label).strip()
-    for cand in (label.strip().lower(), plain.lower()):
-        eid = str(bmap.get(cand, ""))
-        if eid.isdigit():
-            return plain or label, eid
+    squash = lambda t: re.sub(r"[\W_]+", "", t.lower())      # ignore spaces, dots, dashes, brackets ...
+    lab = squash(plain)
+    items = [(k, str(v)) for k, v in bmap.items() if str(v).isdigit() and squash(k)]
+    for k, v in items:                                            # 1) same text
+        if squash(k) == lab:
+            return plain or label, v
+    low = plain.lower()
+    for k, v in sorted(items, key=lambda kv: -len(kv[0])):        # 2) label starts with the rule's words
+        kk = squash(k)
+        if (len(kk) >= 8 and lab.startswith(kk)) or re.match(re.escape(k.lower()) + r"(\W|$)", low):
+            return plain or label, v
     norm = _norm_emoji(label)
     for k in sorted(emap, key=len, reverse=True):
         if k and norm.startswith(k) and str(emap[k]).isdigit():
@@ -617,6 +624,82 @@ def apply_emoji_map(text: str) -> str:
     for i in range(0, len(parts), 2):          # odd parts are protected (code / existing premium emoji)
         parts[i] = pat.sub(lambda m: f'<tg-emoji emoji-id="{emap[m.group(1)]}">{m.group(1)}</tg-emoji>', parts[i])
     return "".join(parts)
+
+
+ALL_BUTTONS = [
+    "Binance Pay", "Crypto · USDT BEP-20 (Instant)", "UPI (30 min)", "Profile", "My Orders", "Referral",
+    "Settings", "Support", "API", "Main menu", "Back", "Search", "Add Funds", "Buy", "Other quantity",
+    "I Agree — Pay Now", "Confirm", "Cancel", "Check Payment", "Cancel deposit", "Transactions",
+    "API Docs", "Create API key", "New API key", "Download docs", "New ticket", "Payment issue",
+    "General question", "Bot bug", "Share link", "Submit TXN Hash", "I've paid — send UTR",
+    "Browse the shop", "Join channel", "I've joined — Check",
+]
+
+
+async def emojiall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text(tt(lang(uid), "admin_only"))
+        return
+    context.user_data["await"] = {"type": "emojiall"}
+    lst = "\n".join(f"{i}. {esc(n)}" for i, n in enumerate(ALL_BUTTONS, 1))
+    await update.message.reply_text(
+        "🎨 <b>Emoji for ALL buttons</b>\n\n" + lst +
+        "\n\nSend <b>ONE message</b> with premium emojis <b>in this order</b> (1st emoji = button 1, 2nd = button 2 …).\n"
+        "• To skip a button put <code>-</code> in its place.\n"
+        "• To start from another number begin with it: <code>10: [emoji][emoji]…</code>\n"
+        "• Fewer emojis than buttons is fine — the rest stay as they are.\n\n"
+        "Works for every button with that text (Back, Cancel, Buy … everywhere). "
+        "Product buttons use ✏️ Edit this product, other emojis use /emoji.",
+        parse_mode=HTML, reply_markup=Markup([[Btn("✅ Done", callback_data="adm:ed", style="success")]]))
+
+
+async def emojiall_text(update, context, st):
+    msg = update.message
+    if not is_admin(update.effective_user.id):
+        clear_await(context)
+        return
+    text = msg.text or ""
+    ids = {e.offset: str(e.custom_emoji_id) for e in (msg.entities or [])
+           if e.type == "custom_emoji" and e.custom_emoji_id}
+    if not ids:
+        await msg.reply_text("❌ Send premium emojis in one message (or press Done).")
+        return
+    start = 1
+    m = re.match(r"^\s*(\d{1,3})\s*[:.)]", text)
+    seq, pos, skip_to = [], 0, 0
+    if m:
+        start = max(1, int(m.group(1)))
+        skip_to = len(m.group(0))
+    chars = list(text)
+    ci = 0
+    pos = 0
+    covered = set()
+    for e in (msg.entities or []):
+        if e.type == "custom_emoji":
+            covered.update(range(e.offset, e.offset + e.length))
+    while ci < len(chars):
+        ch = chars[ci]
+        if ci >= skip_to:
+            if pos in ids:
+                seq.append(ids[pos])
+            elif ch == "-" and pos not in covered:
+                seq.append(None)
+        pos += 2 if ord(ch) > 0xFFFF else 1
+        ci += 1
+    bmap = _jload("btn_icons", {})
+    n = 0
+    for i, eid in enumerate(seq):
+        idx = start - 1 + i
+        if idx >= len(ALL_BUTTONS):
+            break
+        if eid:
+            bmap[ALL_BUTTONS[idx].lower()] = eid
+            n += 1
+    db.set_setting("btn_icons", _json.dumps(bmap))
+    await msg.reply_text(f"✅ {n} button emoji(s) saved. Open the bot and check. "
+                         "Send another message to change more, or press Done.",
+                         reply_markup=Markup([[Btn("✅ Done", callback_data="adm:ed", style="success")]]))
 
 
 def _install_emoji_hook():
@@ -2001,6 +2084,9 @@ async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if kind == "emojirule":
         await emoji_rule_text(update, context, st)
         return
+    if kind == "emojiall":
+        await emojiall_text(update, context, st)
+        return
 
     if kind == "qty":
         try:
@@ -2195,7 +2281,8 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ADMIN\n\n"
         "/addlink <product> <price> <item_link_or_code>\n"
         "/products\n"
-        "/emoji - set premium emojis for any button or emoji in the bot\n"
+        "/emojiall - set premium emojis for ALL buttons in one message\n"
+        "/emoji - single rules (one button or one emoji everywhere)\n"
         "Admins can only add/manage stock items.\n"
         "Descriptions, warranty, delivery time and made-to-order orders are managed on the admin site.\n\n"
         "OWNER ONLY\n"
@@ -2646,6 +2733,7 @@ def build_application(tenant):
     app.add_handler(CommandHandler("chatid", chatid_cmd))
     app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(CommandHandler("emoji", emoji_cmd))
+    app.add_handler(CommandHandler("emojiall", emojiall_cmd))
     app.add_handler(CommandHandler("owner", owner_cmd))
     app.add_handler(CommandHandler("addlink", addlink))
     app.add_handler(CommandHandler("products", products_cmd))
