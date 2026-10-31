@@ -20,6 +20,7 @@ from telegram.ext import (
 )
 
 import fampay_verify
+import growth_bot
 import provider
 import textedit
 import reseller_api
@@ -899,6 +900,9 @@ def parse_tiers():
 
 
 def tier_for(spent: float, language: str) -> str:
+    vip_name, vip_pct = db.vip_level(spent)          # levels set on the admin site (Growth > Settings)
+    if vip_name:
+        return f"{vip_name} (−{vip_pct:g}%)" if vip_pct else vip_name
     for amount, name in parse_tiers():
         if spent >= amount:
             return name
@@ -985,6 +989,8 @@ def grid_button(uid: int, p, full: bool = False):
     else:
         label = name if len(name) <= SHORT_NAME else name[:SHORT_NAME - 1].rstrip() + "…"
     icon = product_icon_for(p)
+    if p["id"] in growth_bot.live_flash_ids():
+        label = "⚡" + label
     if is_available(p):
         return Btn(label, callback_data=f"prod:{p['id']}", icon=icon)
     return Btn(label, callback_data=f"prod:{p['id']}", style="danger", icon=icon)
@@ -1066,11 +1072,13 @@ def card_view(uid: int, p, language: str):
         desc_block = tt(language, "card_desc", desc=esc("\n".join(lines))) if lines else ""
     text = tt(language, "card", name=card_name_html(p), price=money(price), inr=inr(price), disc=disc, stock=stock,
               delivery=delivery, warranty=warranty, desc=desc_block)
+    text += growth_bot.card_extras(uid, p)
     cat = (p["category"] or "").strip()
     back = f"cat:{cat_key(cat)}" if cat else "shop"
     rows = []
     if is_available(p):
         rows.append([Btn(tt(language, "btn_buy", price=money(price)), callback_data=f"buy:{p['id']}", style="success")])
+    rows.extend(growth_bot.card_rows(uid, p))
     if is_admin(uid):
         rows.append([Btn("✏️ Edit this product", callback_data=f"adm:e:{p['id']}")])
     rows.append([Btn(tt(language, "back"), callback_data=back, style="primary")])
@@ -1083,11 +1091,13 @@ def qty_view(uid: int, p, language: str):
     status = tt(language, "in_stock") + f" · {p['stock']}" if p["stock"] > 0 else tt(language, "sold_out")
     text = tt(language, "qty_head", name=card_name_html(p), unit=money(unit), inr=inr(unit),
               bal=money(acct["balance"] or 0), status=status, maxq=p["stock"])
+    text += growth_bot.qty_extras(uid, p)
     sizes = [n for n in QTY_PRESETS if n <= p["stock"]]
     rows = []
     for chunk in (sizes[:4], sizes[4:]):
         if chunk:
             rows.append([Btn(str(n), callback_data=f"qty:{p['id']}:{n}", style="primary") for n in chunk])
+    rows.extend(growth_bot.qty_rows(p))
     rows.append([Btn(tt(language, "other_qty"), callback_data=f"qtyo:{p['id']}", style="success")])
     rows.append([Btn(tt(language, "back"), callback_data=f"prod:{p['id']}", style="primary")])
     return text, Markup(rows)
@@ -1110,10 +1120,12 @@ def calc_view(uid: int, pid: int, qty: int, language: str):
     p = db.get_product(pid)
     if not p or is_manual(p) or qty <= 0 or p["stock"] < qty:
         return None
-    unit = db.get_effective_price(uid, pid, p["price"])
+    info = db.price_info(uid, pid, p["price"], qty, True)
+    unit = info["unit"]
     total = round(unit * qty, 2)
     bal = float(db.get_account(uid)["balance"] or 0)
     text = tt(language, "calc", name=card_name_html(p), qty=qty, unit=money(unit), total=money(total), inr=inr(total), bal=money(bal))
+    text += growth_bot.calc_extras(uid, p, qty, info, total)
     rows = []
     if bal + 1e-9 >= total:
         text += terms_block(p, language)
@@ -1128,7 +1140,7 @@ def calc_view(uid: int, pid: int, qty: int, language: str):
 def wallet_view(uid: int, language: str):
     bal = db.get_account(uid)["balance"] or 0
     text = tt(language, "wallet", bal=money(bal), inr=inr(bal), rate=rate_text(),
-              min=f"{min_deposit():g}", max=f"{max_deposit():g}")
+              min=f"{min_deposit():g}", max=f"{max_deposit():g}") + growth_bot.wallet_extra_text()
     rows = []
     if binance.binance_enabled:
         rows.append([Btn(tt(language, "btn_bpay"), callback_data="fm:bpay")])
@@ -1138,6 +1150,7 @@ def wallet_view(uid: int, language: str):
         rows.append([Btn(tt(language, "btn_upi"), callback_data="fm:upi")])
     if not rows:
         text += tt(language, "no_methods")
+    rows.extend(growth_bot.wallet_rows())
     rows.append([Btn("👤 Profile", callback_data="menu:profile"), Btn("🧾 My Orders", callback_data="menu:orders")])
     rows.append([Btn("🎁 Referral", callback_data="menu:ref"), Btn("⚙️ Settings", callback_data="menu:settings")])
     rows.append(main_menu_row(language))
@@ -1147,7 +1160,7 @@ def wallet_view(uid: int, language: str):
 def warranty_view(uid: int, language: str):
     custom = (db.get_setting("warranty_text", "") or "").strip()
     body = esc(custom) if custom else tt(language, "warranty_default")
-    return tt(language, "warranty", text=body), Markup([
+    return tt(language, "warranty", text=body), Markup(growth_bot.warranty_rows() + [
         [Btn("🎧 " + MENU["support"].split(" ", 1)[1], callback_data="menu:support", style="primary")],
         main_menu_row(language)])
 
@@ -1158,9 +1171,10 @@ def profile_view(user, language: str):
     text = tt(language, "profile", bal=money(acct["balance"] or 0), spent=money(acct["spent"] or 0),
               ref=money(acct["ref_earned"] or 0), tier=esc(tier_for(acct["spent"] or 0, language)),
               name=esc(user.full_name), uname=uname, id=user.id, since=(acct["created_at"] or "")[:10] or "—")
-    return text, Markup([[Btn(tt(language, "btn_orders"), callback_data="menu:orders"),
-                          Btn(tt(language, "btn_tx"), callback_data="menu:tx")],
-                         [Btn(tt(language, "btn_api"), callback_data="api:home")]])
+    extra_text, extra_rows = growth_bot.profile_extra(user.id)
+    return text + extra_text, Markup([[Btn(tt(language, "btn_orders"), callback_data="menu:orders"),
+                                       Btn(tt(language, "btn_tx"), callback_data="menu:tx")],
+                                      [Btn(tt(language, "btn_api"), callback_data="api:home")]] + extra_rows)
 
 
 STATUS_ICON = {"paid": "✅", "processing": "⏳", "pending": "⏳", "failed": "❌", "refunded": "↩️"}
@@ -1175,7 +1189,8 @@ def orders_view(uid: int, language: str):
         f"{STATUS_ICON.get(o['status'], '•')} <code>{esc(o['id'])}</code> · {o['quantity']} × {esc(o['name'] or 'Product')} · "
         f"${money(o['amount'])} · {status_label(language, o['status'])}"
         for o in orders)
-    return tt(language, "orders", rows=rows), Markup([[Btn(tt(language, "shop"), callback_data="shop", style="primary")]])
+    return tt(language, "orders", rows=rows), Markup(growth_bot.orders_rows(uid) +
+                                                     [[Btn(tt(language, "shop"), callback_data="shop", style="primary")]])
 
 
 def tx_view(uid: int, language: str):
@@ -1196,7 +1211,7 @@ def referral_view(uid: int, bot_username: str, language: str):
     text = tt(language, "referral", n=db.referral_count(uid), earned=money(acct["ref_earned"] or 0), paid="0.00",
               pct=f"{db.referral_percent():g}", link=esc(link), code=code)
     share = f"https://t.me/share/url?url={quote(link)}&text={quote(tt(language, 'share_text', shop=shop_name()))}"
-    return text, Markup([[Btn(tt(language, "btn_share"), url=share, style="success")]])
+    return text, Markup([[Btn(tt(language, "btn_share"), url=share, style="success")]] + growth_bot.referral_rows())
 
 
 def support_view(uid: int, language: str):
@@ -1207,8 +1222,8 @@ def support_view(uid: int, language: str):
         text = tt(language, "support_list", rows=rows)
     else:
         text = tt(language, "support_none")
-    return text, Markup([[Btn(tt(language, "btn_new_ticket"), callback_data="sup:new", style="success")],
-                         main_menu_row(language)])
+    return text, Markup([[Btn(tt(language, "btn_new_ticket"), callback_data="sup:new", style="success")]]
+                        + growth_bot.support_rows() + [main_menu_row(language)])
 
 
 def settings_view(uid: int, language: str):
@@ -1475,9 +1490,6 @@ async def cb_prod(update, context, arg):
     if not p:
         await q.answer()
         return
-    if not is_available(p) and not is_admin(q.from_user.id):
-        await q.answer(tt(language, "unavailable"), show_alert=True)
-        return
     await q.answer()
     clear_await(context)
     text, markup = card_view(q.from_user.id, p, language)
@@ -1532,7 +1544,8 @@ async def cb_bal(update, context, arg):
     if not p or is_manual(p) or qty <= 0:
         await q.answer(tt(language, "out"), show_alert=True)
         return
-    unit = db.get_effective_price(uid, pid, p["price"])
+    info = db.price_info(uid, pid, p["price"], qty, True)
+    unit = info["unit"]
     result = await asyncio.to_thread(db.buy_with_balance, uid, pid, qty, unit)
     if result == "balance":
         await q.answer()
@@ -1545,6 +1558,8 @@ async def cb_bal(update, context, arg):
         return
     await q.answer()
     order_id, items = result
+    if info["promo_code"]:
+        await asyncio.to_thread(db.promo_consume, uid)
     order = db.get_order(order_id)
     p_sold = db.get_product_any(pid)
     await announce_sale(context.bot, p_sold["name"] if p_sold else "Product", qty, order_id, "Telegram bot")
@@ -1572,7 +1587,8 @@ async def cb_manual_ok(update, context, arg):
     if not p or not is_manual(p):
         await q.answer(tt(language, "unavailable"), show_alert=True)
         return
-    unit = db.get_effective_price(uid, p["id"], p["price"])
+    info = db.price_info(uid, p["id"], p["price"], 1, True)
+    unit = info["unit"]
     result = db.buy_manual(uid, p["id"], unit, pending["contact"])
     if result == "balance":
         await q.answer()
@@ -1582,6 +1598,8 @@ async def cb_manual_ok(update, context, arg):
         return
     await q.answer()
     context.user_data.pop("manual", None)
+    if info["promo_code"]:
+        db.promo_consume(uid)
     delivery = (p["delivery"] or "").strip() or tt(language, "default_manual_delivery")
     await edit(q, tt(language, "placed", order=esc(result), name=card_name_html(p), contact=esc(pending["contact"]),
                      delivery=esc(delivery)),
@@ -1992,6 +2010,7 @@ CALLBACKS = {
     "cx": cb_cancel_flow, "mok": cb_manual_ok, "search": cb_search, "fm": cb_fund_method,
     "fc": cb_dep_check, "ftx": cb_dep_txhash, "fx": cb_dep_cancel, "sup": cb_support,
     "fu": cb_upi_paid, "api": cb_api, "noop": cb_noop, "adm": cb_admin,
+    "g": growth_bot.cb_growth,
 }
 
 
@@ -2123,6 +2142,9 @@ async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if kind == "txtedit":
         await texts_edit_input(update, context, st)
         return
+    if kind in ("promo", "rvcomment", "wclaim"):
+        await growth_bot.growth_text(update, context, st)
+        return
 
     if kind == "qty":
         try:
@@ -2147,7 +2169,7 @@ async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not p or not is_manual(p):
             clear_await(context)
             return
-        unit = db.get_effective_price(uid, p["id"], p["price"])
+        unit = db.get_effective_price(uid, p["id"], p["price"], 1, True)
         delivery = (p["delivery"] or "").strip() or tt(language, "default_manual_delivery")
         context.user_data["manual"] = {"pid": p["id"], "contact": text}
         context.user_data.pop("await", None)
@@ -2239,6 +2261,8 @@ async def photo_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if st and st["type"] == "ticket":
         msg = update.message
         await open_ticket(update, context, st["kind"], (msg.caption or "").strip(), msg.photo[-1].file_id)
+    elif st and st["type"] == "wclaim":
+        await growth_bot.growth_photo(update, context, st)
 
 
 async def open_ticket(update, context, kind: str, text: str, photo_id):
@@ -3103,6 +3127,9 @@ def build_application(tenant):
     app.add_handler(CommandHandler("restore", restore_cmd))
     app.add_handler(CommandHandler("cancelrestore", cancel_restore))
     app.add_handler(MessageHandler(filters.Document.ALL, restore_doc))
+    app.add_handler(CommandHandler("promo", growth_bot.promo_cmd))
+    app.add_handler(CommandHandler("faq", growth_bot.faq_cmd))
+    app.add_handler(CommandHandler("broadcast", growth_bot.broadcast_cmd))
     app.add_handler(CommandHandler("apiproducts", apiproducts))
     app.add_handler(CommandHandler("linkapi", linkapi))
     app.add_handler(CommandHandler("unlinkapi", unlinkapi))
@@ -3113,7 +3140,8 @@ def build_application(tenant):
     app.add_handler(MessageHandler(filters.PHOTO, photo_msg))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_msg))
     app.job_queue.run_repeating(_in_shop(expiry_job), interval=20, first=10)
-    app.job_queue.run_repeating(_in_shop(outbox_job), interval=10, first=5)
+    app.job_queue.run_repeating(_in_shop(outbox_job), interval=5, first=5)
+    app.job_queue.run_repeating(_in_shop(growth_bot.growth_job), interval=120, first=45)
     app.job_queue.run_repeating(_in_shop(provider_job), interval=120, first=15)
     app.job_queue.run_repeating(_in_shop(backup_job), interval=86400, first=600)
     app.job_queue.run_repeating(_in_shop(lowstock_job), interval=1800, first=120)

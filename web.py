@@ -30,6 +30,8 @@ app.register_blueprint(reseller_api_blueprint)
 register_reseller_admin(app, db)
 from suppliers_admin import register as register_suppliers_admin
 register_suppliers_admin(app, db)
+from growth_admin import register as register_growth_admin
+register_growth_admin(app)
 app.config["MAX_CONTENT_LENGTH"] = 3 * 1024 * 1024   # QR uploads
 app.secret_key = os.getenv("SECRET_KEY") or hashlib.sha256(
     ("shop-admin:" + ADMIN_PASSWORD).encode()
@@ -244,6 +246,14 @@ tr:hover td{background:var(--bg)}
 {{ nl('users','Users','users') }}
 {{ nl('tickets','Support','help',open_tickets,'ticket') }}
 {{ nl('userprices','User prices','tag') }}
+<div class="grp">Growth</div>
+{{ nl('growth_admin.home','Growth settings','sliders') }}
+{{ nl('growth_admin.promos','Promo codes','tag') }}
+{{ nl('growth_admin.deals','Flash deals','clock') }}
+{{ nl('growth_admin.bulk','Bulk prices','box') }}
+{{ nl('growth_admin.broadcast','Broadcast','link') }}
+{{ nl('growth_admin.reviews','Reviews','help') }}
+{{ nl('growth_admin.leaderboard','Leaderboard','users') }}
 <div class="grp">System</div>
 {% if is_main %}{{ nl('sellers_admin.sellers','Sellers','users',pending_sellers) }}{% else %}{{ nl('connect','Bot & payments','link') }}{% endif %}
 {{ nl('suppliers_admin.suppliers','Suppliers API','link') }}

@@ -7,7 +7,10 @@ from datetime import datetime, timezone
 DEFAULT_REFERRAL_PERCENT = float(os.getenv("REFERRAL_PERCENT", "3"))  # used until the admin sets one
 DEFAULT_INR_RATE = float(os.getenv("INR_RATE", "100"))  # INR per 1 USDT until the admin changes it
 
-class Database:
+from growth import GrowthMixin, USER_COLUMNS as _GROWTH_USER_COLUMNS, ORDER_COLUMNS as _GROWTH_ORDER_COLUMNS
+
+
+class Database(GrowthMixin):
     def __init__(self, path):
         self.path = path
 
@@ -117,6 +120,7 @@ class Database:
             PRIMARY KEY (chat_id, msg_id)
         );
         """)
+        self._growth_init(c)
         self._migrate(c)
         c.commit(); c.close()
 
@@ -126,11 +130,11 @@ class Database:
         add = {
             "users": [("balance", "REAL DEFAULT 0"), ("spent", "REAL DEFAULT 0"),
                       ("ref_earned", "REAL DEFAULT 0"), ("referred_by", "INTEGER"),
-                      ("created_at", "TEXT"), ("ref_code", "TEXT")],
+                      ("created_at", "TEXT"), ("ref_code", "TEXT")] + _GROWTH_USER_COLUMNS,
             "products": [("description", "TEXT"), ("delivery", "TEXT"), ("warranty", "TEXT"),
                          ("category", "TEXT"), ("old_price", "REAL"), ("kind", "TEXT DEFAULT 'auto'"),
                          ("prompt", "TEXT"), ("cost", "REAL")],
-            "orders": [("paid_with", "TEXT DEFAULT 'crypto'"), ("contact", "TEXT"), ("admin_note", "TEXT")],
+            "orders": [("paid_with", "TEXT DEFAULT 'crypto'"), ("contact", "TEXT"), ("admin_note", "TEXT")] + _GROWTH_ORDER_COLUMNS,
             "deposits": [("inr_amount", "REAL"), ("rate", "REAL"), ("upi_id", "TEXT"), ("utr", "TEXT"),
                          ("utr_at", "TEXT"), ("reviewed_by", "TEXT")],
         }
@@ -250,14 +254,10 @@ class Database:
         c.commit(); c.close()
         return "ok" if cur.rowcount == 1 else "missing"
 
-    def get_effective_price(self, uid, pid, default):
-        c=self.conn()
-        u=c.execute("SELECT username FROM users WHERE user_id=?",(uid,)).fetchone()
-        price=None
-        if u and u["username"]:
-            r=c.execute("SELECT price FROM user_prices WHERE username=? AND product_id=?",(u["username"].lstrip("@"),pid)).fetchone()
-            price=r["price"] if r else None
-        c.close(); return price if price is not None else default
+    def get_effective_price(self, uid, pid, default, qty=1, checkout=False):
+        """Unit price for this customer: custom user price, else flash deal / bulk price / VIP discount
+        (and the saved promo code when checkout=True). See growth.GrowthMixin.price_info."""
+        return self.final_price(uid, pid, default, qty, checkout)
 
     def set_product_price(self,pid,price):
         c=self.conn(); c.execute("UPDATE products SET price=? WHERE id=?",(price,pid)); c.commit(); c.close()
@@ -313,7 +313,7 @@ class Database:
 
     def user_orders(self, uid, limit=8):
         c=self.conn()
-        rows=c.execute("""SELECT o.id,o.quantity,o.amount,o.status,p.name FROM orders o
+        rows=c.execute("""SELECT o.id,o.product_id,o.quantity,o.amount,o.status,p.name FROM orders o
         LEFT JOIN products p ON p.id=o.product_id WHERE o.user_id=? AND (o.status!='failed' OR o.failure_reason='timeout')
         ORDER BY o.created_at DESC LIMIT ?""",(uid,limit)).fetchall()
         c.close(); return rows
@@ -329,6 +329,7 @@ class Database:
             if bonus > 0:
                 c.execute("UPDATE users SET balance=ROUND(COALESCE(balance,0)+?,2), ref_earned=ROUND(COALESCE(ref_earned,0)+?,2) "
                           "WHERE user_id=?", (bonus, bonus, r["referred_by"]))
+        self._apply_cashback(c, uid, amount)
 
     def get_account(self, uid):
         c=self.conn(); r=c.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone(); c.close()
@@ -408,6 +409,7 @@ class Database:
             c.rollback(); c.close(); return None
         c.execute("UPDATE deposits SET status='paid',paid_at=? WHERE id=?", (self._now(), did))
         c.execute("UPDATE users SET balance=ROUND(COALESCE(balance,0)+?,2) WHERE user_id=?", (d["amount"], d["user_id"]))
+        self._apply_deposit_bonus(c, d["user_id"], d["amount"])
         c.commit(); c.close()
         return d["amount"]
 
@@ -503,6 +505,7 @@ class Database:
             c.rollback(); c.close(); return None
         c.execute("UPDATE deposits SET status='paid', paid_at=?, reviewed_by=? WHERE id=?", (self._now(), str(by), did))
         c.execute("UPDATE users SET balance=ROUND(COALESCE(balance,0)+?,2) WHERE user_id=?", (d["amount"], d["user_id"]))
+        self._apply_deposit_bonus(c, d["user_id"], d["amount"])
         c.commit(); c.close(); return d
 
     def reject_upi(self, did, by):
@@ -692,7 +695,7 @@ class Database:
         c.execute("INSERT INTO outbox(user_id,text,created_at) VALUES(?,?,?)", (uid, text, self._now()))
         c.commit(); c.close()
 
-    def outbox_claim(self, limit=20):
+    def outbox_claim(self, limit=25):
         """Atomically claim waiting messages; each message is handed out exactly once."""
         c=self.conn()
         c.execute("BEGIN IMMEDIATE")

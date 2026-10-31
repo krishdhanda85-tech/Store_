@@ -1,4 +1,13 @@
 =====================================================================
+GROWTH FEATURES (new)  -  see GROWTH_FEATURES.md
+=====================================================================
+New files: growth.py, growth_bot.py, growth_admin.py.   Changed: db.py, bot.py, web.py.   Deploy all together, keep your database.
+Admin site -> "Growth" menu: deposit bonus, cashback, VIP level discounts, promo codes, flash deals, bulk prices,
+broadcast, reviews, referral leaderboard + prizes, FAQ, low-balance reminders. Bot: restock alerts, warranty claim,
+ratings, buy-again buttons, /promo /faq /broadcast. No new Railway variables.
+
+
+=====================================================================
 MULTI-SELLER PLATFORM (new)  -  one site, many sellers
 =====================================================================
 New files: tenancy.py, sellers_web.py.   Changed: bot.py, web.py, binance_pay.py, provider.py,
