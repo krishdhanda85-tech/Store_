@@ -2806,11 +2806,20 @@ _fampay_logged = {}
 
 async def fampay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Owner only: /fampay - checks the FamPay setup and says why a waiting UPI deposit is not auto-approved."""
-    if not is_owner(update.effective_user.id) or not tenancy.cur().is_main:
+    if not is_owner(update.effective_user.id):
         return
-    rows = [d for d in db.upi_payments(status="upi_review", limit=10) if d["utr"]]
-    lines = await asyncio.to_thread(fampay_verify.status_lines, rows)
-    await update.message.reply_text("🔎 <b>FamPay check</b>\n\n" + "\n".join(esc(x) for x in lines)[:3800], parse_mode=HTML)
+    try:
+        if not tenancy.cur().is_main:
+            await update.message.reply_text("FamPay auto-approve works on the main shop only.")
+            return
+        await update.message.reply_text("🔎 Checking FamPay setup, please wait...")
+        rows = [d for d in db.upi_payments(status="upi_review", limit=10) if d["utr"]]
+        lines = await asyncio.to_thread(fampay_verify.status_lines, rows)
+        await update.message.reply_text("🔎 <b>FamPay check</b>\n\n" + "\n".join(esc(x) for x in lines)[:3800],
+                                        parse_mode=HTML)
+    except Exception as e:
+        log.exception("/fampay failed")
+        await update.message.reply_text(f"❌ /fampay error: {esc(str(e))[:300]}", parse_mode=HTML)
 
 
 async def fampay_job(context: ContextTypes.DEFAULT_TYPE):
