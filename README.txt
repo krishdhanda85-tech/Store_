@@ -174,3 +174,5 @@ FAMPAY AUTO-APPROVE FOR UPI TOP-UPS (new: fampay_verify.py + fampay_job in bot.p
 - A deposit is auto-approved only if: sender domain allowed + Gmail DKIM pass + it is a credit + exact INR amount
   + the customer's UTR is in the e-mail + e-mail is newer than the request. Otherwise it stays in manual review.
 - Safe to run: nothing is ever auto-rejected, and a UTR can be used only once.
+
+
