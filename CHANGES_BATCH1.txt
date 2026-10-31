@@ -1,0 +1,15 @@
+BATCH 1 (only bot.py changed)
+
+1. Error alert: any unhandled error is logged and the owner gets a Telegram message
+   (max 1 alert per 10 min per error type, so no spam).
+2. Low-stock alert: every 30 min, owner is told once when an auto-delivery product has
+   <= LOW_STOCK_THRESHOLD items (env var, default 3) or is out of stock. Alerts again only
+   after the product was refilled and ran low again.
+3. Maintenance mode: owner command  /maintenance on | off  . Customers see a short notice;
+   owner/admins keep working. Deposit checking and delivery are background jobs, so they continue.
+
+Already in your bot (nothing added): daily DB backup (backup_job), /backup, /restore,
+duplicate-payment guard (txid UNIQUE + atomic credit_deposit), referral, tiers, tickets, refunds.
+
+Deploy: back up shop.db first, test on a separate test bot, then replace bot.py.
+Rollback: put the old bot.py back.

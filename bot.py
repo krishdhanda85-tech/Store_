@@ -18,6 +18,7 @@ from telegram.ext import (
     ContextTypes, TypeHandler, filters
 )
 
+import fampay_verify
 import provider
 import reseller_api
 import tenancy
@@ -2654,6 +2655,25 @@ async def _bind(update, context):
     if t is None or t.status != "active":
         raise ApplicationHandlerStop
     tenancy.set_current(t)          # same task as the real handler, so it stays set until it ends
+    # Maintenance mode: owner/admins keep working, everyone else gets a short notice.
+    # (Payment checking and delivery run as background jobs, so they are NOT affected.)
+    try:
+        if db.get_setting("maintenance", "0") == "1":
+            uid = update.effective_user.id if update.effective_user else 0
+            if not (is_owner(uid) or is_admin(uid)):
+                note = "🛠 The shop is under maintenance for a few minutes. Please try again shortly."
+                try:
+                    if update.callback_query:
+                        await update.callback_query.answer(note, show_alert=True)
+                    elif update.effective_message:
+                        await update.effective_message.reply_text(note)
+                except Exception:
+                    pass
+                raise ApplicationHandlerStop
+    except ApplicationHandlerStop:
+        raise
+    except Exception:
+        log.exception("maintenance check failed")
 
 
 async def chatid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2713,6 +2733,104 @@ async def promo_job(context: ContextTypes.DEFAULT_TYPE):
         log.exception("Promo post to group %s failed (bot must be in the group and allowed to send)", target)
 
 
+# ---------------------------------------------------------------- owner safety net (new)
+LOW_STOCK_THRESHOLD = int(os.getenv("LOW_STOCK_THRESHOLD", "3") or 3)
+_last_error_alert = {}          # (tenant id, error type) -> unix time of the last alert
+
+
+async def on_error(update, context):
+    """Logs every unhandled error and tells the owner (max 1 alert / 10 min per error type)."""
+    err = context.error
+    log.error("Unhandled error", exc_info=err)
+    try:
+        import time
+        tid = context.application.bot_data.get("tenant_id")
+        key = (tid, type(err).__name__)
+        now = time.time()
+        if now - _last_error_alert.get(key, 0) < 600:
+            return
+        _last_error_alert[key] = now
+        t = tenancy.get_tenant(tid)
+        if t is None or not t.owner_id:
+            return
+        where = ""
+        if isinstance(update, Update) and update.effective_user:
+            where = f"\nUser: <code>{update.effective_user.id}</code>"
+        await context.bot.send_message(
+            t.owner_id,
+            f"⚠️ <b>Bot error</b>: <code>{esc(type(err).__name__)}</code>\n"
+            f"<code>{esc(str(err)[:300])}</code>{where}\n"
+            f"Check the Railway logs if it keeps repeating.",
+            parse_mode=HTML)
+    except Exception:
+        log.exception("could not send the error alert")
+
+
+async def lowstock_job(context: ContextTypes.DEFAULT_TYPE):
+    """Every 30 min: tell the owner once when an auto-delivery product runs low / out of stock,
+    and again only after it was refilled and ran low again."""
+    for p in db.list_products():
+        if is_manual(p):
+            continue
+        flag = f"lowstock_alerted_{p['id']}"
+        stock = int(p["stock"] or 0)
+        alerted = db.get_setting(flag, "0") == "1"
+        if stock <= LOW_STOCK_THRESHOLD and not alerted:
+            icon, msg = ("🔴", "OUT OF STOCK") if stock == 0 else ("🟠", f"only {stock} left")
+            try:
+                await context.bot.send_message(
+                    owner_id(), f"{icon} <b>{esc(p['name'])}</b>: {msg}. Add stock to keep selling.",
+                    parse_mode=HTML)
+                db.set_setting(flag, "1")
+            except Exception:
+                log.exception("low stock alert failed")
+        elif stock > LOW_STOCK_THRESHOLD and alerted:
+            db.set_setting(flag, "0")
+
+
+async def maintenance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner only: /maintenance on | off | (no argument = show status)."""
+    if not is_owner(update.effective_user.id):
+        return
+    arg = (context.args[0].lower() if context.args else "")
+    if arg in ("on", "off"):
+        db.set_setting("maintenance", "1" if arg == "on" else "0")
+    state = "ON 🛠" if db.get_setting("maintenance", "0") == "1" else "OFF ✅"
+    await update.message.reply_text(
+        f"Maintenance mode: <b>{state}</b>\nUse /maintenance on or /maintenance off.\n"
+        f"Owner and admins can still use the bot; payments keep being checked.", parse_mode=HTML)
+
+
+async def fampay_job(context: ContextTypes.DEFAULT_TYPE):
+    """Every 45 s: UPI top-ups that already have a UTR are checked against the FamPay e-mails in Gmail.
+    A strong match is approved automatically; everything else stays for manual review on the admin site."""
+    if not fampay_verify.enabled() or not tenancy.cur().is_main:      # main shop only (uses YOUR Gmail)
+        return
+    rows = [d for d in db.upi_payments(status="upi_review", limit=20) if d["utr"]]
+    if not rows:
+        return
+    results = await asyncio.to_thread(fampay_verify.verify_pending, rows)
+    for dep_id, ok, why in results:
+        if not ok:
+            continue
+        d = db.approve_upi(dep_id, "fampay-auto")
+        if not d:
+            continue                      # an admin handled it first
+        try:
+            bal = db.get_account(d["user_id"])["balance"] or 0
+            await context.bot.send_message(
+                d["user_id"], tt(lang(d["user_id"]), "dep_paid", amount=money(d["amount"]), bal=money(bal)),
+                parse_mode=HTML)
+        except Exception:
+            log.exception("could not tell the customer about the auto-approved deposit %s", dep_id)
+        try:
+            await notify_admins(context, f"✅ <b>UPI auto-approved</b> (FamPay email matched)\n"
+                                         f"🧾 <code>{esc(dep_id)}</code> · ₹{inr_fmt(d['inr_amount'])} → ${money(d['amount'])}\n"
+                                         f"🔢 UTR: <code>{esc(d['utr'])}</code>")
+        except Exception:
+            log.exception("admin notice for auto-approval failed")
+
+
 def _in_shop(fn):
     """Wrap a repeating job so it also runs inside its own shop."""
     async def run(context):
@@ -2747,6 +2865,7 @@ def build_application(tenant):
     app.add_handler(CommandHandler("reopen", reopen))
     app.add_handler(CommandHandler("apitest", apitest))
     app.add_handler(CommandHandler("backup", backup_cmd))
+    app.add_handler(CommandHandler("maintenance", maintenance_cmd))
     app.add_handler(CommandHandler("restore", restore_cmd))
     app.add_handler(CommandHandler("cancelrestore", cancel_restore))
     app.add_handler(MessageHandler(filters.Document.ALL, restore_doc))
@@ -2762,6 +2881,9 @@ def build_application(tenant):
     app.job_queue.run_repeating(_in_shop(outbox_job), interval=10, first=5)
     app.job_queue.run_repeating(_in_shop(provider_job), interval=120, first=15)
     app.job_queue.run_repeating(_in_shop(backup_job), interval=86400, first=600)
+    app.job_queue.run_repeating(_in_shop(lowstock_job), interval=1800, first=120)
+    app.job_queue.run_repeating(_in_shop(fampay_job), interval=45, first=30)
+    app.add_error_handler(on_error)
     if PROMO_ADS:
         app.job_queue.run_repeating(_in_shop(promo_job), interval=PROMO_INTERVAL_MIN * 60, first=60)
     return app

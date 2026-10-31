@@ -163,3 +163,14 @@ MADE-TO-ORDER OTP FLOW (NEW)
 5. After the customer has used the OTP, the seller enters profile and PIN on the website and completes the order. Status becomes completed; the reseller bot polls the order and sends `profile` and `pin` to that same customer.
 
 Order statuses for this flow: processing, otp_requested, otp_ready, completed. Use order ID plus your own customer mapping so data never goes to a different customer. API keys must remain private. OTP/PIN are sensitive; do not log them or store them in public channels. The website retains them in the shop database for the order record; remove the order record when no longer needed if your retention requirements call for it.
+
+
+FAMPAY AUTO-APPROVE FOR UPI TOP-UPS (new: fampay_verify.py + fampay_job in bot.py)
+- Uses your Gmail (IMAP) to read the FamPay "money received" e-mails. Main shop only; sellers are not affected.
+- Variables (OFF unless all three are set):
+    FAMPAY_GMAIL, FAMPAY_APP_PASSWORD (Google App Password), FAMPAY_ALLOWED_SENDERS (domain in the From address
+    of a real FamPay e-mail, e.g. abc.com). Optional FAMPAY_REQUIRE_DKIM=1 (keep it on).
+- The UPI ID you show customers (admin site -> UPI setup) must be the FamPay account whose e-mails land in that Gmail.
+- A deposit is auto-approved only if: sender domain allowed + Gmail DKIM pass + it is a credit + exact INR amount
+  + the customer's UTR is in the e-mail + e-mail is newer than the request. Otherwise it stays in manual review.
+- Safe to run: nothing is ever auto-rejected, and a UTR can be used only once.
