@@ -4,6 +4,7 @@ import logging
 import io
 import os
 import re
+import time
 import zlib
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime, timedelta, timezone
@@ -20,6 +21,7 @@ from telegram.ext import (
 
 import fampay_verify
 import provider
+import textedit
 import reseller_api
 import tenancy
 from binance_pay import public_url
@@ -159,13 +161,13 @@ TEXT = {
         "wallet": "💳 <b>Wallet</b>\n\n💰 Balance: <b>${bal}</b> (₹{inr})\n💱 Rate: 1 USDT = ₹{rate}\n<i>Top-up limits: ${min} — ${max}</i>\n\nPick a method ⬇️",
         "btn_upi": "🏦 UPI (30 min)",
         "ask_amount_upi": "🏦 <b>UPI · INR</b>\n\nSend the amount to add in USDT (${min} — ${max}).\n💱 Rate: 1 USDT = ₹{rate}",
-        "upi_created": "🏦 <b>Pay by UPI</b>\n\n🧾 ID: <code>{id}</code>\n💰 You'll receive: <b>${credit}</b>\n💵 Pay: <b>₹{inr}</b> (₹{rate} per USDT)\n\n📲 UPI ID:\n<code>{upi}</code>\n\n1️⃣ Pay exactly <b>₹{inr}</b>\n2️⃣ Tap <b>I've paid</b> and send the 12-digit <b>UTR</b>\n\n⏳ Admin checks it manually — up to <b>30 min</b>. Send the UTR within {minutes} min.",
+        "upi_created": "🏦 <b>Pay by UPI</b>\n\n🧾 ID: <code>{id}</code>\n💰 You'll receive: <b>${credit}</b>\n💵 Pay: <b>₹{inr}</b> (₹{rate} per USDT)\n\n📲 UPI ID:\n<code>{upi}</code>\n\n1️⃣ Pay exactly <b>₹{inr}</b>\n2️⃣ Tap <b>I've paid</b> and send the 12-digit <b>UTR</b>\n\n⏳ Usually approved within a minute. If it takes longer, an admin checks it — up to <b>30 min</b>. Send the UTR within {minutes} min.",
         "btn_upi_paid": "✅ I've paid — send UTR",
         "utr_ask": "🔢 Send the <b>12-digit UTR</b> (UPI reference number) of your payment of <b>₹{inr}</b>:",
         "utr_invalid": "UTR must be exactly 12 digits. Check your UPI app and send it again.",
         "utr_dup": "⚠️ This UTR was already submitted. If you think this is a mistake, open a Support ticket.",
         "utr_closed": "⌛ This UPI request is closed. Open Add Funds to start again.",
-        "utr_sent": "✅ <b>UTR received</b>\n\n🧾 ID: <code>{id}</code>\n🔢 UTR: <code>{utr}</code>\n💵 ₹{inr} → ${credit}\n\n⏳ Admin is verifying. Your balance is added within <b>30 min</b> — we'll message you here.",
+        "utr_sent": "✅ <b>UTR received</b>\n\n🧾 ID: <code>{id}</code>\n🔢 UTR: <code>{utr}</code>\n💵 ₹{inr} → ${credit}\n\n⏳ We're verifying it. Usually your balance is added within a minute (at most <b>30 min</b>) — we'll message you here.",
         "upi_rejected": "❌ <b>UPI payment not verified</b>\n\n🧾 <code>{id}</code>\n🔢 UTR: <code>{utr}</code>\n\nIf you did pay, open Support and send a screenshot.",
         "upi_none": "UPI is not available right now. Please use Crypto.",
         "btn_bpay": "Binance Pay",
@@ -300,11 +302,41 @@ TEXT = {
 LANG_NAMES = {"en": "English", "zh": "中文", "es": "Español"}
 
 
+_TXT_CACHE = {}          # tenant id -> (loaded_at, {"lang:key": custom text})
+
+
+def _text_overrides() -> dict:
+    """Custom texts the owner saved with /texts (cached 30 s; /texts clears the cache on every change)."""
+    try:
+        tid = tenancy.cur().id
+        c = _TXT_CACHE.get(tid)
+        now = time.time()
+        if c is None or now - c[0] > 30:
+            conn = db.conn()
+            try:
+                rows = conn.execute("SELECT key, value FROM settings WHERE key LIKE 'txt:%'").fetchall()
+            finally:
+                conn.close()
+            c = (now, {r[0][4:]: r[1] for r in rows})
+            _TXT_CACHE[tid] = c
+        return c[1]
+    except Exception:
+        return {}
+
+
 def tt(language: str, key: str, /, **kw) -> str:
-    s = TEXT.get(language, {}).get(key)
-    if s is None:
-        s = TEXT["en"][key]
-    return s.format(**kw) if kw else s
+    ov = _text_overrides()
+    # order: custom text of this language, built-in of this language, custom English, built-in English
+    for custom, s in ((True, ov.get(f"{language}:{key}")), (False, TEXT.get(language, {}).get(key)),
+                      (True, ov.get(f"en:{key}")), (False, TEXT["en"].get(key))):
+        if s is None:
+            continue
+        try:
+            return s.format(**kw) if kw else s
+        except Exception:
+            if not custom:
+                raise                     # a built-in text must format; a broken custom text is just skipped
+    raise KeyError(key)
 
 
 BUTTON_ICONS = os.getenv("BUTTON_ICONS", "1") != "0"   # premium emoji inside buttons (needs Telegram Premium on the bot owner)
@@ -2088,6 +2120,9 @@ async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if kind == "emojiall":
         await emojiall_text(update, context, st)
         return
+    if kind == "txtedit":
+        await texts_edit_input(update, context, st)
+        return
 
     if kind == "qty":
         try:
@@ -2294,6 +2329,8 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/setref <percent>\n"
         "/setrate <inr per USDT>\n"
         "/paymentcenter\n"
+        "/texts [word] - edit ANY bot message (deposit, welcome, warranty...)\n"
+        "/maintenance on|off, /fampay\n"
         "/apiproducts [supplier_id] - supplier catalogs (keys, cost, stock)\n"
         "/linkapi <product_id> <supplier_id> <provider_key>\n"
         "/unlinkapi <product_id> [supplier_id]\n"
@@ -2804,6 +2841,177 @@ async def maintenance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 _fampay_logged = {}
 
 
+# ---------------------------------------------------------------- /texts : edit every message from the bot
+_TX_KEYS = sorted(TEXT["en"])
+_TX_LANGS = (("en", "🇬🇧 EN"), ("zh", "🇨🇳 中文"), ("es", "🇪🇸 ES"))
+
+
+def _tx_default(lg: str, key: str) -> str:
+    return TEXT.get(lg, {}).get(key) or TEXT["en"][key]
+
+
+def _tx_current(lg: str, key: str):
+    """(text, is_custom)"""
+    custom = _text_overrides().get(f"{lg}:{key}")
+    return (custom, True) if custom is not None else (_tx_default(lg, key), False)
+
+
+def _tx_list_view(lg: str, page: int, q: str):
+    keys = [k for k in _TX_KEYS if textedit.match(k, TEXT["en"][k], q)]
+    pages = max(1, -(-len(keys) // textedit.PAGE_SIZE))
+    page = min(max(page, 0), pages - 1)
+    chunk = keys[page * textedit.PAGE_SIZE:(page + 1) * textedit.PAGE_SIZE]
+    ov = _text_overrides()
+    rows = [[_Btn(("✏️ " if f"{lg}:{k}" in ov else "") + textedit.label(k)[:48],
+                  callback_data=f"tx:K:{lg}:{_TX_KEYS.index(k)}")] for k in chunk]
+    nav = []
+    if page > 0:
+        nav.append(_Btn("⬅️", callback_data=f"tx:L:{lg}:{page - 1}"))
+    nav.append(_Btn(f"{page + 1}/{pages}", callback_data=f"tx:L:{lg}:{page}"))
+    if page < pages - 1:
+        nav.append(_Btn("➡️", callback_data=f"tx:L:{lg}:{page + 1}"))
+    rows.append(nav)
+    rows.append([_Btn(("• " if c == lg else "") + n, callback_data=f"tx:L:{c}:0") for c, n in _TX_LANGS])
+    rows.append([_Btn("✖️ Close", callback_data="tx:X")])
+    head = (f"✏️ <b>Edit bot messages</b> — language: <b>{lg.upper()}</b>\n"
+            f"{len(keys)} messages" + (f" matching “{esc(q)}”" if q else "") + ". ✏️ = you changed it.\n"
+            "Tip: <code>/texts deposit</code> searches.")
+    return head, Markup(rows)
+
+
+def _tx_key_view(lg: str, idx: int):
+    key = _TX_KEYS[idx]
+    cur, custom = _tx_current(lg, key)
+    fields = textedit.fields_of(_tx_default("en", key))
+    shown = cur if len(cur) <= 2500 else cur[:2500] + "\n… (shortened here, the full text is used)"
+    text = (f"✏️ <b>{esc(textedit.label(key))}</b> · <code>{esc(key)}</code> · {lg.upper()}"
+            f"{' · <b>custom</b>' if custom else ' · built-in'}\n\n"
+            f"<pre>{esc(shown)}</pre>\n"
+            + ("Placeholders (keep them, the bot fills them in): " + " ".join(f"<code>{{{esc(f)}}}</code>" for f in fields)
+               if fields else "No placeholders in this message.") +
+            ("\nThis is a button caption: plain text only." if textedit.is_plain(key) else ""))
+    rows = [[_Btn("✏️ Edit", callback_data=f"tx:E:{lg}:{idx}"), _Btn("👁 Preview", callback_data=f"tx:P:{lg}:{idx}")]]
+    if custom:
+        rows.append([_Btn("♻️ Reset to built-in", callback_data=f"tx:R:{lg}:{idx}")])
+    rows.append([_Btn("⬅️ Back to list", callback_data=f"tx:L:{lg}:0")])
+    return text, Markup(rows)
+
+
+async def texts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner only: /texts [search word] - edit any message the bot sends."""
+    if not is_owner(update.effective_user.id):
+        return
+    q = " ".join(context.args or []).strip()
+    context.user_data["tx_q"] = q
+    text, kb = _tx_list_view("en", 0, q)
+    await update.message.reply_text(text, reply_markup=kb, parse_mode=HTML)
+
+
+async def texts_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not is_owner(q.from_user.id):
+        await q.answer("Owner only.", show_alert=True)
+        return
+    parts = (q.data or "").split(":")
+    act = parts[1] if len(parts) > 1 else ""
+    try:
+        if act == "X":
+            clear_await(context)
+            await q.answer()
+            await q.message.delete()
+            return
+        lg = parts[2] if len(parts) > 2 and parts[2] in dict(_TX_LANGS) else "en"
+        if act == "L":
+            page = int(parts[3]) if len(parts) > 3 else 0
+            text, kb = _tx_list_view(lg, page, context.user_data.get("tx_q", ""))
+        else:
+            idx = int(parts[3])
+            key = _TX_KEYS[idx]
+            if act == "K":
+                clear_await(context)
+                text, kb = _tx_key_view(lg, idx)
+            elif act == "R":
+                db.del_settings([f"txt:{lg}:{key}"])
+                _TXT_CACHE.pop(tenancy.cur().id, None)
+                await q.answer("Reset to the built-in text.")
+                text, kb = _tx_key_view(lg, idx)
+            elif act == "P":
+                cur, _ = _tx_current(lg, key)
+                shown = textedit.render(cur, _tx_default("en", key))
+                await q.answer()
+                try:
+                    await q.message.reply_text("👁 <b>Preview</b>\n\n" + shown if not textedit.is_plain(key)
+                                               else "👁 Preview:\n\n" + shown,
+                                               parse_mode=None if textedit.is_plain(key) else HTML)
+                except Exception as e:
+                    await q.message.reply_text(f"❌ Telegram cannot show this text: {e}")
+                return
+            elif act == "E":
+                context.user_data["await"] = {"type": "txtedit", "lang": lg, "key": key}
+                fields = textedit.fields_of(_tx_default("en", key))
+                await q.answer()
+                await q.message.reply_text(
+                    f"✏️ Send the <b>new text</b> for <b>{esc(textedit.label(key))}</b> ({lg.upper()}).\n\n"
+                    + ("Keep these placeholders where the bot should fill values: "
+                       + " ".join(f"<code>{{{esc(f)}}}</code>" for f in fields) + "\n\n" if fields else "")
+                    + ("Plain text only (it is a button caption).\n\n" if textedit.is_plain(key) else
+                       "You can use Telegram bold/italic, or tags like <code>&lt;b&gt;bold&lt;/b&gt;</code>, "
+                       "<code>&lt;i&gt;</code>, <code>&lt;code&gt;</code>.\n\n")
+                    + "Send <code>cancel</code> to stop.", parse_mode=HTML,
+                    reply_markup=Markup([[_Btn("❌ Cancel", callback_data=f"tx:K:{lg}:{idx}")]]))
+                return
+            else:
+                await q.answer()
+                return
+        await q.answer()
+        await q.edit_message_text(text, reply_markup=kb, parse_mode=HTML)
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            log.exception("texts_callback")
+        await q.answer()
+    except Exception:
+        log.exception("texts_callback")
+        await q.answer("Something went wrong.", show_alert=True)
+
+
+async def texts_edit_input(update: Update, context: ContextTypes.DEFAULT_TYPE, st):
+    """The owner sent the new text for a message (called from text_msg)."""
+    msg = update.message
+    if not is_owner(update.effective_user.id):
+        clear_await(context)
+        return
+    raw = msg.text or ""
+    if raw.strip().lower() in ("cancel", "stop"):
+        clear_await(context)
+        await msg.reply_text("Cancelled. Nothing was changed.")
+        return
+    lg, key = st["lang"], st["key"]
+    styled = {"bold", "italic", "underline", "strikethrough", "code", "pre", "text_link", "spoiler",
+              "blockquote", "custom_emoji"}
+    has_style = any(e.type in styled for e in (msg.entities or []))
+    new = (msg.text_html if has_style and not textedit.is_plain(key) else raw).strip()
+    err = textedit.validate(key, new, _tx_default("en", key))
+    if err:
+        await msg.reply_text(f"❌ Not saved: {err}\n\nSend the corrected text, or send cancel.")
+        return
+    shown = textedit.render(new, _tx_default("en", key))
+    try:                                   # Telegram itself must accept it before we save
+        await msg.reply_text(("👁 <b>Preview</b>\n\n" + shown) if not textedit.is_plain(key)
+                             else "👁 Preview:\n\n" + shown,
+                             parse_mode=None if textedit.is_plain(key) else HTML)
+    except Exception as e:
+        await msg.reply_text(f"❌ Telegram rejected this text, so it was not saved:\n{e}\n\n"
+                             "Send the corrected text, or send cancel.")
+        return
+    db.set_setting(f"txt:{lg}:{key}", new)
+    _TXT_CACHE.pop(tenancy.cur().id, None)
+    clear_await(context)
+    idx = _TX_KEYS.index(key)
+    await msg.reply_text("✅ Saved. Customers see it from now on.",
+                         reply_markup=Markup([[_Btn("♻️ Reset", callback_data=f"tx:R:{lg}:{idx}"),
+                                               _Btn("⬅️ Messages", callback_data=f"tx:L:{lg}:0")]]))
+
+
 async def fampay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Owner only: /fampay - checks the FamPay setup and says why a waiting UPI deposit is not auto-approved."""
     if not is_owner(update.effective_user.id):
@@ -2891,6 +3099,7 @@ def build_application(tenant):
     app.add_handler(CommandHandler("backup", backup_cmd))
     app.add_handler(CommandHandler("maintenance", maintenance_cmd))
     app.add_handler(CommandHandler("fampay", fampay_cmd))
+    app.add_handler(CommandHandler("texts", texts_cmd))
     app.add_handler(CommandHandler("restore", restore_cmd))
     app.add_handler(CommandHandler("cancelrestore", cancel_restore))
     app.add_handler(MessageHandler(filters.Document.ALL, restore_doc))
@@ -2898,6 +3107,7 @@ def build_application(tenant):
     app.add_handler(CommandHandler("linkapi", linkapi))
     app.add_handler(CommandHandler("unlinkapi", unlinkapi))
     app.add_handler(CommandHandler("apibalance", apibalance))
+    app.add_handler(CallbackQueryHandler(texts_callback, pattern=r"^tx:"))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.Regex(MENU_RE), menu_text))
     app.add_handler(MessageHandler(filters.PHOTO, photo_msg))
