@@ -89,15 +89,18 @@ def _dkim_ok(msg) -> bool:
 
 
 def _text(msg) -> str:
+    """Subject + every text/plain and text/html part (emails often hold the real details only in the HTML part)."""
     out = [str(msg.get("Subject") or "")]
-    part = msg.get_body(preferencelist=("plain", "html"))
-    if part is not None:
+    for part in msg.walk():
+        ctype = part.get_content_type()
+        if ctype not in ("text/plain", "text/html"):
+            continue
         try:
             body = part.get_content()
         except Exception:
-            body = ""
-        if part.get_content_type() == "text/html":
-            body = _html.unescape(re.sub(r"<[^>]+>", " ", body))
+            continue
+        if ctype == "text/html":
+            body = _html.unescape(re.sub(r"<[^>]+>", " ", re.sub(r"(?is)<(script|style).*?</\1>", " ", body)))
         out.append(body)
     return "\n".join(out)
 
@@ -108,9 +111,10 @@ def evaluate(msg, inr_amount, utr: str, created_at: datetime, now: datetime = No
     addr = (msg.get("From") or "")
     m = re.search(r"@([A-Za-z0-9.\-]+)", addr)
     if not m or not _domain_ok(m.group(1)):
-        return False, "sender not allowed"
+        return False, f"sender domain '{m.group(1) if m else addr[:40]}' is not in FAMPAY_ALLOWED_SENDERS"
     if REQUIRE_DKIM and not _dkim_ok(msg):
-        return False, "dkim not verified"
+        top = re.sub(r"\s+", " ", str((msg.get_all("Authentication-Results") or ["(none)"])[0]))[:180]
+        return False, f"gmail dkim check failed for allowed domain. Header: {top}"
     try:
         sent = parsedate_to_datetime(str(msg.get("Date")))
         if sent.tzinfo is None:
@@ -118,13 +122,13 @@ def evaluate(msg, inr_amount, utr: str, created_at: datetime, now: datetime = No
     except Exception:
         return False, "no date"
     if sent < created_at - timedelta(minutes=5) or sent > now + timedelta(minutes=5):
-        return False, "email time outside request window"
+        return False, f"email time {sent.isoformat()} outside request window"
     text = _text(msg).lower()
     if "debited" in text or not any(w in text for w in ("received", "credited")):
         return False, "not a credit"
     want = _paise(inr_amount)
     if want is None or want not in _amounts(text):
-        return False, "amount differs"
+        return False, f"amount differs (email has {[a/100 for a in _amounts(text)][:4]}, wanted {want/100})"
     if utr not in text:
         return False, "utr not in email"
     return True, "ok"
@@ -181,3 +185,26 @@ def verify_pending(rows):
         except Exception:
             pass
     return results
+
+
+def status_lines(rows):
+    """Text lines for the owner command /fampay (never prints secrets)."""
+    miss = [n for n, v in (("FAMPAY_GMAIL", GMAIL), ("FAMPAY_APP_PASSWORD", APP_PASSWORD),
+                           ("FAMPAY_ALLOWED_SENDERS", ALLOWED)) if not v]
+    if miss:
+        return ["❌ Missing Railway variables: " + ", ".join(miss)]
+    lines = [f"Allowed sender domains: {', '.join(ALLOWED)}", f"DKIM required: {REQUIRE_DKIM}"]
+    try:
+        c = imaplib.IMAP4_SSL("imap.gmail.com", 993, ssl_context=ssl.create_default_context())
+        c.login(GMAIL if "@" in GMAIL else GMAIL + "@gmail.com", APP_PASSWORD)
+        c.select("INBOX", readonly=True)
+        c.logout()
+        lines.append("✅ Gmail login OK")
+    except Exception as e:
+        lines.append(f"❌ Gmail login FAILED: {str(e)[:150]}")
+        return lines
+    if not rows:
+        lines.append("No UPI deposit is waiting with a UTR right now.")
+    for dep_id, ok, why in verify_pending(rows):
+        lines.append(f"{'✅' if ok else '⏳'} {dep_id}: {why}")
+    return lines

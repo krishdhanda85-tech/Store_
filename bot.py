@@ -2801,6 +2801,18 @@ async def maintenance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Owner and admins can still use the bot; payments keep being checked.", parse_mode=HTML)
 
 
+_fampay_logged = {}
+
+
+async def fampay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner only: /fampay - checks the FamPay setup and says why a waiting UPI deposit is not auto-approved."""
+    if not is_owner(update.effective_user.id) or not tenancy.cur().is_main:
+        return
+    rows = [d for d in db.upi_payments(status="upi_review", limit=10) if d["utr"]]
+    lines = await asyncio.to_thread(fampay_verify.status_lines, rows)
+    await update.message.reply_text("🔎 <b>FamPay check</b>\n\n" + "\n".join(esc(x) for x in lines)[:3800], parse_mode=HTML)
+
+
 async def fampay_job(context: ContextTypes.DEFAULT_TYPE):
     """Every 45 s: UPI top-ups that already have a UTR are checked against the FamPay e-mails in Gmail.
     A strong match is approved automatically; everything else stays for manual review on the admin site."""
@@ -2812,6 +2824,9 @@ async def fampay_job(context: ContextTypes.DEFAULT_TYPE):
     results = await asyncio.to_thread(fampay_verify.verify_pending, rows)
     for dep_id, ok, why in results:
         if not ok:
+            if _fampay_logged.get(dep_id) != why:          # log each reason once, not every 45 s
+                _fampay_logged[dep_id] = why
+                log.info("FamPay %s not auto-approved: %s", dep_id, why)
             continue
         d = db.approve_upi(dep_id, "fampay-auto")
         if not d:
@@ -2866,6 +2881,7 @@ def build_application(tenant):
     app.add_handler(CommandHandler("apitest", apitest))
     app.add_handler(CommandHandler("backup", backup_cmd))
     app.add_handler(CommandHandler("maintenance", maintenance_cmd))
+    app.add_handler(CommandHandler("fampay", fampay_cmd))
     app.add_handler(CommandHandler("restore", restore_cmd))
     app.add_handler(CommandHandler("cancelrestore", cancel_restore))
     app.add_handler(MessageHandler(filters.Document.ALL, restore_doc))
