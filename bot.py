@@ -1376,6 +1376,7 @@ async def announce_sale(bot, product_name: str, quantity: int, order_id: str, so
 
 async def send_start_screen(message, user, context):
     created = db.ensure_user(user.id, user.username)
+    db.set_first_name(user.id, user.first_name)
     language = db.get_user_language(user.id)
     if not language:
         await message.reply_text(tt("en", "welcome", shop=esc(shop_name())), reply_markup=kb_lang(), parse_mode=HTML)
@@ -1400,6 +1401,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(prompt, reply_markup=join_channel_markup(), parse_mode=HTML)
         return
     created = db.ensure_user(u.id, u.username)
+    db.set_first_name(u.id, u.first_name)
     if created and context.args and context.args[0].startswith("ref_"):
         referrer = db.user_by_ref_code(context.args[0][4:])
         if referrer:
@@ -1450,6 +1452,7 @@ async def menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(closed_text(), parse_mode=HTML)
         return
     db.touch_username(update.effective_user.id, update.effective_user.username)
+    db.set_first_name(update.effective_user.id, update.effective_user.first_name)
     await show_menu(update, context, MENU_BY_LABEL[update.message.text])
 
 
@@ -2067,6 +2070,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer()
         return
     db.touch_username(q.from_user.id, q.from_user.username)
+    db.set_first_name(q.from_user.id, q.from_user.first_name)
     await handler(update, context, arg)
 
 
@@ -2430,7 +2434,18 @@ async def outbox_job(context: ContextTypes.DEFAULT_TYPE):
     """Deliver messages queued by the admin site. Each message is claimed first, so it is sent only once."""
     for m in db.outbox_claim():
         try:
-            await context.bot.send_message(m["user_id"], m["text"], parse_mode=HTML, disable_web_page_preview=True)
+            ks = m.keys()
+            pid = m["product_id"] if "product_id" in ks else None
+            pcode = m["promo_code"] if "promo_code" in ks else None
+            lg = _pick_lang(m["lang"] if "lang" in ks else "en")
+            rows = []
+            if pcode:
+                rows.append([Btn(_t("btn_claim", lg), callback_data=f"pmx:{pcode}", style="primary")])
+            if pid:
+                rows.append([Btn(_t("btn_buy", lg), callback_data=f"prod:{pid}", style="success")])
+            markup = Markup(rows) if rows else None
+            await context.bot.send_message(m["user_id"], m["text"], parse_mode=HTML,
+                                           disable_web_page_preview=True, reply_markup=markup)
         except Exception:
             log.exception("outbox message %s could not be sent", m["id"])
             db.outbox_failed(m["id"])
@@ -2854,12 +2869,30 @@ PROMO_ADS = os.getenv("PROMO_ADS", "1") != "0"
 PROMO_INTERVAL_MIN = max(1, int(os.getenv("PROMO_INTERVAL_MIN", "5") or 5))
 PROMO_TAGLINES = (
     "🔥 <b>Deal alert!</b>",
-    "⚡ <b>Instant delivery available</b>",
     "💎 <b>Featured product</b>",
     "🛍 <b>Check this out</b>",
-    "✅ <b>Available now</b>",
     "🎯 <b>Today's pick</b>",
+    "⭐ <b>Customer favourite</b>",
 )
+# Used for personal messages when Gemini is unavailable. Never claims anything about delivery/stock/price.
+_SMART_TAGLINES = {
+    "renew": "<b>Keep your subscription going</b>\n<i>Renew in a few taps and stay covered.</i>",
+    "pricedrop": "<b>Good news: the price just dropped</b>\n<i>A product you already know is cheaper right now.</i>",
+    "crosssell": "<b>You might like this one</b>\n<i>A popular pick among customers with similar taste.</i>",
+    "loyal": "<b>Thank you for being with us</b>\n<i>Here is your favourite again, whenever you need it.</i>",
+    "winback": "<b>We missed you</b>\n<i>Your favourite is still here whenever you are ready.</i>",
+    "newcomer": "<b>Today's pick for you</b>",
+}
+
+
+def _clean_name(name, limit=38):
+    """Short, readable product name for sentences: drops a leading 'Buy', bracketed extras, long tails."""
+    n = re.sub(r"\([^)]*\)|\[[^\]]*\]", "", str(name or ""))
+    n = re.sub(r"^\s*buy\s+", "", n, flags=re.I)
+    n = " ".join(n.split()).strip(" -:·,")
+    if len(n) > limit:
+        n = n[:limit].rsplit(" ", 1)[0].rstrip(" -:·,") + "…"
+    return n or "this product"
 
 
 async def promo_job(context: ContextTypes.DEFAULT_TYPE):
@@ -2912,14 +2945,14 @@ PROMO_DM_SMART = os.getenv("PROMO_DM_SMART", "1") != "0"           # analyse pur
 PROMO_DM_PERSONAL = os.getenv("PROMO_DM_PERSONAL", "1") != "0"      # each buyer gets a message about what THEY bought
 
 
-def _dm_body(p, head, top="", fact="", balance=0.0):
+def _dm_body(p, head, top="", fact="", balance=0.0, cta=True):
     """Message layout with REAL data only: top line, AI hook, one fact line, card, wallet, call to action."""
     price = float(p["price"])
     pct = discount_pct(p["old_price"], price)
     lines = ([top] if top else []) + [head]
     if fact:
         lines += ["", fact]
-    lines += ["", "━━━━━━━━━━━━", card_name_html(p)]
+    lines += ["", "┈┈┈┈┈┈┈┈┈┈┈┈", card_name_html(p)]
     if pct:
         lines.append(f"💰 <s>${money(p['old_price'])}</s> → <b>${money(price)}</b>  (🔻{pct}% OFF)")
     else:
@@ -2927,10 +2960,11 @@ def _dm_body(p, head, top="", fact="", balance=0.0):
     if not is_manual(p):
         lines.append(f"📦 In stock: <b>{p['stock']}</b>")
     lines += _promo_extra_lines(p)
-    lines.append("━━━━━━━━━━━━")
+    lines.append("┈┈┈┈┈┈┈┈┈┈┈┈")
     if balance and balance >= 0.5:
-        lines.append(f"💳 Wallet balance: <b>${money(balance)}</b> — ready to use")
-    lines += ["", "👇 Open the menu and tap <b>Products</b> to order"]
+        lines.append(f"💳 You have <b>${money(balance)}</b> in your wallet")
+    if cta:
+        lines += ["", "👇 Open the menu and tap <b>Products</b> to order"]
     return "\n".join(lines)
 
 
@@ -2942,68 +2976,271 @@ def _promo_dm_text(p, reason, welcome=False):
     return _dm_body(p, head, top="👋 <b>Welcome back!</b>" if welcome else "")
 
 
-# smart reason -> (Gemini angle, top line)
-_SMART_TOP = {
-    "renew": ("renew_due", "⏰ <b>Time to renew?</b>"),
-    "pricedrop": ("pricedrop", "📉 <b>Price drop!</b>"),
-    "crosssell": ("crosssell", "🤝 <b>Picked for you</b>"),
-    "loyal": ("loyal", "🏆 <b>Thank you for being a loyal customer</b>"),
-    "winback": ("winback", "💌 <b>We missed you!</b>"),
+# ---------------------------------------------------------------- smart personal messages (3 languages)
+_SMART_ANGLE = {"renew": "renew_due", "pricedrop": "pricedrop", "crosssell": "crosssell",
+                "loyal": "loyal", "winback": "winback"}
+_DIV = "┈┈┈┈┈┈┈┈┈┈┈┈"
+_SM = {
+    # headline without / with the customer's first name ({n})
+    "top_renew": {"en": ("⏰ <b>Time to renew?</b>", "⏰ <b>{n}, time to renew?</b>"),
+                  "zh": ("⏰ <b>该续费了吗？</b>", "⏰ <b>{n}，该续费了吗？</b>"),
+                  "es": ("⏰ <b>¿Hora de renovar?</b>", "⏰ <b>{n}, ¿hora de renovar?</b>")},
+    "top_pricedrop": {"en": ("📉 <b>Price drop!</b>", "📉 <b>{n}, price drop!</b>"),
+                      "zh": ("📉 <b>降价啦！</b>", "📉 <b>{n}，降价啦！</b>"),
+                      "es": ("📉 <b>¡Bajó el precio!</b>", "📉 <b>{n}, ¡bajó el precio!</b>")},
+    "top_crosssell": {"en": ("🤝 <b>Picked for you</b>", "🤝 <b>{n}, picked for you</b>"),
+                      "zh": ("🤝 <b>为你精选</b>", "🤝 <b>{n}，为你精选</b>"),
+                      "es": ("🤝 <b>Elegido para ti</b>", "🤝 <b>{n}, elegido para ti</b>")},
+    "top_loyal": {"en": ("🏆 <b>Thank you for being a loyal customer</b>", "🏆 <b>{n}, thank you for being a loyal customer</b>"),
+                  "zh": ("🏆 <b>感谢您一直以来的支持</b>", "🏆 <b>{n}，感谢您一直以来的支持</b>"),
+                  "es": ("🏆 <b>Gracias por ser un cliente fiel</b>", "🏆 <b>{n}, gracias por ser un cliente fiel</b>")},
+    "top_winback": {"en": ("💌 <b>We missed you!</b>", "💌 <b>{n}, we missed you!</b>"),
+                    "zh": ("💌 <b>好久不见，我们想你了！</b>", "💌 <b>{n}，好久不见，我们想你了！</b>"),
+                    "es": ("💌 <b>¡Te extrañamos!</b>", "💌 <b>{n}, ¡te extrañamos!</b>")},
+    "top_newcomer": {"en": ("", "👋 <b>Hi {n}!</b>"), "zh": ("", "👋 <b>你好，{n}！</b>"), "es": ("", "👋 <b>¡Hola, {n}!</b>")},
+    # one factual line from the customer's real history
+    "f_renew": {"en": "🧾 Your last order was <b>{d} days ago</b>", "zh": "🧾 您上次下单是在 <b>{d} 天前</b>",
+                "es": "🧾 Tu último pedido fue hace <b>{d} días</b>"},
+    "f_renew_t": {"en": " · you've ordered this <b>{t}×</b>", "zh": " · 您已购买 <b>{t} 次</b>", "es": " · lo has pedido <b>{t}×</b>"},
+    "f_pricedrop": {"en": "📉 You bought this before, and it is cheaper right now", "zh": "📉 您以前买过它，现在更便宜了",
+                    "es": "📉 Ya lo compraste antes y ahora está más barato"},
+    "f_cross_n": {"en": "🤝 <b>{n}</b> customers who bought {p} also picked this", "zh": "🤝 购买过 {p} 的 <b>{n}</b> 位客户也选了它",
+                  "es": "🤝 <b>{n}</b> clientes que compraron {p} también eligieron esto"},
+    "f_cross": {"en": "🤝 A popular pick among {p} buyers", "zh": "🤝 {p} 的买家都很喜欢", "es": "🤝 Muy elegido entre quienes compraron {p}"},
+    "f_loyal": {"en": "🧾 You've placed <b>{o}</b> orders with us. Thank you!", "zh": "🧾 您已在我们这里下了 <b>{o}</b> 单，谢谢！",
+                "es": "🧾 Has hecho <b>{o}</b> pedidos con nosotros, ¡gracias!"},
+    "f_winback": {"en": "🧾 It's been <b>{d} days</b> since your last order", "zh": "🧾 距离您上次下单已过去 <b>{d} 天</b>",
+                  "es": "🧾 Han pasado <b>{d} días</b> desde tu último pedido"},
+    # product card labels
+    "price": {"en": "Price", "zh": "价格", "es": "Precio"}, "stock": {"en": "In stock", "zh": "库存", "es": "En stock"},
+    "delivery": {"en": "Delivery", "zh": "发货", "es": "Entrega"}, "warranty": {"en": "Warranty", "zh": "质保", "es": "Garantía"},
+    "wallet": {"en": "💳 You have <b>${a}</b> in your wallet", "zh": "💳 您的钱包余额：<b>${a}</b>", "es": "💳 Tienes <b>${a}</b> en tu billetera"},
+    "flash": {"en": "⏳ Flash deal ends in <b>{t}</b>", "zh": "⏳ 限时特价还剩 <b>{t}</b>", "es": "⏳ La oferta termina en <b>{t}</b>"},
+    "low": {"en": "🔥 Only <b>{n}</b> left", "zh": "🔥 仅剩 <b>{n}</b> 件", "es": "🔥 Solo quedan <b>{n}</b>"},
+    "rating": {"en": "⭐ <b>{a}</b> · {n} reviews", "zh": "⭐ <b>{a}</b> · {n} 条评价", "es": "⭐ <b>{a}</b> · {n} reseñas"},
+    "code": {"en": "🎟 Your personal code: <b>{c}</b> · <b>{p}% off</b>, valid {d} days",
+             "zh": "🎟 您的专属优惠码：<b>{c}</b> · 立减 <b>{p}%</b>，{d} 天内有效",
+             "es": "🎟 Tu código personal: <b>{c}</b> · <b>{p}% de descuento</b>, válido {d} días"},
+    "btn_buy": {"en": "🛒 Buy now", "zh": "🛒 立即购买", "es": "🛒 Comprar ahora"},
+    "btn_claim": {"en": "🎟 Claim my discount", "zh": "🎟 领取我的优惠", "es": "🎟 Obtener mi descuento"},
+    "test": {"en": "🧪 <b>TEST preview</b> (only you got this)", "zh": "🧪 <b>测试预览</b>（只有你收到）", "es": "🧪 <b>Vista previa de prueba</b> (solo tú la recibes)"},
+    # fallback hook when Gemini is unavailable (never claims delivery / stock / price)
+    "tag_renew": {"en": "<b>Keep your subscription going</b>\n<i>Renew in a few taps and stay covered.</i>",
+                  "zh": "<b>让您的订阅继续有效</b>\n<i>几步即可续费，保持无忧。</i>",
+                  "es": "<b>Mantén tu suscripción activa</b>\n<i>Renueva en unos toques y sigue cubierto.</i>"},
+    "tag_pricedrop": {"en": "<b>Good news: the price just dropped</b>\n<i>A product you already know is cheaper right now.</i>",
+                      "zh": "<b>好消息：价格下调了</b>\n<i>您熟悉的商品现在更便宜。</i>",
+                      "es": "<b>Buenas noticias: bajó el precio</b>\n<i>Un producto que ya conoces está más barato.</i>"},
+    "tag_crosssell": {"en": "<b>You might like this one</b>\n<i>A popular pick among customers with similar taste.</i>",
+                      "zh": "<b>您可能会喜欢</b>\n<i>口味相近的客户都喜欢这款。</i>",
+                      "es": "<b>Quizás te guste este</b>\n<i>Una opción popular entre clientes con gustos similares.</i>"},
+    "tag_loyal": {"en": "<b>Thank you for being with us</b>\n<i>Here is your favourite again, whenever you need it.</i>",
+                  "zh": "<b>感谢您一直陪伴我们</b>\n<i>您喜欢的商品，随时可再次购买。</i>",
+                  "es": "<b>Gracias por estar con nosotros</b>\n<i>Aquí tienes tu favorito cuando lo necesites.</i>"},
+    "tag_winback": {"en": "<b>We missed you</b>\n<i>Your favourite is still here whenever you are ready.</i>",
+                    "zh": "<b>我们想念您</b>\n<i>您喜欢的商品一直都在。</i>",
+                    "es": "<b>Te extrañamos</b>\n<i>Tu favorito sigue aquí cuando quieras.</i>"},
+    "tag_newcomer": {"en": "<b>Today's pick for you</b>", "zh": "<b>今日为您推荐</b>", "es": "<b>La selección de hoy para ti</b>"},
 }
 
 
-def _smart_fact(item, by_id):
-    """One factual line from the customer's real history (never invented)."""
-    r, f = item["reason"], item["facts"]
+def _t(key, language, **kw):
+    d = _SM[key]
+    s = d.get(language) or d["en"]
+    return s.format(**kw) if kw else s
+
+
+def _pick_lang(language, use_language=True):
+    return language if use_language and language in ("en", "zh", "es") else "en"
+
+
+def _first_name(name):
+    n = " ".join(str(name or "").split())
+    return n.split(" ")[0][:20] if n else ""
+
+
+def _left(delta):
+    s = max(0, int(delta.total_seconds()))
+    d, h, m = s // 86400, (s % 86400) // 3600, (s % 3600) // 60
+    return f"{d}d {h}h" if d else (f"{h}h {m}m" if h else f"{max(m, 1)}m")
+
+
+def _smart_fact(it, by_id, language):
+    r, f = it["reason"], it["facts"]
     if r == "renew":
-        t = f"🧾 Your last order was <b>{f['days_ago']} days ago</b>"
-        return t + (f" · you've ordered this <b>{f['times']}×</b>" if f.get("times", 1) > 1 else "")
+        t = _t("f_renew", language, d=f["days_ago"])
+        return t + (_t("f_renew_t", language, t=f["times"]) if f.get("times", 1) > 1 else "")
     if r == "pricedrop":
-        return "🧾 You bought this before — it's cheaper right now"
+        return _t("f_pricedrop", language)
     if r == "crosssell":
         src = by_id.get(f.get("from_pid"))
-        if src is not None:
-            return f"🧾 <b>{f['people']}</b> customers who bought {esc(src['name'])} also took this"
-        return ""
+        if src is None:
+            return ""
+        who = f"<b>{esc(_clean_name(src['name']))}</b>"
+        return _t("f_cross_n", language, n=f["people"], p=who) if f["people"] >= 5 else _t("f_cross", language, p=who)
     if r == "loyal":
-        return f"🧾 You've placed <b>{item['orders']}</b> orders with us — thank you!"
+        return _t("f_loyal", language, o=it["orders"])
     if r == "winback":
-        return f"🧾 It's been <b>{f['days_ago']} days</b> since your last order"
+        return _t("f_winback", language, d=f["days_ago"])
     return ""
+
+
+def _smart_text(it, p, by_id, cfg, head, language, code=None, test=False):
+    """The whole personal message. Every number comes from the database."""
+    reason = it["reason"]
+    name = esc(_first_name(it.get("name"))) if cfg["names"] else ""
+    plain, named = _SM["top_" + reason].get(language, _SM["top_" + reason]["en"])
+    top = named.format(n=name) if name else plain
+    lines = ([_t("test", language)] if test else []) + ([top] if top else []) + [head]
+    fact = _smart_fact(it, by_id, language)
+    if fact:
+        lines += ["", fact]
+    lines += ["", _DIV, card_name_html(p)]
+
+    price, old = float(p["price"]), p["old_price"]
+    fl = db.flash_for(p["id"]) if cfg["urgency"] else None
+    if fl and float(fl["price"]) < price:
+        old, price = price, float(fl["price"])
+    pct = discount_pct(old, price)
+    lbl = _t("price", language)
+    lines.append(f"💰 <s>${money(old)}</s> → <b>${money(price)}</b>  (🔻{pct}% OFF)" if pct
+                 else f"💰 {lbl}: <b>${money(price)}</b>")
+    if cfg["reviews"]:
+        avg, n = db.product_rating(p["id"])
+        if n >= 3:
+            lines.append(_t("rating", language, a=f"{avg:g}", n=n))
+    if not is_manual(p):
+        if cfg["urgency"] and 0 < int(p["stock"]) <= LOW_STOCK_THRESHOLD:
+            lines.append(_t("low", language, n=p["stock"]))
+        else:
+            lines.append(f"📦 {_t('stock', language)}: <b>{p['stock']}</b>")
+    if fl and cfg["urgency"]:
+        lines.append(_t("flash", language, t=_left(fl["end"] - datetime.now(timezone.utc))))
+    for icon, key in (("⚡", "delivery"), ("🛡", "warranty")):
+        v = " ".join(str(p[key] or "").split())[:60]
+        if v:
+            lines.append(f"{icon} {_t(key, language)}: {esc(v)}")
+    lines.append(_DIV)
+    if code:
+        lines.append(_t("code", language, c=code[0], p=code[1], d=code[2]))
+    if it.get("balance", 0) >= 0.5:
+        lines.append(_t("wallet", language, a=money(it["balance"])))
+    return "\n".join(lines)
+
+
+def _make_winback_code(cfg):
+    """One-time personal code for a returning customer: (code, percent, days) or None."""
+    import secrets
+    pct = cfg.get("winback_pct", 0)
+    if pct <= 0:
+        return None
+    for _ in range(4):
+        code = "WB" + secrets.token_hex(3).upper()
+        try:
+            db.promo_add(code, "percent", pct, max_uses=1, days=cfg["winback_code_days"])
+            return code, pct, cfg["winback_code_days"]
+        except ValueError:
+            continue
+    return None
+
+
+def _smart_one(it, p, by_id, cfg, hooks, test=False):
+    """-> (text, product_id, promo_code, language). One Gemini call per (angle, product, language)."""
+    language = _pick_lang(it.get("lang"), cfg["language"])
+    reason = it["reason"]
+    angle = _SMART_ANGLE.get(reason, "normal")
+    key = (angle, p["id"], language)
+    if key not in hooks:
+        hooks[key] = agents.write_hook(p["name"], angle, allowed_hook_emojis(), p["description"] or "", language)
+    head = _hook_html(hooks[key]) or _t("tag_" + reason, language)
+    code = _make_winback_code(cfg) if reason == "winback" else None
+    return _smart_text(it, p, by_id, cfg, head, language, code, test), p["id"], (code[0] if code else None), language
 
 
 def _build_promo_dm_smart(products, by_id):
     """Per-customer analysis of paid-order history. Returns (items, label, log_rows) or None."""
-    import random
     import smart_promo
-    ids = db.audience_ids(PROMO_DM_AUDIENCE)
+    from collections import Counter
+    cfg = smart_promo.get_cfg(db)
+    audience = db.get_setting("promo_dm_audience", PROMO_DM_AUDIENCE) or PROMO_DM_AUDIENCE
+    ids = db.audience_ids(audience)
     if not ids:
         return None
     disc = lambda x: discount_pct(x["old_price"], float(x["price"])) or 0
-    picks = smart_promo.analyze(db, ids, products, disc, is_available)
+    picks = smart_promo.analyze(db, ids, products, disc, is_available, cfg=cfg)
     if not picks:
         return None
     gp, greason = agents.manager_pick(products, db.get_setting("promo_dm_pid", ""),
                                       LOW_STOCK_THRESHOLD, disc, is_manual)
-    from collections import Counter
     hooks, items, rows, count = {}, [], [], Counter()
     for it in picks:
-        reason = it["reason"]
-        if reason == "newcomer":
-            p, angle, top = gp, greason, ""
-        else:
-            p = by_id[it["pid"]]
-            angle, top = _SMART_TOP[reason]
-        key = (angle, p["id"])
-        if key not in hooks:                      # ONE Gemini call per (angle, product), not per user
-            hooks[key] = agents.write_hook(p["name"], angle, allowed_hook_emojis(), p["description"] or "")
-        head = _hook_html(hooks[key]) or random.choice(PROMO_TAGLINES)
-        items.append((it["uid"], _dm_body(p, head, top, _smart_fact(it, by_id), it["balance"])))
-        rows.append((it["uid"], p["id"], reason))
-        count[reason] += 1
+        p = gp if it["reason"] == "newcomer" else by_id[it["pid"]]
+        text, pid, code, language = _smart_one(it, p, by_id, cfg, hooks)
+        items.append((it["uid"], text, pid, code, language))
+        rows.append((it["uid"], p["id"], it["reason"]))
+        count[it["reason"]] += 1
     db.set_setting("promo_dm_pid", str(gp["id"]))
     label = "[smart] " + " ".join(f"{k}:{v}" for k, v in count.most_common())
     return items, label, rows
+
+
+async def cb_promo_claim(update, context, arg):
+    """'Claim my discount' button of a personal message: saves the one-time code for this customer."""
+    q = update.callback_query
+    ok, msg, _kind = db.promo_redeem(q.from_user.id, arg)
+    await q.answer()
+    await q.message.reply_text(msg, parse_mode=HTML)
+
+
+CALLBACKS["pmx"] = cb_promo_claim
+
+
+def _build_smart_test(uid, reason):
+    """Preview of one reason for ONE user (admin's test button). Uses a real product; nothing is logged."""
+    import smart_promo
+    cfg = smart_promo.get_cfg(db)
+    products = [p for p in db.list_products() if is_available(p)]
+    if not products:
+        return None
+    by_id = {p["id"]: p for p in db.list_products()}
+    c = db.conn()
+    u = c.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+    c.close()
+    keys = u.keys() if u is not None else []
+    p = products[0]
+    other = products[1] if len(products) > 1 else products[0]
+    facts = {"renew": {"days_ago": 29, "times": 2}, "pricedrop": {"days_ago": 12, "times": 1},
+             "crosssell": {"from_pid": other["id"], "people": 7}, "loyal": {"days_ago": 5, "times": 3},
+             "winback": {"days_ago": 60, "times": 2}, "newcomer": {}}[reason]
+    it = {"uid": uid, "reason": reason, "pid": p["id"], "facts": facts,
+          "balance": float(u["balance"] or 0) if u is not None and "balance" in keys else 0.0,
+          "orders": 3, "name": (u["first_name"] if u is not None and "first_name" in keys else "") or "",
+          "lang": (u["language"] if u is not None and "language" in keys else "") or "en"}
+    text, pid, code, language = _smart_one(it, p, by_id, cfg, {}, test=True)
+    return [(uid, text, pid, code, language)]
+
+
+async def smart_test_job(context: ContextTypes.DEFAULT_TYPE):
+    """Picks up a 'send me a test' request made on the admin website and queues it for that Telegram user."""
+    try:
+        raw = db.get_setting("sp_test_req", "")
+        if not raw:
+            return
+        db.set_setting("sp_test_req", "")
+        import json as _json
+        req = _json.loads(raw)
+        uid, reason = int(req["uid"]), str(req["reason"])
+        if reason not in _SMART_ANGLE and reason != "newcomer":
+            return
+        items = await asyncio.to_thread(_build_smart_test, uid, reason)
+        if not items:
+            db.set_setting("sp_test_res", "No product in stock to build a test message.")
+            return
+        await asyncio.to_thread(db.queue_personal, items, "test", f"[smart-test] {reason} -> {uid}")
+        db.set_setting("sp_test_res", f"Test '{reason}' queued for {uid}. It arrives within a few seconds.")
+    except Exception as e:
+        log.exception("smart test failed")
+        db.set_setting("sp_test_res", "Test failed: " + str(e)[:150])
 
 
 def _build_promo_dm():
@@ -3015,7 +3252,8 @@ def _build_promo_dm():
     by_id = {p["id"]: p for p in products}
     if PROMO_DM_SMART:
         try:
-            return _build_promo_dm_smart(db.list_products(), {p["id"]: p for p in db.list_products()})
+            allp = db.list_products()
+            return _build_promo_dm_smart(allp, {p["id"]: p for p in allp})
         except Exception:
             log.exception("smart promo failed, using the simple promo")
     ids = db.audience_ids(PROMO_DM_AUDIENCE)
@@ -3042,25 +3280,32 @@ def _build_promo_dm():
     return items, f"[promo] {gp['name']} + {len(texts)} personal", []
 
 
+def _promo_dm_on():
+    """Website switch (Smart Promo page) wins over the PROMO_DM variable."""
+    v = str(db.get_setting("promo_dm_on", "") or "")
+    return (v == "1") if v != "" else PROMO_DM
+
+
 async def promo_dm_job(context: ContextTypes.DEFAULT_TYPE):
-    """Every PROMO_DM_EVERY_HOURS (min 6) queue the promo for the users' bot chats. Buyers get a
-    message about the product THEY bought before; everyone else gets the Manager's pick.
-    Uses the same outbox as /broadcast, so sending is paced and blocked users are skipped."""
-    if not PROMO_DM:
+    """Smart mode: every hour, message only the customers who are due AND are at their usual time of day.
+    Simple mode: every PROMO_DM_EVERY_HOURS (min 6). Uses the same outbox as /broadcast, so sending is paced
+    and blocked users are skipped."""
+    if not _promo_dm_on():
         return
     try:
         last = float(db.get_setting("promo_dm_last", "0") or 0)
-        if time.time() - last < PROMO_DM_EVERY_HOURS * 3600:
+        gap = 3300 if PROMO_DM_SMART else PROMO_DM_EVERY_HOURS * 3600
+        if time.time() - last < gap:
             return
         built = await asyncio.to_thread(_build_promo_dm)
+        db.set_setting("promo_dm_last", str(time.time()))
         if not built:
             return
         items, label, log_rows = built
-        n = await asyncio.to_thread(db.queue_personal, items, PROMO_DM_AUDIENCE, label)
+        n = await asyncio.to_thread(db.queue_personal, items, db.get_setting("promo_dm_audience", PROMO_DM_AUDIENCE), label)
         if log_rows:
             import smart_promo
             await asyncio.to_thread(smart_promo.mark_sent, db, log_rows)
-        db.set_setting("promo_dm_last", str(time.time()))
         log.info("Promo DM queued for %s user(s)", n)
     except Exception:
         log.exception("promo DM failed")
@@ -3419,8 +3664,8 @@ def build_application(tenant):
     app.job_queue.run_repeating(_in_shop(lowstock_job), interval=1800, first=120)
     app.job_queue.run_repeating(_in_shop(fampay_job), interval=45, first=30)
     app.add_error_handler(on_error)
-    if PROMO_DM:
-        app.job_queue.run_repeating(_in_shop(promo_dm_job), interval=1800, first=300)
+    app.job_queue.run_repeating(_in_shop(promo_dm_job), interval=1800, first=300)
+    app.job_queue.run_repeating(_in_shop(smart_test_job), interval=10, first=20)
     if PROMO_ADS:
         app.job_queue.run_repeating(_in_shop(promo_job), interval=PROMO_INTERVAL_MIN * 60, first=60)
     return app

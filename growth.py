@@ -72,7 +72,8 @@ CREATE TABLE IF NOT EXISTS broadcasts (
 );
 """
 
-USER_COLUMNS = [("promo_code", "TEXT"), ("cashback_earned", "REAL DEFAULT 0"), ("low_bal_at", "TEXT")]
+USER_COLUMNS = [("promo_code", "TEXT"), ("cashback_earned", "REAL DEFAULT 0"), ("low_bal_at", "TEXT"),
+                ("first_name", "TEXT")]
 ORDER_COLUMNS = [("review_asked", "INTEGER DEFAULT 0")]
 
 AUDIENCES = {
@@ -595,18 +596,42 @@ class GrowthMixin:
         c.commit(); c.close()
         return len(ids)
 
+    def set_first_name(self, user_id, name):
+        """Remember the customer's Telegram first name (for 'Hi Rahul'). Writes only when it changed."""
+        name = " ".join(str(name or "").split())[:40]
+        if not name:
+            return
+        c = self.conn()
+        try:
+            r = c.execute("SELECT first_name FROM users WHERE user_id=?", (user_id,)).fetchone()
+            if r is not None and (r["first_name"] or "") != name:
+                c.execute("UPDATE users SET first_name=? WHERE user_id=?", (name, user_id))
+                c.commit()
+        finally:
+            c.close()
+
     def queue_personal(self, items, audience, label):
-        """items: [(user_id, text)] - each user gets their own text. One line in the broadcast history."""
+        """items: [(user_id, text)] or [(user_id, text, product_id, promo_code, lang)] (extras optional).
+        product_id adds a 'Buy now' button, promo_code a 'Claim' button; lang picks the button language.
+        One line in the broadcast history."""
         if not items:
             return 0
         now = self._now()
         c = self.conn()
-        c.executemany("INSERT INTO outbox(user_id,text,created_at) VALUES(?,?,?)",
-                      [(uid, txt, now) for uid, txt in items])
+        for col, typ in (("product_id", "INTEGER"), ("promo_code", "TEXT"), ("lang", "TEXT")):
+            try:
+                c.execute(f"ALTER TABLE outbox ADD COLUMN {col} {typ}")
+            except Exception:
+                pass                                # column already exists
+        rows = []
+        for it in items:
+            it = tuple(it) + (None,) * (5 - len(it))
+            rows.append((it[0], it[1], now, it[2], it[3], it[4]))
+        c.executemany("INSERT INTO outbox(user_id,text,created_at,product_id,promo_code,lang) VALUES(?,?,?,?,?,?)", rows)
         c.execute("INSERT INTO broadcasts(text,audience,n,created_at) VALUES(?,?,?,?)",
-                  (label, audience, len(items), now))
+                  (label, audience, len(rows), now))
         c.commit(); c.close()
-        return len(items)
+        return len(rows)
 
     def broadcast_history(self, limit=15):
         c = self.conn()
