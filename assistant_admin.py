@@ -37,7 +37,8 @@ Changes here are live in the bot immediately.</p>
 <input name="q" value="{{ q }}" maxlength="300" placeholder="e.g. How long is the Netflix warranty?" required>
 <button type="submit" class="green">Ask</button></form>
 {% if tested %}<div class="sub" style="margin-top:10px;padding:10px;white-space:pre-wrap"><b>🤖 {{ c.name }}</b>
-{{ answer if answer else '→ The assistant would send this to a human (no answer found, or it is about an order/payment).' }}</div>{% endif %}
+{{ answer if answer else '→ No AI answer, the customer would go to a human.' }}
+{% if note %}<span class="failed">Reason: {{ note }}</span>{% endif %}</div>{% endif %}
 </div>
 
 <div class="card"><h3>Recent conversations</h3>
@@ -58,7 +59,7 @@ LABELS = {"answered": "Answered", "solved": "Solved ✅", "human": "Asked for a 
 def home():
     import web
     db = web.db
-    q, answer, tested = "", "", False
+    q, answer, tested, note = "", "", False, ""
     if request.method == "POST":
         f = request.form
         if f.get("action") == "save":
@@ -85,13 +86,16 @@ def home():
                 agents.SUPPORT_DAILY_MAX = c["max"]
                 info = store.shop_info(db, extra=c["extra"])
                 try:
-                    answer = agents.answer_support(q, info) or ""
+                    answer, note = agents.answer_support_ex(q, info)
+                    answer = answer or ""
                 except Exception as e:
-                    flash(str(e)[:200], "err")
+                    note = "Error: " + str(e)[:300]
+            elif q:
+                note = "Your 'send to a human' keywords matched this question, so the AI is skipped."
     c = store.cfg(db, env_max=int(os.getenv("SUPPORT_AI_DAILY_MAX", "150") or 150))
     return web.render_str(PAGE, c=c, words=", ".join(c["words"]), st=store.stats(db), rows=store.recent(db),
                           labels=LABELS, key=bool(os.getenv("GEMINI_API_KEY", "").strip()),
-                          q=q, answer=answer, tested=tested)
+                          q=q, answer=answer, tested=tested, note=note)
 
 
 def register(app):

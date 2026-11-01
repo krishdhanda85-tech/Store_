@@ -140,11 +140,19 @@ def _support_ok():
 
 
 def answer_support(question, shop_info):
-    """Blocking. Answers a GENERAL question using only `shop_info` (public shop facts).
+    """Blocking. Same as answer_support_ex but returns only the answer (or None)."""
+    return answer_support_ex(question, shop_info)[0]
+
+
+def answer_support_ex(question, shop_info):
+    """Returns (answer_or_None, note). `note` says WHY there is no answer (shown in the admin test box).
+    Blocking. Answers a GENERAL question using only `shop_info` (public shop facts).
     Returns the answer text, or None meaning 'send this to a human' (no key, limit reached, error,
     or the AI is not sure / it is about an order, payment or account)."""
-    if not GEMINI_KEY or not _support_ok():
-        return None
+    if not GEMINI_KEY:
+        return None, "GEMINI_API_KEY is not set on the server."
+    if not _support_ok():
+        return None, f"Daily limit reached ({SUPPORT_DAILY_MAX} answers). Raise 'Max AI answers per day' or wait for tomorrow."
     prompt = (
         "You are the support assistant of a Telegram shop selling digital subscriptions/accounts.\n"
         "Answer the customer's question using ONLY the SHOP INFO below.\n"
@@ -160,9 +168,12 @@ def answer_support(question, shop_info):
     try:
         text = _gemini(prompt, 500, 0.3)
         _sup["count"] += 1
-        if not text or "ESCALATE" in text.upper():
-            return None
-        return text[:900]
+        if not text:
+            return None, "Gemini returned an empty reply."
+        if "ESCALATE" in text.upper():
+            return None, ("Gemini works, but the answer is not in your shop info (or it looks like an order/payment "
+                          "question). Add it to 'Extra knowledge' or to the product's warranty/delivery fields.")
+        return text[:900], ""
     except Exception as e:
         log.warning("Gemini support failed: %s", str(e)[:200])
-        return None
+        return None, "Gemini error: " + str(e)[:300]
