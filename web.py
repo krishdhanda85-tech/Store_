@@ -560,7 +560,8 @@ d.addEventListener('keydown',function(e){
 <datalist id="cats">{% for c in cats %}<option value="{{ c }}">{% endfor %}</datalist>
 
 <div class="page-head"><h2>Products</h2>
-<button class="sm" type="button" onclick="var b=document.getElementById('addbox');b.hidden=!b.hidden;if(!b.hidden){b.scrollIntoView({behavior:'smooth'});}">+ Add product</button></div>
+<div style="display:flex;gap:8px;flex-wrap:wrap"><button class="sm" type="button" onclick="var b=document.getElementById('addbox');b.hidden=!b.hidden;if(!b.hidden){b.scrollIntoView({behavior:'smooth'});}">+ Add product</button>
+{% if suppliers_cat %}<button class="sm green" type="button" onclick="location='{{ url_for('import_admin.home') }}'">Import from supplier</button>{% endif %}</div></div>
 
 <div class="sumline"><span>{{ products|length }} products</span>
 {% if ns.out %}<span class="b">{{ ns.out }} out of stock</span>{% endif %}
@@ -697,13 +698,11 @@ d.addEventListener('keydown',function(e){
 <button type="submit">Save</button></form>
 {% endif %}
 {% if suppliers_cat %}
-<form method="post" action="{{ url_for('source_edit', pid=p.id) }}" style="margin-top:10px">
+<form method="post" action="{{ url_for('source_edit', pid=p.id) }}" style="margin-top:10px" onsubmit="return chkOffer(this)">
 <input type="hidden" name="action" value="add">
-<label>Add a supplier product</label>
-<select name="offer" required>
-<option value="">- choose -</option>
-{% for sp in suppliers_cat %}<optgroup label="{{ sp.name }}">{% for a in sp['items'] %}<option value="{{ sp.id }}|{{ a.key }}">{{ a.name }} · cost ${{ '%.2f' % a.cost }} · stock {{ a.stock }}</option>{% endfor %}</optgroup>{% endfor %}
-</select>
+<label>Add a supplier product <span class="hint">type a few letters to search</span></label>
+<input list="offers" placeholder="Search supplier products..." autocomplete="off" oninput="pickOffer(this)">
+<input type="hidden" name="offer" value="">
 <button type="submit">Add</button></form>
 {% else %}<p class="muted" style="margin-top:8px">No supplier connected yet. <a href="{{ url_for('suppliers_admin.suppliers') }}">Add a supplier</a>.</p>{% endif %}
 </div>
@@ -715,7 +714,17 @@ d.addEventListener('keydown',function(e){
 </details>
 {% else %}<div class="card">No products yet. Use the form above to add your first one.</div>{% endfor %}
 
+{% if suppliers_cat %}<datalist id="offers">{% for sp in suppliers_cat %}{% for a in sp['items'] %}<option value="{{ a.name }} · ${{ '%.2f' % a.cost }} · stock {{ a.stock }} · {{ sp.name }}" data-v="{{ sp.id }}|{{ a.key }}"></option>{% endfor %}{% endfor %}</datalist>{% endif %}
 <script>
+var OM=null;
+function pickOffer(i){
+  if(!OM){OM={};document.querySelectorAll('#offers option').forEach(function(o){OM[o.value]=o.dataset.v;});}
+  i.nextElementSibling.value=OM[i.value]||'';
+}
+function chkOffer(f){
+  if(!f.offer.value){alert('Pick a product from the suggestions list first.');return false;}
+  return true;
+}
 function calc(f){
   var o=f.querySelector('.profit');if(!o)return;
   var c=parseFloat(f.cost.value),p=parseFloat(f.price.value);
