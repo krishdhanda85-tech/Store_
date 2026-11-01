@@ -2035,7 +2035,7 @@ CALLBACKS = {
     "lang": cb_lang, "setlang": cb_setlang, "menu": cb_menu, "shop": cb_shop, "fund": cb_fund,
     "cat": cb_cat, "prod": cb_prod, "buy": cb_buy, "qty": cb_qty, "qtyo": cb_qty_other, "bal": cb_bal,
     "cx": cb_cancel_flow, "mok": cb_manual_ok, "search": cb_search, "fm": cb_fund_method,
-    "fc": cb_dep_check, "ftx": cb_dep_txhash, "fx": cb_dep_cancel, "sup": cb_support, "aisup": cb_aisup,
+    "fc": cb_dep_check, "ftx": cb_dep_txhash, "fx": cb_dep_cancel, "sup": cb_support,
     "fu": cb_upi_paid, "api": cb_api, "noop": cb_noop, "adm": cb_admin,
     "g": growth_bot.cb_growth,
 }
@@ -2365,6 +2365,9 @@ async def cb_aisup(update, context, arg):
         f"🎫 <b>Ticket #{tid}</b> · {esc(label)}\n👤 {who} ({user.id})\n\n{esc(body)}\n\n"
         "<i>Reply to this message to answer the customer.</i>", ticket_id=tid)
 
+
+
+CALLBACKS["aisup"] = cb_aisup
 
 async def open_ticket(update, context, kind: str, text: str, photo_id):
     user = update.effective_user
