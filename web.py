@@ -36,6 +36,8 @@ from assistant_admin import register as register_assistant_admin
 register_assistant_admin(app)
 from smart_admin import register as register_smart_admin
 register_smart_admin(app)
+from import_admin import register as register_import_admin
+register_import_admin(app)
 app.config["MAX_CONTENT_LENGTH"] = 3 * 1024 * 1024   # QR uploads
 app.secret_key = os.getenv("SECRET_KEY") or hashlib.sha256(
     ("shop-admin:" + ADMIN_PASSWORD).encode()
@@ -242,6 +244,7 @@ tr:hover td{background:var(--bg)}
 {{ nl('orders','Orders','list') }}
 {{ nl('manual','Pending orders','clock',pending_count) }}
 {{ nl('products','Products','box') }}
+{{ nl('import_admin.home','Import products','link') }}
 {{ nl('profit_centre','Profit centre','card') }}
 <div class="grp">Payments</div>
 {{ nl('upipay','UPI payments','card',upi_pending) }}
