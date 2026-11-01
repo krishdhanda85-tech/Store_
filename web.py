@@ -32,6 +32,8 @@ from suppliers_admin import register as register_suppliers_admin
 register_suppliers_admin(app, db)
 from growth_admin import register as register_growth_admin
 register_growth_admin(app)
+from assistant_admin import register as register_assistant_admin
+register_assistant_admin(app)
 app.config["MAX_CONTENT_LENGTH"] = 3 * 1024 * 1024   # QR uploads
 app.secret_key = os.getenv("SECRET_KEY") or hashlib.sha256(
     ("shop-admin:" + ADMIN_PASSWORD).encode()
@@ -245,6 +247,7 @@ tr:hover td{background:var(--bg)}
 <div class="grp">Customers</div>
 {{ nl('users','Users','users') }}
 {{ nl('tickets','Support','help',open_tickets,'ticket') }}
+{{ nl('assistant_admin.home','AI Assistant','help') }}
 {{ nl('userprices','User prices','tag') }}
 <div class="grp">Growth</div>
 {{ nl('growth_admin.home','Growth settings','sliders') }}

@@ -12,6 +12,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 from web import app
 import bot
+import marketing_bot
 
 
 def run_web():
@@ -20,6 +21,7 @@ def run_web():
 
 if __name__ == "__main__":
     threading.Thread(target=run_web, daemon=True).start()
+    marketing_bot.start()
     result = bot.main()
     if inspect.iscoroutine(result):
         asyncio.run(result)

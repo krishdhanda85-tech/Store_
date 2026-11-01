@@ -19,6 +19,7 @@ from telegram.ext import (
     ContextTypes, TypeHandler, filters
 )
 
+import agents
 import fampay_verify
 import growth_bot
 import provider
@@ -647,6 +648,32 @@ def ui_button_icon(label: str):
 
 
 _PROTECTED = re.compile(r"(<tg-emoji.*?</tg-emoji>|<code>.*?</code>|<pre>.*?</pre>)", re.S)
+
+
+def _hook_html(hook):
+    """Gemini copy -> HTML: first line bold (headline), second line italic. '' when there is none."""
+    if not hook:
+        return ""
+    parts = hook.split("\n", 1)
+    out = f"<b>{esc(parts[0])}</b>"
+    if len(parts) > 1 and parts[1].strip():
+        out += f"\n<i>{esc(parts[1].strip())}</i>"
+    return out
+
+
+def _promo_extra_lines(p):
+    """Real delivery / warranty info from the product (only when the admin filled it in)."""
+    lines = []
+    for icon, label, key in (("⚡", "Delivery", "delivery"), ("🛡", "Warranty", "warranty")):
+        v = " ".join(str(p[key] or "").split())[:60]
+        if v:
+            lines.append(f"{icon} {label}: {esc(v)}")
+    return lines
+
+
+def allowed_hook_emojis():
+    """Emoji characters that already have a premium/custom emoji rule (so Gemini can use them)."""
+    return [k for k, v in _jload("emoji_map", {}).items() if k and str(v).isdigit() and len(k) <= 4][:30]
 
 
 def apply_emoji_map(text: str) -> str:
@@ -2008,7 +2035,7 @@ CALLBACKS = {
     "lang": cb_lang, "setlang": cb_setlang, "menu": cb_menu, "shop": cb_shop, "fund": cb_fund,
     "cat": cb_cat, "prod": cb_prod, "buy": cb_buy, "qty": cb_qty, "qtyo": cb_qty_other, "bal": cb_bal,
     "cx": cb_cancel_flow, "mok": cb_manual_ok, "search": cb_search, "fm": cb_fund_method,
-    "fc": cb_dep_check, "ftx": cb_dep_txhash, "fx": cb_dep_cancel, "sup": cb_support,
+    "fc": cb_dep_check, "ftx": cb_dep_txhash, "fx": cb_dep_cancel, "sup": cb_support, "aisup": cb_aisup,
     "fu": cb_upi_paid, "api": cb_api, "noop": cb_noop, "adm": cb_admin,
     "g": growth_bot.cb_growth,
 }
@@ -2251,6 +2278,8 @@ async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(tt(language, "search_head", q=esc(text)), reply_markup=Markup(rows), parse_mode=HTML)
 
     elif kind == "ticket":
+        if _ai_cfg()["on"] and st.get("kind") == "gen" and text and await ai_support_try(update, context, text):
+            return
         await open_ticket(update, context, st["kind"], text, None)
 
 
@@ -2263,6 +2292,78 @@ async def photo_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await open_ticket(update, context, st["kind"], (msg.caption or "").strip(), msg.photo[-1].file_id)
     elif st and st["type"] == "wclaim":
         await growth_bot.growth_photo(update, context, st)
+
+
+SUPPORT_AI = os.getenv("SUPPORT_AI", "1") != "0"      # AI answers GENERAL questions first; people can still reach a human
+
+
+def _ai_cfg():
+    import assistant_store
+    return assistant_store.cfg(db, env_on=SUPPORT_AI, env_max=agents.SUPPORT_DAILY_MAX)
+
+
+def _support_shop_info() -> str:
+    """Public shop facts the support assistant may use (no user data) + the owner's extra knowledge."""
+    import assistant_store
+    return assistant_store.shop_info(db, tt("en", "warranty_default").replace("\n", " "), _ai_cfg()["extra"])
+
+
+async def ai_support_try(update, context, text: str) -> bool:
+    """Answer a general question with the AI assistant. True = answered (no ticket yet)."""
+    import assistant_store
+    msg = update.message
+    language = lang(update.effective_user.id)
+    c = _ai_cfg()
+    if assistant_store.wants_human(c["words"], text):
+        return False                                   # owner's keywords -> straight to a human
+    try:
+        await msg.chat.send_action("typing")
+        agents.SUPPORT_DAILY_MAX = c["max"]            # limit set on the website
+        info = await asyncio.to_thread(_support_shop_info)
+        ans = await asyncio.to_thread(agents.answer_support, text, info)
+    except Exception:
+        log.exception("AI support failed")
+        return False
+    if not ans:
+        assistant_store.log_answer(db, update.effective_user.id, text, "", "escalated")
+        return False
+    clear_await(context)
+    context.user_data["ai_q"] = text[:1000]
+    context.user_data["ai_log"] = assistant_store.log_answer(db, update.effective_user.id, text, ans, "answered")
+    markup = Markup([[Btn("✅ Solved", callback_data="aisup:ok", style="success"),
+                      Btn("🙋 Talk to a human", callback_data="aisup:human", style="primary")]])
+    await msg.reply_text(f"🤖 <b>{esc(c['name'])}</b>\n\n{esc(ans)}\n\n<i>Did this solve it?</i>",
+                         parse_mode=HTML, reply_markup=markup)
+    return True
+
+
+async def cb_aisup(update, context, arg):
+    q = update.callback_query
+    await q.answer()
+    user = q.from_user
+    language = lang(user.id)
+    try:
+        await q.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    question = context.user_data.pop("ai_q", "")
+    import assistant_store
+    assistant_store.set_outcome(db, context.user_data.pop("ai_log", None), "solved" if arg == "ok" else "human")
+    if arg == "ok":
+        await q.message.reply_text("👍 Glad it helped! Open Support any time you need us.")
+        return
+    if not question:
+        await q.message.reply_text("Please open Support and tap New ticket.")
+        return
+    label = tt("en", "k_gen")
+    body = question + "\n\n(The AI assistant answered but the customer still wants a human.)"
+    tid = db.create_ticket(user.id, label, body, None)
+    await q.message.reply_text(tt(language, "ticket_created", id=tid), parse_mode=HTML)
+    who = f"@{esc(user.username)}" if user.username else esc(user.full_name)
+    await notify_admins(
+        context,
+        f"🎫 <b>Ticket #{tid}</b> · {esc(label)}\n👤 {who} ({user.id})\n\n{esc(body)}\n\n"
+        "<i>Reply to this message to answer the customer.</i>", ticket_id=tid)
 
 
 async def open_ticket(update, context, kind: str, text: str, photo_id):
@@ -2770,18 +2871,25 @@ async def promo_job(context: ContextTypes.DEFAULT_TYPE):
         if not products:
             return
         last = context.application.bot_data.get("last_promo_pid")
-        pool = [p for p in products if p["id"] != last] or products
-        p = random.choice(pool)
+        # Manager agent (plain Python) decides WHAT to promote
+        p, reason = agents.manager_pick(
+            products, last, LOW_STOCK_THRESHOLD,
+            lambda x: discount_pct(x["old_price"], float(x["price"])) or 0, is_manual)
         context.application.bot_data["last_promo_pid"] = p["id"]
         price = float(p["price"])
         pct = discount_pct(p["old_price"], price)
-        lines = [random.choice(PROMO_TAGLINES), "", card_name_html(p)]
+        # Marketing agent (Gemini) writes the hook; falls back to the fixed taglines
+        hook = await asyncio.to_thread(agents.write_hook, p["name"], reason, allowed_hook_emojis(),
+                                       p["description"] or "")
+        head = _hook_html(hook) or random.choice(PROMO_TAGLINES)
+        lines = [head, "", card_name_html(p)]
         if pct:
             lines.append(f"💰 <s>${money(p['old_price'])}</s> → <b>${money(price)}</b>  (🔻{pct}% OFF)")
         else:
             lines.append(f"💰 Price: <b>${money(price)}</b>")
         if not is_manual(p):
             lines.append(f"📦 In stock: <b>{p['stock']}</b>")
+        lines += _promo_extra_lines(p)
         lines.append("")
         lines.append("👇 Tap <b>Buy Now</b> to order")
         uname = (getattr(tenancy.cur(), "bot_username", "") or "").lstrip("@")
@@ -2792,6 +2900,167 @@ async def promo_job(context: ContextTypes.DEFAULT_TYPE):
                                        reply_markup=markup, disable_web_page_preview=True)
     except Exception:
         log.exception("Promo post to group %s failed (bot must be in the group and allowed to send)", target)
+
+
+PROMO_DM = os.getenv("PROMO_DM", "0") == "1"                       # send the promo to users inside the bot chat
+PROMO_DM_AUDIENCE = os.getenv("PROMO_DM_AUDIENCE", "all")           # all | buyers | nobuy | balance | inactive
+PROMO_DM_EVERY_HOURS = max(6, int(os.getenv("PROMO_DM_EVERY_HOURS", "24") or 24))
+PROMO_DM_SMART = os.getenv("PROMO_DM_SMART", "1") != "0"           # analyse purchase history per customer
+PROMO_DM_PERSONAL = os.getenv("PROMO_DM_PERSONAL", "1") != "0"      # each buyer gets a message about what THEY bought
+
+
+def _dm_body(p, head, top="", fact="", balance=0.0):
+    """Message layout with REAL data only: top line, AI hook, one fact line, card, wallet, call to action."""
+    price = float(p["price"])
+    pct = discount_pct(p["old_price"], price)
+    lines = ([top] if top else []) + [head]
+    if fact:
+        lines += ["", fact]
+    lines += ["", "━━━━━━━━━━━━", card_name_html(p)]
+    if pct:
+        lines.append(f"💰 <s>${money(p['old_price'])}</s> → <b>${money(price)}</b>  (🔻{pct}% OFF)")
+    else:
+        lines.append(f"💰 Price: <b>${money(price)}</b>")
+    if not is_manual(p):
+        lines.append(f"📦 In stock: <b>{p['stock']}</b>")
+    lines += _promo_extra_lines(p)
+    lines.append("━━━━━━━━━━━━")
+    if balance and balance >= 0.5:
+        lines.append(f"💳 Wallet balance: <b>${money(balance)}</b> — ready to use")
+    lines += ["", "👇 Open the menu and tap <b>Products</b> to order"]
+    return "\n".join(lines)
+
+
+def _promo_dm_text(p, reason, welcome=False):
+    """One promo message with real name / price / stock. Gemini only writes the hook line."""
+    import random
+    hook = agents.write_hook(p["name"], reason, allowed_hook_emojis(), p["description"] or "")
+    head = _hook_html(hook) or random.choice(PROMO_TAGLINES)
+    return _dm_body(p, head, top="👋 <b>Welcome back!</b>" if welcome else "")
+
+
+# smart reason -> (Gemini angle, top line)
+_SMART_TOP = {
+    "renew": ("renew_due", "⏰ <b>Time to renew?</b>"),
+    "pricedrop": ("pricedrop", "📉 <b>Price drop!</b>"),
+    "crosssell": ("crosssell", "🤝 <b>Picked for you</b>"),
+    "loyal": ("loyal", "🏆 <b>Thank you for being a loyal customer</b>"),
+    "winback": ("winback", "💌 <b>We missed you!</b>"),
+}
+
+
+def _smart_fact(item, by_id):
+    """One factual line from the customer's real history (never invented)."""
+    r, f = item["reason"], item["facts"]
+    if r == "renew":
+        t = f"🧾 Your last order was <b>{f['days_ago']} days ago</b>"
+        return t + (f" · you've ordered this <b>{f['times']}×</b>" if f.get("times", 1) > 1 else "")
+    if r == "pricedrop":
+        return "🧾 You bought this before — it's cheaper right now"
+    if r == "crosssell":
+        src = by_id.get(f.get("from_pid"))
+        if src is not None:
+            return f"🧾 <b>{f['people']}</b> customers who bought {esc(src['name'])} also took this"
+        return ""
+    if r == "loyal":
+        return f"🧾 You've placed <b>{item['orders']}</b> orders with us — thank you!"
+    if r == "winback":
+        return f"🧾 It's been <b>{f['days_ago']} days</b> since your last order"
+    return ""
+
+
+def _build_promo_dm_smart(products, by_id):
+    """Per-customer analysis of paid-order history. Returns (items, label, log_rows) or None."""
+    import random
+    import smart_promo
+    ids = db.audience_ids(PROMO_DM_AUDIENCE)
+    if not ids:
+        return None
+    disc = lambda x: discount_pct(x["old_price"], float(x["price"])) or 0
+    picks = smart_promo.analyze(db, ids, products, disc, is_available)
+    if not picks:
+        return None
+    gp, greason = agents.manager_pick(products, db.get_setting("promo_dm_pid", ""),
+                                      LOW_STOCK_THRESHOLD, disc, is_manual)
+    from collections import Counter
+    hooks, items, rows, count = {}, [], [], Counter()
+    for it in picks:
+        reason = it["reason"]
+        if reason == "newcomer":
+            p, angle, top = gp, greason, ""
+        else:
+            p = by_id[it["pid"]]
+            angle, top = _SMART_TOP[reason]
+        key = (angle, p["id"])
+        if key not in hooks:                      # ONE Gemini call per (angle, product), not per user
+            hooks[key] = agents.write_hook(p["name"], angle, allowed_hook_emojis(), p["description"] or "")
+        head = _hook_html(hooks[key]) or random.choice(PROMO_TAGLINES)
+        items.append((it["uid"], _dm_body(p, head, top, _smart_fact(it, by_id), it["balance"])))
+        rows.append((it["uid"], p["id"], reason))
+        count[reason] += 1
+    db.set_setting("promo_dm_pid", str(gp["id"]))
+    label = "[smart] " + " ".join(f"{k}:{v}" for k, v in count.most_common())
+    return items, label, rows
+
+
+def _build_promo_dm():
+    """Runs in a thread. Returns (items [(user_id, text)], label, log_rows) or None."""
+    import random
+    products = [p for p in db.list_products() if is_available(p)]
+    if not products:
+        return None
+    by_id = {p["id"]: p for p in products}
+    if PROMO_DM_SMART:
+        try:
+            return _build_promo_dm_smart(db.list_products(), {p["id"]: p for p in db.list_products()})
+        except Exception:
+            log.exception("smart promo failed, using the simple promo")
+    ids = db.audience_ids(PROMO_DM_AUDIENCE)
+    if not ids:
+        return None
+    # Manager picks the general product (for people with no purchase yet / sold-out favourite)
+    gp, greason = agents.manager_pick(
+        products, db.get_setting("promo_dm_pid", ""), LOW_STOCK_THRESHOLD,
+        lambda x: discount_pct(x["old_price"], float(x["price"])) or 0, is_manual)
+    if str(gp["id"]) == str(db.get_setting("promo_dm_pid", "")) and len(products) > 1:
+        gp = random.choice([x for x in products if str(x["id"]) != str(gp["id"])])
+    general = _promo_dm_text(gp, greason)
+    items, texts = [], {}
+    last = _last_purchases() if PROMO_DM_PERSONAL else {}
+    for uid in ids:
+        fav = by_id.get(last.get(uid))
+        if fav is None:
+            items.append((uid, general))
+            continue
+        if fav["id"] not in texts:                 # ONE AI call per product, not per user
+            texts[fav["id"]] = _promo_dm_text(fav, "renew", welcome=True)
+        items.append((uid, texts[fav["id"]]))
+    db.set_setting("promo_dm_pid", str(gp["id"]))
+    return items, f"[promo] {gp['name']} + {len(texts)} personal", []
+
+
+async def promo_dm_job(context: ContextTypes.DEFAULT_TYPE):
+    """Every PROMO_DM_EVERY_HOURS (min 6) queue the promo for the users' bot chats. Buyers get a
+    message about the product THEY bought before; everyone else gets the Manager's pick.
+    Uses the same outbox as /broadcast, so sending is paced and blocked users are skipped."""
+    if not PROMO_DM:
+        return
+    try:
+        last = float(db.get_setting("promo_dm_last", "0") or 0)
+        if time.time() - last < PROMO_DM_EVERY_HOURS * 3600:
+            return
+        built = await asyncio.to_thread(_build_promo_dm)
+        if not built:
+            return
+        items, label, log_rows = built
+        n = await asyncio.to_thread(db.queue_personal, items, PROMO_DM_AUDIENCE, label)
+        if log_rows:
+            import smart_promo
+            await asyncio.to_thread(smart_promo.mark_sent, db, log_rows)
+        db.set_setting("promo_dm_last", str(time.time()))
+        log.info("Promo DM queued for %s user(s)", n)
+    except Exception:
+        log.exception("promo DM failed")
 
 
 # ---------------------------------------------------------------- owner safety net (new)
@@ -3147,6 +3416,8 @@ def build_application(tenant):
     app.job_queue.run_repeating(_in_shop(lowstock_job), interval=1800, first=120)
     app.job_queue.run_repeating(_in_shop(fampay_job), interval=45, first=30)
     app.add_error_handler(on_error)
+    if PROMO_DM:
+        app.job_queue.run_repeating(_in_shop(promo_dm_job), interval=1800, first=300)
     if PROMO_ADS:
         app.job_queue.run_repeating(_in_shop(promo_job), interval=PROMO_INTERVAL_MIN * 60, first=60)
     return app

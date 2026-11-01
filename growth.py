@@ -595,6 +595,19 @@ class GrowthMixin:
         c.commit(); c.close()
         return len(ids)
 
+    def queue_personal(self, items, audience, label):
+        """items: [(user_id, text)] - each user gets their own text. One line in the broadcast history."""
+        if not items:
+            return 0
+        now = self._now()
+        c = self.conn()
+        c.executemany("INSERT INTO outbox(user_id,text,created_at) VALUES(?,?,?)",
+                      [(uid, txt, now) for uid, txt in items])
+        c.execute("INSERT INTO broadcasts(text,audience,n,created_at) VALUES(?,?,?,?)",
+                  (label, audience, len(items), now))
+        c.commit(); c.close()
+        return len(items)
+
     def broadcast_history(self, limit=15):
         c = self.conn()
         rows = c.execute("SELECT * FROM broadcasts ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
