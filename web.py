@@ -662,13 +662,13 @@ d.addEventListener('keydown',function(e){
 <option value="auto" {{ 'selected' if p.kind != 'manual' }}>Automatic delivery (from stock)</option>
 <option value="manual" {{ 'selected' if p.kind == 'manual' }}>Made to order (customer sends an email, you deliver by hand)</option>
 </select>
-<label>Delivery time <span class="hint">shown to the customer</span></label>
+<label>Delivery time <span class="hint">empty = Instant</span></label>
 <input name="delivery" value="{{ p.delivery or '' }}">
-<label>Warranty <span class="hint">e.g. 90 days, empty shows None</span></label>
+<label>Warranty <span class="hint">made-to-order only, e.g. 30 days. Automatic products: write it in the description</span></label>
 <input name="warranty" value="{{ p.warranty or '' }}">
 <label>Question asked before buying <span class="hint">made-to-order only</span></label>
 <input name="prompt" value="{{ p.prompt or '' }}" placeholder="Send an email that you haven't linked to Spotify before.">
-<label>Description <span class="hint">one point per line</span></label>
+<label>Description <span class="hint">one point per line, write the warranty here</span></label>
 <textarea name="description" rows="4">{{ p.description or '' }}</textarea>
 <button type="submit">Save changes</button>
 </form>

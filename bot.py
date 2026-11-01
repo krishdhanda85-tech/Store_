@@ -130,7 +130,7 @@ TEXT = {
         "sold_out": "Sold out",
         "in_stock": "In stock",
         "made_to_order": "Made to order",
-        "card": "📦 <b>{name}</b>\n\n💰 Price: <b>${price}</b> (₹{inr}){disc}\n📦 Stock: <b>{stock}</b>{delivery}\n🛡 Warranty: <b>{warranty}</b>{desc}",
+        "card": "📦 <b>{name}</b>\n\n💰 Price: <b>${price}</b> (₹{inr}){disc}\n📦 Stock: <b>{stock}</b>{delivery}{warranty}{desc}",
         "card_delivery": "\n⏳ Delivery: <b>{delivery}</b>",
         "card_desc": "\n\n📝 <b>Description</b>\n<blockquote>{desc}</blockquote>",
         "default_manual_delivery": "by hand — within 24 hours",
@@ -665,6 +665,8 @@ def _promo_extra_lines(p):
     """Real delivery / warranty info from the product (only when the admin filled it in)."""
     lines = []
     for icon, label, key in (("⚡", "Delivery", "delivery"), ("🛡", "Warranty", "warranty")):
+        if key == "warranty" and not is_manual(p):
+            continue
         v = " ".join(str(p[key] or "").split())[:60]
         if v:
             lines.append(f"{icon} {label}: {esc(v)}")
@@ -1085,10 +1087,14 @@ def card_view(uid: int, p, language: str):
         stock = tt(language, "made_to_order")
     else:
         stock = (tt(language, "in_stock") + f" · {p['stock']}") if p["stock"] > 0 else tt(language, "sold_out")
-    delivery_value = (p["delivery"] or "").strip() or (tt(language, "default_manual_delivery") if is_manual(p) else "")
+    delivery_value = (p["delivery"] or "").strip() or (tt(language, "default_manual_delivery") if is_manual(p) else "Instant")
     delivery_html = fmt_get(p["id"], "delivery", p["delivery"]) or esc(delivery_value)
     delivery = tt(language, "card_delivery", delivery=delivery_html) if delivery_value else ""
-    warranty = fmt_get(p["id"], "warranty", p["warranty"]) or esc((p["warranty"] or "").strip() or tt(language, "none"))
+    # warranty is shown only for made-to-order products; for automatic ones it lives in the description
+    warranty = ""
+    if is_manual(p):
+        w_html = fmt_get(p["id"], "warranty", p["warranty"]) or esc((p["warranty"] or "").strip() or tt(language, "none"))
+        warranty = "\n🛡 Warranty: <b>" + w_html + "</b>"
     desc_fmt = fmt_get(p["id"], "description", p["description"])
     lines = [l.strip() for l in (p["description"] or "").splitlines() if l.strip()]
     lines = [("✅ " + l) if l[0].isalnum() else l for l in lines]   # one ✅ per point unless it already has an icon
@@ -1136,7 +1142,8 @@ def terms_block(p, language: str) -> str:
     delivery = (p["delivery"] or "").strip()
     warranty = (p["warranty"] or "").strip()
     lines.append("🚀 Delivery: " + (esc(delivery) if delivery else ("Instant" if not is_manual(p) else "After you order")))
-    lines.append("🛡 Warranty: " + (esc(warranty) if warranty else tt(language, "none")))
+    if is_manual(p):
+        lines.append("🛡 Warranty: " + (esc(warranty) if warranty else tt(language, "none")))
     for l in [x.strip() for x in (p["description"] or "").splitlines() if x.strip()][:6]:
         lines.append(("✅ " + esc(l)) if l[0].isalnum() else esc(l))
     return tt(language, "terms", terms="\n".join(lines))
@@ -1900,7 +1907,7 @@ def adm_menu(p):
             "work in Name, Description, Delivery and Warranty.")
     pid = p["id"]
     rows = [[Btn("📝 Name", callback_data=f"adm:f:{pid}:name"), Btn("📄 Description", callback_data=f"adm:f:{pid}:description")],
-            [Btn("🚚 Delivery", callback_data=f"adm:f:{pid}:delivery"), Btn("🛡 Warranty", callback_data=f"adm:f:{pid}:warranty")],
+            [Btn("🚚 Delivery", callback_data=f"adm:f:{pid}:delivery")] + ([Btn("🛡 Warranty", callback_data=f"adm:f:{pid}:warranty")] if is_manual(p) else []),
             [Btn("🎨 Button emoji", callback_data=f"adm:i:{pid}", style="primary")]]
     if icon:
         rows.append([Btn("🗑 Remove button emoji", callback_data=f"adm:ix:{pid}", style="danger")])
@@ -3117,6 +3124,8 @@ def _smart_text(it, p, by_id, cfg, head, language, code=None, test=False):
     if fl and cfg["urgency"]:
         lines.append(_t("flash", language, t=_left(fl["end"] - datetime.now(timezone.utc))))
     for icon, key in (("⚡", "delivery"), ("🛡", "warranty")):
+        if key == "warranty" and not B.is_manual(p):
+            continue
         v = " ".join(str(p[key] or "").split())[:60]
         if v:
             lines.append(f"{icon} {_t(key, language)}: {esc(v)}")

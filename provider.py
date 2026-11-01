@@ -137,7 +137,9 @@ def _ch_call(s, method, action, params=None, body=None, idem=None):
 
 def _ch_catalog(s):
     return [{"key": str(p["key"]), "name": str(p["name"]),
-             "cost": float(p["price_usdt_from"]), "stock": int(p["stock"])}
+             "cost": float(p["price_usdt_from"]), "stock": int(p["stock"]),
+             "description": str(p.get("description") or "").strip(),
+             "category": str(p.get("category") or "").strip()}
             for p in _ch_call(s, "GET", "products")["products"]]
 
 
@@ -158,7 +160,8 @@ GENERIC_DEFAULT = {
     "auth_header": "Authorization",        # e.g. "X-API-Key"
     "auth_prefix": "Bearer ",              # use "" when the key is sent as-is
     "products": {"method": "GET", "path": "/products", "list": "products",
-                 "key": "id", "name": "name", "cost": "price", "stock": "stock"},
+                 "key": "id", "name": "name", "cost": "price", "stock": "stock",
+                 "description": "description", "category": "category"},
     "balance": {"method": "GET", "path": "/balance", "field": "balance"},
     "purchase": {"method": "POST", "path": "/purchase", "send": "json",
                  "product_param": "product_id", "qty_param": "quantity",
@@ -243,7 +246,11 @@ def _g_catalog(s):
             stock = int(float(_dig(p, sec["stock"]) or 0))
         except (TypeError, ValueError):
             continue
-        out.append({"key": str(key), "name": str(_dig(p, sec["name"]) or key), "cost": cost, "stock": stock})
+        desc = _dig(p, sec.get("description")) if sec.get("description") else None
+        cat = _dig(p, sec.get("category")) if sec.get("category") else None
+        out.append({"key": str(key), "name": str(_dig(p, sec["name"]) or key), "cost": cost, "stock": stock,
+                    "description": str(desc).strip() if isinstance(desc, (str, int, float)) else "",
+                    "category": str(cat).strip() if isinstance(cat, (str, int, float)) else ""})
     return out
 
 
@@ -854,6 +861,13 @@ class ShopDB(Database):
                 else:
                     c.execute("UPDATE product_sources SET cost=?, stock=?, last_sync=? WHERE id=?",
                               (p["cost"], p["stock"], _now(), r["id"]))
+                    # fill an empty category / description from the supplier (never overwrites what you set)
+                    if p.get("category"):
+                        c.execute("UPDATE products SET category=? WHERE id=? AND (category IS NULL OR TRIM(category)='')",
+                                  (str(p["category"])[:60], r["product_id"]))
+                    if p.get("description"):
+                        c.execute("UPDATE products SET description=? WHERE id=? AND (description IS NULL OR TRIM(description)='')",
+                                  (str(p["description"])[:1000], r["product_id"]))
             for pid in {r["product_id"] for r in rows}:
                 self._refresh_map(c, pid)
                 prod = Database.get_product(self, pid)

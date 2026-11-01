@@ -1,6 +1,7 @@
 """Admin website page: Import products from a supplier in one go (search, multi-select, bulk markup)."""
 import re
 
+import provider
 from flask import Blueprint, request, redirect, url_for, flash
 
 bp = Blueprint("import_admin", __name__)
@@ -26,10 +27,10 @@ PAGE = r"""{% extends 'base.html' %}{% block body %}
 <button type="button" class="grey sm" onclick="resetPrices()">Reset prices</button></div>
 
 <div class="card"><h3>2. Apply to all selected <span class="hint">optional</span></h3>
-<label>Category <span class="hint">same category = grouped under one button in the bot</span></label><input name="category" list="cats" placeholder="e.g. AI tools">
+<p class="muted" style="margin:0 0 6px">Category, description (with warranty) and delivery (Instant) are copied from the supplier automatically. Fill the boxes below only to override.</p>
+<label>Category <span class="hint">empty = same category as the supplier</span></label><input name="category" list="cats" placeholder="e.g. AI tools">
 <datalist id="cats">{% for c in cats %}<option value="{{ c }}">{% endfor %}</datalist>
-<label>Delivery time shown to the customer</label><input name="delivery" placeholder="e.g. Instant">
-<label>Warranty</label><input name="warranty" placeholder="e.g. 30 days"></div>
+<label>Delivery time shown to the customer</label><input name="delivery" placeholder="empty = Instant"></div>
 
 <div class="card"><h3>3. Choose products</h3>
 <input id="q" placeholder="Search..." oninput="filt()" autocomplete="off">
@@ -41,7 +42,7 @@ PAGE = r"""{% extends 'base.html' %}{% block body %}
 <div class="sub imp-row" data-name="{{ a.name|lower }}" data-stock="{{ a.stock }}" data-cost="{{ '%.4f' % a.cost }}" data-added="{{ 1 if added else 0 }}" style="padding:10px;margin:6px 0">
 <label style="display:flex;gap:10px;align-items:flex-start;margin:0"><input type="checkbox" class="pick" name="pick" value="{{ loop.index0 }}" style="width:auto;margin-top:6px" onchange="count()" {{ 'disabled' if added }}>
 <span style="flex:1"><input name="name_{{ loop.index0 }}" value="{{ a.name }}" maxlength="120" {{ 'disabled' if added }}>
-<span class="muted" style="font-size:13px">cost ${{ '%.2f' % a.cost }} · stock {{ a.stock }}{% if added %} · <b class="paid">already added</b>{% endif %}</span></span></label>
+<span class="muted" style="font-size:13px">{% if a.category %}{{ a.category }} · {% endif %}cost ${{ '%.2f' % a.cost }} · stock {{ a.stock }}{% if added %} · <b class="paid">already added</b>{% endif %}</span></span></label>
 <input type="hidden" name="key_{{ loop.index0 }}" value="{{ a.key }}">
 <div style="display:flex;gap:8px;align-items:center;margin-top:6px;padding-left:30px"><span class="muted">Sell for $</span><input class="pr" name="price_{{ loop.index0 }}" type="number" step="0.01" min="0.01" style="max-width:110px" oninput="this.dataset.manual=1;prof(this.closest('.imp-row'))" {{ 'disabled' if added }}><span class="pf muted"></span></div>
 </div>
@@ -118,7 +119,12 @@ def create():
         return redirect(url_for("import_admin.home"))
     category = (f.get("category") or "").strip()[:60] or None
     delivery = (f.get("delivery") or "").strip()[:60] or None
-    warranty = (f.get("warranty") or "").strip()[:60] or None
+    try:
+        sup = db.get_supplier(sid)
+        catalog = {p["key"]: p for p in provider.catalog_for(sup, max_age=300)} if sup else {}
+    except Exception:
+        catalog = {}
+    names = {re.sub(r"\s+", " ", p["name"]).strip().casefold(): p["id"] for p in db.list_products()}
     picks = [p for p in f.getlist("pick") if p.isdigit()][:300]
     ok, problems, below_cost = 0, [], 0
     for i in picks:
@@ -132,17 +138,25 @@ def create():
             problems.append(f"{name or key or '#' + i}: name and price are needed")
             continue
         try:
-            existed = any(p["name"] == name for p in db.list_products())
-            pid = db.add_product(name, price, "auto")
+            item = catalog.get(key, {})
+            pid = names.get(name.casefold())
+            existed = pid is not None          # same product from another supplier -> just add it as a fallback source
+            if not existed:
+                pid = db.add_product(name, price, "auto")
+                names[name.casefold()] = pid
             fields = {}
-            if category:
-                fields["category"] = category
-            if delivery:
-                fields["delivery"] = delivery
-            if warranty:
-                fields["warranty"] = warranty
             if not existed:
                 fields["price"] = price
+                fields["delivery"] = delivery or "Instant"
+                fields["category"] = category or (item.get("category") or "")[:60] or None
+                if item.get("description"):
+                    fields["description"] = item["description"][:1000]
+            else:
+                cur_p = db.get_product_any(pid)
+                if cur_p and not (cur_p["category"] or "").strip() and (category or item.get("category")):
+                    fields["category"] = category or item["category"][:60]
+                if cur_p and not (cur_p["description"] or "").strip() and item.get("description"):
+                    fields["description"] = item["description"][:1000]
             if fields:
                 db.update_product(pid, **fields)
             db.add_source(pid, sid, key)
