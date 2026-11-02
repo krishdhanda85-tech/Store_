@@ -22,6 +22,7 @@ from telegram.ext import (
 import agents
 import fampay_verify
 import growth_bot
+import netflix_otp
 import provider
 import textedit
 import reseller_api
@@ -399,7 +400,8 @@ MENU_RE = "^(" + "|".join(re.escape(v) for v in MENU_BY_LABEL) + ")$"
 
 def main_keyboard():
     return ReplyKeyboardMarkup(
-        [[MENU["shop"], MENU["support"]], [MENU["funds"], MENU["api"]], [MENU["warranty"]]],
+        [[MENU["shop"], MENU["support"]], [MENU["funds"], MENU["api"]], [MENU["warranty"]]]
+        + ([[netflix_otp.BTN_LABEL]] if netflix_otp.enabled() else []),
         resize_keyboard=True, is_persistent=True, input_field_placeholder="Choose a quick menu b…")
 
 
@@ -3661,6 +3663,7 @@ def build_application(tenant):
     app.add_handler(CommandHandler("unlinkapi", unlinkapi))
     app.add_handler(CommandHandler("apibalance", apibalance))
     app.add_handler(CallbackQueryHandler(texts_callback, pattern=r"^tx:"))
+    netflix_otp.register_bot(app)
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.Regex(MENU_RE), menu_text))
     app.add_handler(MessageHandler(filters.PHOTO, photo_msg))
