@@ -601,7 +601,38 @@ def first_custom_emoji_id(msg) -> str:
     return t if t.isdigit() and 5 <= len(t) <= 30 else ""
 
 
+CAT_SEP = " / "          # "OTT / Netflix" = brand Netflix inside the type OTT
+
+
+def norm_cat(c) -> str:
+    return CAT_SEP.join(x.strip() for x in (c or "").split(CAT_SEP) if x.strip())
+
+
+def cat_paths():
+    """Every category path incl. parents: 'OTT / Netflix' also gives 'OTT'."""
+    seen = []
+    for c in db.list_categories():
+        parts = [x.strip() for x in c.split(CAT_SEP) if x.strip()]
+        for i in range(1, len(parts) + 1):
+            pth = CAT_SEP.join(parts[:i])
+            if pth not in seen:
+                seen.append(pth)
+    return seen
+
+
+def cat_children(parent=None):
+    out = []
+    for pth in cat_paths():
+        if parent is None:
+            if CAT_SEP not in pth:
+                out.append(pth)
+        elif pth.startswith(parent + CAT_SEP) and CAT_SEP not in pth[len(parent) + len(CAT_SEP):]:
+            out.append(pth)
+    return out
+
+
 def _cat_rule_key(category: str) -> str:
+    category = category.split(CAT_SEP)[-1]          # emoji rules use the brand / type name only
     k = category.lower().replace("+", " plus ").replace("&", " and ")
     return " ".join(k.split())[:40]
 
@@ -1029,7 +1060,7 @@ def grid_button(uid: int, p, full: bool = False):
 
 def category_button(c: str):
     """Category button styled exactly like the product grid buttons (dark, premium icon + name)."""
-    name = (c or "").strip()
+    name = (c or "").split(CAT_SEP)[-1].strip()     # button shows the last part: "OTT / Netflix" -> "Netflix"
     label = name if len(name) <= SHORT_NAME else name[:SHORT_NAME - 1].rstrip() + "…"
     icon = product_icon_id(name)
     if not icon:
@@ -1047,16 +1078,20 @@ def shop_view(uid: int, language: str, category: str = None, page: int = 0):
         text = tt(language, "shop_head", avail=avail, total=len(products))
         shown = list(products)
         nav_key = "shop"
-        cats = db.list_categories()
+        cats = cat_children(None)
         if cats and page == 0:        # categories (if the admin uses them) are one row of buttons above the grid
             for i in range(0, len(cats), GRID_COLS):
                 rows.append([category_button(c) for c in cats[i:i + GRID_COLS]])
             shown = [p for p in products if not (p["category"] or "").strip()] or []
             # products that belong to a category are opened through that category
     else:
-        text = tt(language, "cat_head", cat=esc(category))
-        shown = [p for p in products if (p["category"] or "").strip() == category]
+        text = tt(language, "cat_head", cat=esc(category.replace(CAT_SEP, " › ")))
+        shown = [p for p in products if norm_cat(p["category"]) == category]
         nav_key = f"cat:{cat_key(category)}~"
+        kids = cat_children(category)
+        if kids and page == 0:         # brands inside this type: one row of buttons above the products
+            for i in range(0, len(kids), GRID_COLS):
+                rows.append([category_button(c) for c in kids[i:i + GRID_COLS]])
     shown.sort(key=lambda p: (p["name"] or "").lower())
     in_cat = category is not None
     cols = 1 if in_cat else GRID_COLS
@@ -1077,7 +1112,8 @@ def shop_view(uid: int, language: str, category: str = None, page: int = 0):
     else:
         if is_admin(uid):
             rows.append([Btn("✏️ Category emoji", callback_data=f"adm:ce:{cat_key(category)}")])
-        rows.append([Btn(tt(language, "back"), callback_data="shop", style="primary")])
+        up = category.rsplit(CAT_SEP, 1)[0] if CAT_SEP in category else None
+        rows.append([Btn(tt(language, "back"), callback_data=(f"cat:{cat_key(up)}" if up else "shop"), style="primary")])
     return text, Markup(rows)
 
 
@@ -1108,7 +1144,7 @@ def card_view(uid: int, p, language: str):
     text = tt(language, "card", name=card_name_html(p), price=money(price), inr=inr(price), disc=disc, stock=stock,
               delivery=delivery, warranty=warranty, desc=desc_block)
     text += growth_bot.card_extras(uid, p)
-    cat = (p["category"] or "").strip()
+    cat = norm_cat(p["category"])
     back = f"cat:{cat_key(cat)}" if cat else "shop"
     rows = []
     if is_available(p):
@@ -1514,7 +1550,7 @@ async def cb_cat(update, context, arg):
     await q.answer()
     language = lang(q.from_user.id)
     key, _, pg = arg.partition("~")
-    category = next((c for c in db.list_categories() if cat_key(c) == key), None)
+    category = next((c for c in cat_paths() if cat_key(c) == key), None)
     if category is None:
         await show_menu(update, context, "shop")
         return
@@ -1964,7 +2000,7 @@ async def cb_admin(update, context, arg):
             await edit(q, text, markup)
         return
     if op in ("ce", "cx"):
-        category = next((c for c in db.list_categories() if cat_key(c) == rest), None)
+        category = next((c for c in cat_paths() if cat_key(c) == rest), None)
         if category is None:
             await edit(q, "Category not found.")
             return

@@ -120,8 +120,64 @@ def _gkey(n):
     return f"{','.join(n[0])}|{n[1]}"
 
 
+# Type groups: new products go into one of these shop categories (first match wins; "=" means whole word only).
+# Edit the words/names here whenever you want a new group or a brand moved.
+TYPE_GROUPS = [
+    ("Music", ["spotify", "applemusic", "youtubemusic", "amazonmusic", "deezer", "tidal", "soundcloud",
+               "jiosaavn", "gaana", "wynk", "napster", "music"]),
+    ("VPN", ["vpn", "nordvpn", "expressvpn", "surfshark", "protonvpn", "cyberghost", "ipvanish", "windscribe",
+             "hotspotshield", "purevpn", "tunnelbear"]),
+    ("OTT", ["netflix", "amazonprime", "primevideo", "disney", "hotstar", "crunchyroll", "hbo", "max", "sonyliv",
+             "zee5", "jiocinema", "appletv", "paramount", "peacock", "hulu", "youtube", "mxplayer", "altbalaji",
+             "voot", "discovery", "viki", "ott"]),
+    ("AI Tools", ["chatgpt", "gemini", "claude", "perplexity", "grok", "midjourney", "copilot", "cursor", "deepseek",
+                  "runway", "elevenlabs", "leonardo", "sora", "veo", "quillbot", "grammarly", "=ai", "openai",
+                  "anthropic", "suno", "heygen", "jasper"]),
+    ("Learning", ["coursera", "udemy", "duolingo", "linkedin", "skillshare", "masterclass", "datacamp"]),
+    ("Design & Tools", ["canva", "capcut", "adobe", "notion", "microsoft365", "office", "windows", "figma",
+                        "telegram", "discord"]),
+]
+SHORT_WORD_ONLY = {"max", "ott", "hbo", "veo", "sora", "viki", "suno"}
+
+
+def type_category(name, rules=None):
+    """Which type group (Music / VPN / OTT / AI Tools ...) does this product belong to? -> str or ''"""
+    t = _apply_aliases(name, _rules(rules))
+    words = set(re.findall(r"[a-z0-9]+", t))
+    sq = _squash(t)
+    for cat, kws in TYPE_GROUPS:
+        for kw in kws:
+            whole = kw.startswith("=") or kw in SHORT_WORD_ONLY
+            kw = kw.lstrip("=")
+            if (kw in words) if whole else (kw in sq):
+                return cat
+    return ""
+
+
+def brand_label(name, rules=None):
+    """Brand of a product (Netflix, ChatGPT, NordVPN ...) -> str or ''"""
+    rs = _rules(rules)
+    t = _apply_aliases(name, rs)
+    words = set(re.findall(r"[a-z0-9]+", t))
+    found = [r for r in rs if r["canon"] in words]
+    if found:
+        return found[0]["label"][:40]
+    sq = _squash(name)
+    for b in BRANDS:
+        if _squash(b) in sq:
+            return b
+    ws = re.findall(r"[A-Za-z0-9]+", clean_name(name))
+    return ws[0].title()[:40] if ws else ""
+
+
 def guess_category(name, sup_cat, existing_cats, rules=None):
     rs = _rules(rules)
+    # 0) type group first (AI / VPN / Music / OTT ...); reuse the spelling of your own category if it exists
+    tg = type_category(name, rs)
+    if tg:
+        br = brand_label(name, rs)
+        path = f"{tg} / {br}" if br and br.casefold() != tg.casefold() else tg   # e.g. "OTT / Netflix"
+        return next((c for c in existing_cats if c.casefold() == path.casefold()), path)
     t = _apply_aliases(name, rs)
     words = set(re.findall(r"[a-z0-9]+", t))
     found = [r for r in rs if r["canon"] in words]
@@ -210,6 +266,7 @@ PAGE = r"""{% extends 'base.html' %}{% block body %}
 <label>Round the price</label>
 <select name="rnd"><option value="five" {{ 'selected' if auto.rnd == 'five' }}>Up to the next 5 cents</option><option value="x99" {{ 'selected' if auto.rnd == 'x99' }}>Ending .99</option><option value="none" {{ 'selected' if auto.rnd == 'none' }}>No rounding</option></select>
 <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" name="instock" value="1" style="width:auto" {{ 'checked' if auto.instock }}> Only add products that are in stock</label>
+<label>Never auto-add these brands (comma separated, you add them by hand)</label><input name="skip" value="{{ auto.skip }}" placeholder="Spotify">
 <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap"><button type="submit">Save</button></div></form>
 <form method="post" action="{{ url_for('compare_admin.auto_run') }}" style="margin-top:8px"><button type="submit" class="green sm">Run now</button></form></div>
 
@@ -319,7 +376,8 @@ def auto_settings(db):
     return {"on": str(db.get_setting("auto_import_on", "0")) == "1",
             "pct": num("auto_import_pct", 40.0), "fix": num("auto_import_fix", 0.0),
             "rnd": str(db.get_setting("auto_import_rnd", "five")),
-            "instock": str(db.get_setting("auto_import_instock", "1")) == "1"}
+            "instock": str(db.get_setting("auto_import_instock", "1")) == "1",
+            "skip": str(db.get_setting("auto_import_skip", "Spotify") or "")}
 
 
 def price_for(cost, pct, fix, rnd):
@@ -419,10 +477,14 @@ def auto_import(db, limit=100):
     sups, errs, groups, _s, _h, _c = pending_groups(db, max_age=60)
     names = {re.sub(r"\s+", " ", p["name"]).strip().casefold(): p["id"] for p in db.list_products()}
     catalogs, added, below, problems, added_names = {}, 0, 0, [], []
+    skip_words = [_squash(w) for w in re.split(r"[,\n]", st["skip"]) if _squash(w)]
     for g in groups:
         if added >= limit:
             break
         if st["instock"] and not g["instock"]:
+            continue
+        hay = _squash(g["name"]) + "|" + _squash(g["category"])
+        if any(w in hay for w in skip_words):   # e.g. Spotify: you add it by hand
             continue
         cost = g["best"]["cost"]
         if cost <= 0:
@@ -492,6 +554,7 @@ def auto_save():
     rnd = f.get("rnd", "five")
     db.set_setting("auto_import_rnd", rnd if rnd in ("five", "x99", "none") else "five")
     db.set_setting("auto_import_instock", "1" if f.get("instock") else "0")
+    db.set_setting("auto_import_skip", (f.get("skip") or "").strip()[:200])
     flash("Auto mode saved. The bot will " + ("add new products by itself every 10 minutes." if f.get("on") else "not add products by itself."))
     return redirect(url_for("compare_admin.home"))
 
