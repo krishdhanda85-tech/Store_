@@ -129,7 +129,10 @@ TYPE_GROUPS = [
              "privateinternetaccess", "=pia", "proton", "mullvad", "hidemyass", "=hma", "hideme"]),
     ("Security", ["kaspersky", "norton", "mcafee", "bitdefender", "avast", "=avg", "=eset", "malwarebytes",
                   "1password", "lastpass", "dashlane", "nordpass", "antivirus", "trendmicro", "webroot", "secureline"]),
-    ("OTT", ["netflix", "amazonprime", "primevideo", "disney", "hotstar", "crunchyroll", "hbo", "max", "sonyliv",
+    ("Learning", ["coursera", "udemy", "duolingo", "linkedin", "skillshare", "masterclass", "datacamp", "kahoot",
+                  "quizlet", "memrise", "scribd", "chegg", "studocu", "coursehero", "brilliant", "babbel",
+                  "rosettastone", "turnitin", "numerade", "bartleby", "mindvalley", "pitpit"]),
+    ("OTT", ["netflix", "amazonprime", "primevideo", "disney", "hotstar", "crunchyroll", "hbo", "sonyliv",
              "zee5", "jiocinema", "appletv", "paramount", "peacock", "hulu", "youtube", "mxplayer", "altbalaji",
              "voot", "discoveryplus", "sunnxt", "wetv", "iqiyi", "bilibili", "shahid", "dazn", "viki", "ott"]),
     ("AI Tools", ["chatgpt", "gemini", "claude", "perplexity", "grok", "midjourney", "copilot", "cursor", "deepseek",
@@ -137,9 +140,6 @@ TYPE_GROUPS = [
                   "anthropic", "suno", "heygen", "jasper", "kling", "lovable", "manus", "minimax", "museai",
                   "openart", "replit", "higgsfield", "pika", "windsurf", "bolt", "hailuo", "vidu", "pixverse",
                   "ideogram", "krea", "genspark", "gamma", "poe", "=v0"]),
-    ("Learning", ["coursera", "udemy", "duolingo", "linkedin", "skillshare", "masterclass", "datacamp", "kahoot",
-                  "quizlet", "memrise", "scribd", "chegg", "studocu", "coursehero", "brilliant", "babbel",
-                  "rosettastone", "turnitin", "numerade", "bartleby", "mindvalley", "pitpit"]),
     ("Tools & Software", ["canva", "capcut", "adobe", "notion", "microsoft", "office", "outlook", "windows", "figma",
                           "telegram", "discord", "ilovepdf", "meitu", "picsart", "remini", "freepik", "envato",
                           "zoom", "slack", "dropbox", "evernote", "wps", "autodesk"]),
@@ -345,7 +345,7 @@ PAGE = r"""{% extends 'base.html' %}{% block body %}
 <label>Round the price</label>
 <select name="rnd"><option value="five" {{ 'selected' if auto.rnd == 'five' }}>Up to the next 5 cents</option><option value="x99" {{ 'selected' if auto.rnd == 'x99' }}>Ending .99</option><option value="none" {{ 'selected' if auto.rnd == 'none' }}>No rounding</option></select>
 <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" name="instock" value="1" style="width:auto" {{ 'checked' if auto.instock }}> Only add products that are in stock</label>
-<label>Never auto-add these brands (comma separated, you add them by hand)</label><input name="skip" value="{{ auto.skip }}" placeholder="Spotify">
+<label>Never auto-add these brands (comma separated, you add them by hand)</label><input name="skip" value="{{ auto.skip }}" placeholder="Spotify, Netflix, Crunchyroll, Amazon Prime">
 <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap"><button type="submit">Save</button></div></form>
 <form method="post" action="{{ url_for('compare_admin.auto_run') }}" style="margin-top:8px"><button type="submit" class="green sm">Run now</button></form></div>
 
@@ -460,7 +460,7 @@ def auto_settings(db):
             "pct": num("auto_import_pct", 40.0), "fix": num("auto_import_fix", 0.0),
             "rnd": str(db.get_setting("auto_import_rnd", "five")),
             "instock": str(db.get_setting("auto_import_instock", "1")) == "1",
-            "skip": str(db.get_setting("auto_import_skip", "Spotify") or "")}
+            "skip": str(db.get_setting("auto_import_skip", "Spotify, Netflix, Crunchyroll, Amazon Prime, Prime Video") or "")}
 
 
 def price_for(cost, pct, fix, rnd):
