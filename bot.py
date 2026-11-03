@@ -617,6 +617,9 @@ def cat_paths():
             pth = CAT_SEP.join(parts[:i])
             if pth not in seen:
                 seen.append(pth)
+    for f in FOLDER_NAMES:
+        if f not in seen:
+            seen.append(f)
     return seen
 
 
@@ -1034,6 +1037,21 @@ def product_button(uid: int, p):
     return Btn("🔴 " + label.removeprefix("🟢 ") + " · SOLD OUT", callback_data=f"prod:{p['id']}", style="danger")
 
 
+# Brand folders shown at the top of the grid (everything else stays in the plain 3-column grid).
+# (folder name, words that must appear in the product name or category, no spaces)
+FOLDERS = [("Netflix", ("netflix",)), ("Spotify", ("spotify",)), ("Crunchyroll", ("crunchyroll", "crunchy")),
+           ("Amazon Prime", ("amazonprime", "primevideo", "primevedio")), ("YouTube", ("youtube",))]
+FOLDER_NAMES = [f[0] for f in FOLDERS]
+
+
+def folder_of(p):
+    sq = re.sub(r"[^a-z0-9]", "", ((p["name"] or "") + " " + (p["category"] or "")).casefold())
+    for name, words in FOLDERS:
+        if any(w in sq for w in words):
+            return name
+    return None
+
+
 FLAT_GRID = os.getenv("FLAT_GRID", "1").strip() != "0"     # 1 = only the 3-column product grid (no category folders)
 GRID_COLS = 3
 GRID_PAGE_SIZE = 30            # 10 rows x 3 columns
@@ -1079,17 +1097,28 @@ def shop_view(uid: int, language: str, category: str = None, page: int = 0):
         text = tt(language, "shop_head", avail=avail, total=len(products))
         shown = list(products)
         nav_key = "shop"
-        cats = [] if FLAT_GRID else cat_children(None)    # FLAT_GRID: no category folders, one 3-column grid of all products
-        if cats and page == 0:        # categories (if the admin uses them) are one row of buttons above the grid
-            for i in range(0, len(cats), GRID_COLS):
-                rows.append([category_button(c) for c in cats[i:i + GRID_COLS]])
-            shown = [p for p in products if not (p["category"] or "").strip()] or []
-            # products that belong to a category are opened through that category
+        if FLAT_GRID:
+            # only the brand folders (Netflix, Spotify ...) + a plain grid of every other product
+            have = [f for f in FOLDER_NAMES if any(folder_of(p) == f for p in products)]
+            if page == 0:
+                for i in range(0, len(have), GRID_COLS):
+                    rows.append([category_button(c) for c in have[i:i + GRID_COLS]])
+            shown = [p for p in products if folder_of(p) is None]
+        else:
+            cats = cat_children(None)
+            if cats and page == 0:        # categories (if the admin uses them) are one row of buttons above the grid
+                for i in range(0, len(cats), GRID_COLS):
+                    rows.append([category_button(c) for c in cats[i:i + GRID_COLS]])
+                shown = [p for p in products if not (p["category"] or "").strip()] or []
+                # products that belong to a category are opened through that category
     else:
         text = tt(language, "cat_head", cat=esc(category.replace(CAT_SEP, " › ")))
-        shown = [p for p in products if norm_cat(p["category"]) == category]
+        if category in FOLDER_NAMES:
+            shown = [p for p in products if folder_of(p) == category]
+        else:
+            shown = [p for p in products if norm_cat(p["category"]) == category]
         nav_key = f"cat:{cat_key(category)}~"
-        kids = cat_children(category)
+        kids = [] if category in FOLDER_NAMES else cat_children(category)
         if kids and page == 0:         # brands inside this type: one row of buttons above the products
             for i in range(0, len(kids), GRID_COLS):
                 rows.append([category_button(c) for c in kids[i:i + GRID_COLS]])
