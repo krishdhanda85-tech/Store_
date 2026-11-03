@@ -604,10 +604,33 @@ def auto_import(db, limit=100):
     return {"added": added, "below_cost": below, "problems": problems, "names": added_names, "errs": errs}
 
 
+def fix_misplaced(db):
+    """Products sitting in a wrong type folder (e.g. Duolingo inside OTT) go to the right one. -> count moved"""
+    rules = make_rules(db.get_setting("compare_aliases", ""))
+    moved = 0
+    for p in list(db.list_products()):
+        old = (p["category"] or "").strip()
+        if not old.casefold().startswith("ott"):
+            continue
+        tg = type_category(p["name"] or "", rules)
+        if tg and tg != "OTT":
+            new = guess_category(p["name"] or "", "", [], rules)
+            try:
+                db.update_product(p["id"], category=new)
+                moved += 1
+            except Exception:
+                pass
+    return moved
+
+
 @bp.route("/compare")
 def home():
     import web
     db = web.db
+    try:
+        fix_misplaced(db)
+    except Exception:
+        pass
     show_hidden = request.args.get("hidden") == "1"
     sups, errs, groups, skipped, hidden_n, existing_cats = pending_groups(db, show_hidden)
     for e in errs:

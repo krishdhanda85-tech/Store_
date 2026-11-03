@@ -2878,6 +2878,10 @@ async def autoimport_job(context: ContextTypes.DEFAULT_TYPE):
     category, description and markup price). Result goes to the website activity log (no Telegram spam)."""
     import compare_admin
     try:
+        await asyncio.to_thread(compare_admin.fix_misplaced, db)   # e.g. Duolingo wrongly inside OTT
+    except Exception as e:
+        log.warning("fix_misplaced failed: %s", e)
+    try:
         if str(db.get_setting("auto_import_on", "0")) != "1":
             return
         r = await asyncio.to_thread(compare_admin.auto_import, db)
