@@ -1649,8 +1649,10 @@ def create_product():
         msg = f"'{name}' added. Cost ${cost:.2f}, price ${price:.2f}, {_profit_text(price, cost)}."
     lines = _lines(f.get("links")) if kind == "auto" else []
     if lines:
-        db.add_stock_lines(pid, lines)
-        msg += f" {len(lines)} stock item(s) added."
+        n_added = db.add_stock_lines(pid, lines)
+        msg += f" {n_added} stock item(s) added."
+        if getattr(db, "last_stock_skipped", 0):
+            msg += f" {db.last_stock_skipped} duplicate profile(s) skipped."
     elif kind == "auto":
         msg += " No stock yet - open the product and use Add stock."
     flash(msg)
@@ -1680,8 +1682,8 @@ def stock_add(pid):
     if not lines:
         flash("Paste at least one item.", "err")
     else:
-        db.add_stock_lines(pid, lines)
-        flash(f"{len(lines)} item(s) added to stock.")
+        n_added = db.add_stock_lines(pid, lines)
+        flash(f"{n_added} item(s) added to stock." + (f" {db.last_stock_skipped} duplicate profile(s) skipped." if getattr(db, "last_stock_skipped", 0) else ""))
     return _back(pid)
 
 

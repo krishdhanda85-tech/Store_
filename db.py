@@ -212,10 +212,21 @@ class Database(GrowthMixin):
 
     def add_stock_lines(self, pid, lines, added_by=0):
         now=datetime.now(timezone.utc).isoformat()
+        norm=lambda t: re.sub(r"\s+", " ", t or "").strip().casefold()
         c=self.conn()
+        # account/profile lines (they contain an e-mail) are never added twice: not if the same line is already in
+        # stock (sold or not), and not twice in the same paste -> one profile can never be sold to two customers
+        have={norm(r["link"]) for r in c.execute("SELECT link FROM stock WHERE link LIKE '%@%'")}
+        added=0; self.last_stock_skipped=0
         for line in lines:
+            k=norm(line)
+            if "@" in k:
+                if k in have:
+                    self.last_stock_skipped+=1; continue
+                have.add(k)
             c.execute("INSERT INTO stock(product_id,link,added_by,added_at) VALUES(?,?,?,?)",(pid,line,added_by,now))
-        c.commit(); c.close(); return len(lines)
+            added+=1
+        c.commit(); c.close(); return added
 
     def delete_stock_item(self, pid, sid):
         """Remove one UNSOLD stock line. Sold lines are never touched."""
@@ -281,6 +292,25 @@ class Database(GrowthMixin):
     def mark_order_failed(self,oid,reason):
         c=self.conn(); c.execute("UPDATE orders SET status='failed',failure_reason=? WHERE id=? AND status='pending'",(reason,oid)); c.commit(); c.close()
 
+    def _otp_grant(self, c, uid, oid, lines):
+        """Delivered stock lines that contain a mail registered in Netflix OTP -> this buyer may get
+        OTP_PER_PROFILE (default 1) login code(s) for that profile. Same connection/transaction as the sale."""
+        try:
+            per = max(1, int(os.getenv("OTP_PER_PROFILE", "1")))
+            c.execute("CREATE TABLE IF NOT EXISTS otp_grants(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,"
+                      " mail_id INTEGER NOT NULL, order_id TEXT, line TEXT, otp_limit INTEGER NOT NULL DEFAULT 1,"
+                      " used INTEGER NOT NULL DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+            for ln in lines:
+                m = re.search(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", ln or "")
+                if not m:
+                    continue
+                r = c.execute("SELECT id FROM otp_mails WHERE lower(email)=?", (m.group(0).lower(),)).fetchone()
+                if r:
+                    c.execute("INSERT INTO otp_grants(user_id,mail_id,order_id,line,otp_limit) VALUES(?,?,?,?,?)",
+                              (uid, r["id"], oid, (ln or "")[:300], per))
+        except Exception:
+            pass        # never block a sale because of the OTP helper
+
     def fulfill_order(self,oid):
         c=self.conn()
         c.execute("BEGIN IMMEDIATE")
@@ -293,6 +323,7 @@ class Database(GrowthMixin):
         for x in links:
             c.execute("UPDATE stock SET sold=1 WHERE id=?",(x["id"],))
         c.execute("UPDATE orders SET status='paid',paid_at=?,paid_with='crypto' WHERE id=?",(datetime.now(timezone.utc).isoformat(),oid))
+        self._otp_grant(c, o["user_id"], oid, [x["link"] for x in links])
         self._credit_spend(c, o["user_id"], o["amount"])
         c.commit(); c.close()
         return [x["link"] for x in links]
@@ -378,6 +409,7 @@ class Database(GrowthMixin):
         c.execute("INSERT INTO orders(id,user_id,product_id,quantity,unit_price,amount,status,expires_at,created_at,paid_at,paid_with) "
                   "VALUES(?,?,?,?,?,?,'paid',?,?,?,'balance')", (oid,uid,pid,qty,unit,amount,now,now,now))
         c.execute("UPDATE users SET balance=ROUND(COALESCE(balance,0)-?,2) WHERE user_id=?", (amount, uid))
+        self._otp_grant(c, uid, oid, [x["link"] for x in links])
         self._credit_spend(c, uid, amount)
         c.commit(); c.close()
         return oid, [x["link"] for x in links]

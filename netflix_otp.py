@@ -41,6 +41,11 @@ CREATE TABLE IF NOT EXISTS otp_assign(
     mail_id INTEGER NOT NULL,
     otp_limit INTEGER NOT NULL DEFAULT 5,
     used INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS otp_grants(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL, mail_id INTEGER NOT NULL, order_id TEXT, line TEXT,
+    otp_limit INTEGER NOT NULL DEFAULT 1, used INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS otp_log(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER, mail_id INTEGER, result TEXT,
@@ -130,7 +135,67 @@ def _log(uid, mid, result):
     c.close()
 
 
+def _grants(uid):
+    c = _conn()
+    rows = c.execute("""SELECT g.id, g.otp_limit, g.used, g.line, m.email
+                        FROM otp_grants g JOIN otp_mails m ON m.id=g.mail_id
+                        WHERE g.user_id=? AND g.used<g.otp_limit ORDER BY g.id""", (uid,)).fetchall()
+    c.close()
+    return rows
+
+
+def _profile_hint(line):
+    """'mail:pass | Profile 3 | PIN 1234' -> 'Profile 3' (best effort, for the button label)."""
+    parts = [x.strip() for x in re.split(r"[|\n]", line or "") if x.strip()]
+    return parts[1] if len(parts) > 1 else ""
+
+
+async def _read_and_send(uid, mail_id, addr, pwd_enc, host, used, limit, count_sql, count_arg):
+    pwd = decrypt(pwd_enc)
+    if not pwd:
+        return "⚠️ This mail is not set up correctly. Please contact the admin."
+    try:
+        res = await asyncio.to_thread(fetch_netflix_mail, addr, pwd, host)
+    except Exception as e:
+        log.warning("OTP mail check failed for %s: %s", addr, type(e).__name__)
+        _log(uid, mail_id, "error: " + type(e).__name__)
+        return "⚠️ Could not check the mail right now. Try again in a minute."
+    if not res:
+        _log(uid, mail_id, "no mail")
+        return (f"📭 No new Netflix mail in the last {MAX_AGE_MIN} min.\n"
+                "First open Netflix and ask for the login code, then press the button again.\n"
+                f"Used: {used}/{limit} (this try was not counted)")
+    c = _conn()
+    cur = c.execute(count_sql, (count_arg,))
+    c.commit()
+    c.close()
+    if cur.rowcount == 0:
+        return "⛔ Your OTP limit is finished. Please contact the admin."
+    _log(uid, mail_id, "sent " + (res["code"] or "link"))
+    out = f"✅ Mail: {addr}\n"
+    if res["code"]:
+        out += f"🔑 Code: {res['code']}\n"
+    if res["link"]:
+        out += f"🔗 Link: {res['link']}\n"
+    return out + f"\nUsed: {used + 1}/{limit}"
+
+
+async def do_grant(uid: int, gid: int) -> str:
+    c = _conn()
+    g = c.execute("""SELECT g.id, g.otp_limit, g.used, m.id mid, m.email, m.pwd_enc, m.imap_host
+                     FROM otp_grants g JOIN otp_mails m ON m.id=g.mail_id WHERE g.id=? AND g.user_id=?""",
+                  (gid, uid)).fetchone()
+    c.close()
+    if not g:
+        return "❌ This profile was not found."
+    if g["used"] >= g["otp_limit"]:
+        return f"⛔ The OTP for this profile was already used ({g['used']}/{g['otp_limit']})."
+    return await _read_and_send(uid, g["mid"], g["email"], g["pwd_enc"], g["imap_host"], g["used"], g["otp_limit"],
+                                "UPDATE otp_grants SET used=used+1 WHERE id=? AND used<otp_limit", gid)
+
+
 async def do_otp(uid: int) -> str:
+    """Old manual assignment (admin assigned a mail to a user)."""
     c = _conn()
     a = c.execute("""SELECT a.id, a.otp_limit, a.used, m.id mid, m.email, m.pwd_enc, m.imap_host
                      FROM otp_assign a JOIN otp_mails m ON m.id=a.mail_id WHERE a.user_id=?""",
@@ -140,45 +205,50 @@ async def do_otp(uid: int) -> str:
         return "❌ No mail is assigned to you. Please contact the admin."
     if a["used"] >= a["otp_limit"]:
         return f"⛔ Your OTP limit is finished ({a['used']}/{a['otp_limit']}). Please contact the admin."
-    pwd = decrypt(a["pwd_enc"])
-    if not pwd:
-        return "⚠️ This mail is not set up correctly. Please contact the admin."
-    try:
-        res = await asyncio.to_thread(fetch_netflix_mail, a["email"], pwd, a["imap_host"])
-    except Exception as e:
-        log.warning("OTP mail check failed for %s: %s", a["email"], type(e).__name__)
-        _log(uid, a["mid"], "error: " + type(e).__name__)
-        return "⚠️ Could not check the mail right now. Try again in a minute."
-    if not res:
-        _log(uid, a["mid"], "no mail")
-        return (f"📭 No new Netflix mail in the last {MAX_AGE_MIN} min.\n"
-                "First ask Netflix to send the code/link, then press the button again.\n"
-                f"Used: {a['used']}/{a['otp_limit']} (this try was not counted)")
-    c = _conn()
-    cur = c.execute("UPDATE otp_assign SET used=used+1 WHERE id=? AND used<otp_limit", (a["id"],))
-    c.commit()
-    c.close()
-    if cur.rowcount == 0:
-        return "⛔ Your OTP limit is finished. Please contact the admin."
-    _log(uid, a["mid"], "sent " + (res["code"] or "link"))
-    out = f"✅ Mail: {a['email']}\n"
-    if res["code"]:
-        out += f"🔑 Code: {res['code']}\n"
-    if res["link"]:
-        out += f"🔗 Link: {res['link']}\n"
-    return out + f"\nUsed: {a['used'] + 1}/{a['otp_limit']}"
+    return await _read_and_send(uid, a["mid"], a["email"], a["pwd_enc"], a["imap_host"], a["used"], a["otp_limit"],
+                                "UPDATE otp_assign SET used=used+1 WHERE id=? AND used<otp_limit", a["id"])
+
+
+async def _start(uid):
+    """-> (text, markup or None): one profile -> read it now, several -> let the user pick."""
+    gs = _grants(uid)
+    if not gs:
+        c = _conn()
+        manual = c.execute("SELECT 1 FROM otp_assign WHERE user_id=?", (uid,)).fetchone()
+        c.close()
+        if manual:
+            return await do_otp(uid), None
+        return ("❌ You have no profile waiting for an OTP.\n"
+                "Each purchased Netflix profile gets one login code. If you already used it, contact support."), None
+    if len(gs) == 1:
+        return await do_grant(uid, gs[0]["id"]), None
+    rows = []
+    for g in gs[:20]:
+        hint = _profile_hint(g["line"])
+        rows.append([InlineKeyboardButton(f"🔑 {g['email']}" + (f" · {hint}" if hint else ""),
+                                          callback_data=f"otpg:{g['id']}")])
+    return "Which profile do you want the login code for?", InlineKeyboardMarkup(rows)
 
 
 async def otp_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wait = await update.message.reply_text("⏳ Checking the mail...")
-    text = await do_otp(update.effective_user.id)
-    await wait.edit_text(text, disable_web_page_preview=True)
+    text, markup = await _start(update.effective_user.id)
+    await wait.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
 
 
 async def otp_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer("Checking...")
-    await q.message.reply_text(await do_otp(q.from_user.id), disable_web_page_preview=True)
+    text, markup = await _start(q.from_user.id)
+    await q.message.reply_text(text, reply_markup=markup, disable_web_page_preview=True)
+
+
+async def otpg_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer("Checking...")
+    gid = int(q.data.split(":", 1)[1])
+    text = await do_grant(q.from_user.id, gid)
+    await q.message.reply_text(text, disable_web_page_preview=True)
 
 
 def register_bot(app):
@@ -186,6 +256,7 @@ def register_bot(app):
     app.add_handler(CommandHandler("otp", otp_msg))
     app.add_handler(MessageHandler(filters.Regex("^" + re.escape(BTN_LABEL) + "$"), otp_msg))
     app.add_handler(CallbackQueryHandler(otp_cb, pattern=r"^otp$"))
+    app.add_handler(CallbackQueryHandler(otpg_cb, pattern=r"^otpg:\d+$"))
 
 
 # ------------------------------------------------------------------ admin website
@@ -252,6 +323,7 @@ def home():
                         flash(str(e), "err")
             elif act == "delmail":
                 c.execute("DELETE FROM otp_assign WHERE mail_id=?", (int(f["id"]),))
+                c.execute("DELETE FROM otp_grants WHERE mail_id=?", (int(f["id"]),))
                 c.execute("DELETE FROM otp_mails WHERE id=?", (int(f["id"]),))
                 c.commit()
                 flash("Mail deleted.")
