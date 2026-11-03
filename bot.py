@@ -1668,7 +1668,18 @@ async def cb_bal(update, context, arg):
     order = db.get_order(order_id)
     p_sold = db.get_product_any(pid)
     await announce_sale(context.bot, p_sold["name"] if p_sold else "Product", qty, order_id, "Telegram bot")
-    markup = Markup([[Btn("🛍 " + tt(language, "browse"), callback_data="shop", style="success")]])
+    rows = []
+    try:       # Netflix profile (or any order with a registered OTP mail): "Get OTP" button under the delivery
+        c = db.conn()
+        has_grant = c.execute("SELECT 1 FROM sqlite_master WHERE name='otp_grants'").fetchone() and \
+            c.execute("SELECT 1 FROM otp_grants WHERE order_id=? LIMIT 1", (order_id,)).fetchone()
+        c.close()
+        if has_grant or "netflix" in ((p_sold["name"] if p_sold else "") or "").casefold():
+            rows.append([Btn("🔑 Get OTP", callback_data="otp", style="primary")])
+    except Exception:
+        log.exception("could not add the Get OTP button")
+    rows.append([Btn("🛍 " + tt(language, "browse"), callback_data="shop", style="success")])
+    markup = Markup(rows)
     await edit(q, delivery_text(language, order, items), markup)
 
 

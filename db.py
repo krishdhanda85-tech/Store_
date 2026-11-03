@@ -2,12 +2,26 @@ import os
 import re
 import secrets
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 DEFAULT_REFERRAL_PERCENT = float(os.getenv("REFERRAL_PERCENT", "3"))  # used until the admin sets one
 DEFAULT_INR_RATE = float(os.getenv("INR_RATE", "100"))  # INR per 1 USDT until the admin changes it
 
 from growth import GrowthMixin, USER_COLUMNS as _GROWTH_USER_COLUMNS, ORDER_COLUMNS as _GROWTH_ORDER_COLUMNS
+
+
+NF_DDL = ("CREATE TABLE IF NOT EXISTS nf_subs(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, name TEXT, mail TEXT,"
+          " profile TEXT, start_date TEXT, expires_at TEXT, order_id TEXT, source TEXT DEFAULT 'bot', notified_at TEXT,"
+          " created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+
+
+def nf_days(name):
+    """'Netflix 3 months' -> 90, '1 year' -> 365, '2 weeks' -> 14 (default 30)."""
+    m = re.search(r"(\d+)\s*(year|yr|month|mo\b|week|day)", (name or "").casefold())
+    if not m:
+        return 30
+    n, u = int(m.group(1)), m.group(2)
+    return max(1, n * (365 if u in ("year", "yr") else 30 if u.startswith("mo") else 7 if u == "week" else 1))
 
 
 class Database(GrowthMixin):
@@ -311,6 +325,24 @@ class Database(GrowthMixin):
         except Exception:
             pass        # never block a sale because of the OTP helper
 
+    def _nf_record(self, c, uid, oid, pid, lines):
+        """Netflix profile sold -> one row in the Netflix customers list (same transaction as the sale)."""
+        try:
+            pr = c.execute("SELECT name FROM products WHERE id=?", (pid,)).fetchone()
+            if not pr or "netflix" not in (pr["name"] or "").casefold():
+                return
+            c.execute(NF_DDL)
+            days = nf_days(pr["name"])
+            today = datetime.now(timezone.utc).date()
+            for ln in lines:
+                m = re.search(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", ln or "")
+                parts = [x.strip() for x in re.split(r"[|\n]", ln or "") if x.strip()]
+                c.execute("INSERT INTO nf_subs(user_id,mail,profile,start_date,expires_at,order_id,source) VALUES(?,?,?,?,?,?,'bot')",
+                          (uid, m.group(0).lower() if m else "", parts[1][:60] if len(parts) > 1 else "",
+                           today.isoformat(), (today + timedelta(days=days)).isoformat(), oid))
+        except Exception:
+            pass        # never block a sale because of the Netflix list
+
     def fulfill_order(self,oid):
         c=self.conn()
         c.execute("BEGIN IMMEDIATE")
@@ -324,6 +356,7 @@ class Database(GrowthMixin):
             c.execute("UPDATE stock SET sold=1 WHERE id=?",(x["id"],))
         c.execute("UPDATE orders SET status='paid',paid_at=?,paid_with='crypto' WHERE id=?",(datetime.now(timezone.utc).isoformat(),oid))
         self._otp_grant(c, o["user_id"], oid, [x["link"] for x in links])
+        self._nf_record(c, o["user_id"], oid, o["product_id"], [x["link"] for x in links])
         self._credit_spend(c, o["user_id"], o["amount"])
         c.commit(); c.close()
         return [x["link"] for x in links]
@@ -410,6 +443,7 @@ class Database(GrowthMixin):
                   "VALUES(?,?,?,?,?,?,'paid',?,?,?,'balance')", (oid,uid,pid,qty,unit,amount,now,now,now))
         c.execute("UPDATE users SET balance=ROUND(COALESCE(balance,0)-?,2) WHERE user_id=?", (amount, uid))
         self._otp_grant(c, uid, oid, [x["link"] for x in links])
+        self._nf_record(c, uid, oid, pid, [x["link"] for x in links])
         self._credit_spend(c, uid, amount)
         c.commit(); c.close()
         return oid, [x["link"] for x in links]

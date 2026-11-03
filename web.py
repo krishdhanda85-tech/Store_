@@ -44,6 +44,8 @@ from alerts_admin import register as register_alerts_admin
 register_alerts_admin(app)
 from netflix_otp import register_admin as register_otp_admin
 register_otp_admin(app)
+from netflix_admin import register_admin as register_netflix_admin
+register_netflix_admin(app)
 app.config["MAX_CONTENT_LENGTH"] = 3 * 1024 * 1024   # QR uploads
 app.secret_key = os.getenv("SECRET_KEY") or hashlib.sha256(
     ("shop-admin:" + ADMIN_PASSWORD).encode()
@@ -262,6 +264,7 @@ tr:hover td{background:var(--bg)}
 {{ nl('tickets','Support','help',open_tickets,'ticket') }}
 {{ nl('assistant_admin.home','AI Assistant','help') }}
 {{ nl('smart_admin.home','Smart Promo','sliders') }}
+{{ nl('netflix_admin.home','Netflix customers','users') }}
 {{ nl('otp_admin.home','Netflix OTP','key') }}
 {{ nl('userprices','User prices','tag') }}
 <div class="grp">Growth</div>
