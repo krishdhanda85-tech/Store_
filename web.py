@@ -40,6 +40,8 @@ from import_admin import register as register_import_admin
 register_import_admin(app)
 from compare_admin import register as register_compare_admin
 register_compare_admin(app)
+from alerts_admin import register as register_alerts_admin
+register_alerts_admin(app)
 from netflix_otp import register_admin as register_otp_admin
 register_otp_admin(app)
 app.config["MAX_CONTENT_LENGTH"] = 3 * 1024 * 1024   # QR uploads
@@ -250,6 +252,7 @@ tr:hover td{background:var(--bg)}
 {{ nl('products','Products','box') }}
 {{ nl('import_admin.home','Import products','link') }}
 {{ nl('compare_admin.home','Compare & import','link') }}
+{{ nl('alerts_admin.home','Stock alerts','clock') }}
 {{ nl('profit_centre','Profit centre','card') }}
 <div class="grp">Payments</div>
 {{ nl('upipay','UPI payments','card',upi_pending) }}

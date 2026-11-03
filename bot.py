@@ -2839,7 +2839,7 @@ async def provider_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def autoimport_job(context: ContextTypes.DEFAULT_TYPE):
     """Every 10 min: if Auto mode is ON, compare all suppliers and add new products (cheapest supplier,
-    category, description and markup price). Tells the admins what was added."""
+    category, description and markup price). Result goes to the website activity log (no Telegram spam)."""
     import compare_admin
     try:
         if str(db.get_setting("auto_import_on", "0")) != "1":
@@ -2848,14 +2848,8 @@ async def autoimport_job(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.warning("auto import failed: %s", e)
         return
-    if r["added"]:
-        shown = ", ".join(esc(n) for n in r["names"][:8])
-        more = f" +{len(r['names']) - 8} more" if len(r["names"]) > 8 else ""
-        txt = (f"🤖 Auto mode added {r['added']} new product(s): {shown}{more}.\n"
-               "Open the Products page to add emojis or change prices.")
-        if r["below_cost"]:
-            txt += f"\n⚠️ {r['below_cost']} priced at or below cost."
-        await notify_admins(context, txt)
+    if r["added"] and db.get_setting("auto_import_notify", "0") == "1":
+        await notify_admins(context, f"🤖 Auto mode added {r['added']} new product(s). See Stock alerts → Activity on the website.")
 
 
 # ---------------------------------------------------------------- one bot per seller
@@ -3377,25 +3371,28 @@ async def on_error(update, context):
 
 
 async def lowstock_job(context: ContextTypes.DEFAULT_TYPE):
-    """Every 30 min: tell the owner once when an auto-delivery product runs low / out of stock,
-    and again only after it was refilled and ran low again."""
-    for p in db.list_products():
-        if is_manual(p):
-            continue
-        flag = f"lowstock_alerted_{p['id']}"
-        stock = int(p["stock"] or 0)
-        alerted = db.get_setting(flag, "0") == "1"
-        if stock <= LOW_STOCK_THRESHOLD and not alerted:
-            icon, msg = ("🔴", "OUT OF STOCK") if stock == 0 else ("🟠", f"only {stock} left")
-            try:
-                await context.bot.send_message(
-                    owner_id(), f"{icon} <b>{esc(p['name'])}</b>: {msg}. Add stock to keep selling.",
-                    parse_mode=HTML)
-                db.set_setting(flag, "1")
-            except Exception:
-                log.exception("low stock alert failed")
-        elif stock > LOW_STOCK_THRESHOLD and alerted:
-            db.set_setting(flag, "0")
+    """No more one Telegram message per product. Out-of-stock / low-stock products are listed on the
+    admin website (Stock alerts page). Optional, OFF by default: ONE short summary per day."""
+    import time as _t
+    import alerts_admin
+    if db.get_setting("lowstock_digest", "0") != "1":
+        return
+    try:
+        last = float(db.get_setting("lowstock_digest_ts", "0") or 0)
+    except ValueError:
+        last = 0
+    if _t.time() - last < 86400:
+        return
+    out, low, _m = alerts_admin.summary(db)
+    if not out and not low:
+        return
+    try:
+        await context.bot.send_message(
+            owner_id(), f"📦 Stock summary: <b>{len(out)}</b> out of stock, <b>{len(low)}</b> running low.\n"
+                        "Open the admin website → Stock alerts to see them.", parse_mode=HTML)
+        db.set_setting("lowstock_digest_ts", str(_t.time()))
+    except Exception:
+        log.exception("stock summary failed")
 
 
 async def maintenance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):

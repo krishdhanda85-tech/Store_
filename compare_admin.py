@@ -439,6 +439,17 @@ def auto_import(db, limit=100):
             added += 1
             below += 1 if bc else 0
             added_names.append(g["name"])
+    if added or problems:
+        try:
+            import alerts_admin
+            shown = ", ".join(added_names[:6]) + (f" +{len(added_names) - 6} more" if len(added_names) > 6 else "")
+            if added:
+                alerts_admin.log_event(db, f"Auto mode added {added} product(s): {shown}"
+                                           + (f" ({below} at or below cost)" if below else ""))
+            for p in problems[:3]:
+                alerts_admin.log_event(db, f"Auto mode problem: {p}")
+        except Exception:
+            pass
     return {"added": added, "below_cost": below, "problems": problems, "names": added_names, "errs": errs}
 
 
