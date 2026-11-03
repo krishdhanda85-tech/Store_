@@ -29,6 +29,8 @@ log = logging.getLogger("netflix_otp")
 MAX_AGE_MIN = int(os.getenv("OTP_MAX_AGE_MIN", "20"))
 OTP_DIGITS = max(4, min(8, int(os.getenv("OTP_DIGITS", "4"))))   # Netflix sign-in code length
 BTN_LABEL = "🔑 Get OTP"
+UNL_COOLDOWN = int(os.getenv("OTP_UNLIMITED_COOLDOWN", "5"))     # seconds between two tries of one unlimited user
+_last_try = {}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS otp_mails(
@@ -47,6 +49,12 @@ CREATE TABLE IF NOT EXISTS otp_grants(
     user_id INTEGER NOT NULL, mail_id INTEGER NOT NULL, order_id TEXT, line TEXT,
     otp_limit INTEGER NOT NULL DEFAULT 1, used INTEGER NOT NULL DEFAULT 0,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS otp_unlimited(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL, mail_id INTEGER NOT NULL,
+    taken INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, mail_id));
 CREATE TABLE IF NOT EXISTS otp_log(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER, mail_id INTEGER, result TEXT,
@@ -213,8 +221,62 @@ async def do_otp(uid: int) -> str:
                                 "UPDATE otp_assign SET used=used+1 WHERE id=? AND used<otp_limit", a["id"])
 
 
+def _unlimited(uid):
+    c = _conn()
+    rows = c.execute("""SELECT u.id, m.email FROM otp_unlimited u JOIN otp_mails m ON m.id=u.mail_id
+                        WHERE u.user_id=? ORDER BY u.id""", (uid,)).fetchall()
+    c.close()
+    return rows
+
+
+async def do_unlimited(uid: int, rid: int) -> str:
+    """Admin-given access: no limit, the try is never counted against anything."""
+    c = _conn()
+    u = c.execute("""SELECT u.id, m.id mid, m.email, m.pwd_enc, m.imap_host
+                     FROM otp_unlimited u JOIN otp_mails m ON m.id=u.mail_id WHERE u.id=? AND u.user_id=?""",
+                  (rid, uid)).fetchone()
+    c.close()
+    if not u:
+        return "❌ You do not have access to this mail any more. Please contact the admin."
+    now = datetime.now().timestamp()
+    wait = UNL_COOLDOWN - (now - _last_try.get(uid, 0))
+    if wait > 0:
+        return f"⏳ Please wait {int(wait) + 1} second(s) and press again."
+    _last_try[uid] = now
+    pwd = decrypt(u["pwd_enc"])
+    if not pwd:
+        return "⚠️ This mail is not set up correctly. Please contact the admin."
+    try:
+        res = await asyncio.to_thread(fetch_netflix_mail, u["email"], pwd, u["imap_host"])
+    except Exception as e:
+        log.warning("OTP mail check failed for %s: %s", u["email"], type(e).__name__)
+        _log(uid, u["mid"], "unlimited error: " + type(e).__name__)
+        return "⚠️ Could not check the mail right now. Try again in a minute."
+    if not res:
+        _log(uid, u["mid"], "unlimited no mail")
+        return (f"📭 No new Netflix mail in the last {MAX_AGE_MIN} min.\n"
+                "First open Netflix and ask for the login code, then press the button again.")
+    c = _conn()
+    c.execute("UPDATE otp_unlimited SET taken=taken+1 WHERE id=?", (u["id"],))
+    c.commit()
+    c.close()
+    _log(uid, u["mid"], "unlimited sent " + (res["code"] or "link"))
+    out = f"✅ Mail: {u['email']}\n"
+    if res["code"]:
+        out += f"🔑 Code: {res['code']}\n"
+    if res["link"]:
+        out += f"🔗 Link: {res['link']}\n"
+    return out + "\n♾ Unlimited access"
+
+
 async def _start(uid):
     """-> (text, markup or None): one profile -> read it now, several -> let the user pick."""
+    ul = _unlimited(uid)
+    if len(ul) == 1:
+        return await do_unlimited(uid, ul[0]["id"]), None
+    if len(ul) > 1:
+        rows = [[InlineKeyboardButton(f"♾ {r['email']}", callback_data=f"otpu:{r['id']}")] for r in ul[:20]]
+        return "Which mail do you want the login code for?", InlineKeyboardMarkup(rows)
     gs = _grants(uid)
     if not gs:
         c = _conn()
@@ -255,12 +317,21 @@ async def otpg_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.message.reply_text(text, disable_web_page_preview=True)
 
 
+async def otpu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer("Checking...")
+    rid = int(q.data.split(":", 1)[1])
+    text = await do_unlimited(q.from_user.id, rid)
+    await q.message.reply_text(text, disable_web_page_preview=True)
+
+
 def register_bot(app):
     """Call in build_application BEFORE the catch-all callback / text handlers."""
     app.add_handler(CommandHandler("otp", otp_msg))
     app.add_handler(MessageHandler(filters.Regex("^" + re.escape(BTN_LABEL) + "$"), otp_msg))
     app.add_handler(CallbackQueryHandler(otp_cb, pattern=r"^otp$"))
     app.add_handler(CallbackQueryHandler(otpg_cb, pattern=r"^otpg:\d+$"))
+    app.add_handler(CallbackQueryHandler(otpu_cb, pattern=r"^otpu:\d+$"))
 
 
 # ------------------------------------------------------------------ admin website
@@ -297,6 +368,21 @@ A try counts only when a code/link was really found. Gmail needs an <b>App Passw
 <form method="post" style="display:inline" onsubmit="return confirm('Remove?')"><input type="hidden" name="action" value="unassign"><input type="hidden" name="id" value="{{ a.id }}"><button type="submit" class="red">Remove</button></form></td></tr>
 {% else %}<tr><td colspan="5">Nobody assigned yet.</td></tr>{% endfor %}</table></div></div>
 
+<div class="card"><h3>♾ Unlimited OTP access</h3>
+<p class="muted">Give any Telegram user unlimited OTPs for a mail. No limit, nothing is counted against them.
+They press <b>🔑 Get OTP</b> as many times as they want until you remove them.</p>
+<form method="post"><input type="hidden" name="action" value="unl_add">
+<label>Telegram user ID</label><input name="uid" inputmode="numeric" required>
+<label>Mail</label><select name="mail_id">{% for m in mails %}<option value="{{ m.id }}">{{ m.email }}</option>{% endfor %}<option value="all">All mails</option></select>
+<label><input type="checkbox" name="notify" value="1" checked style="width:auto"> Tell the user on Telegram</label>
+<button type="submit" class="green">Give unlimited access</button></form>
+<div class="scroll"><table><tr><th>User</th><th>Mail</th><th>OTPs taken</th><th></th></tr>
+{% for u in unl %}<tr><td>{{ u.user_id }}</td><td>{{ u.email }}</td><td>{{ u.taken }}</td>
+<td style="white-space:nowrap">
+<form method="post" style="display:inline"><input type="hidden" name="action" value="unl_reset"><input type="hidden" name="id" value="{{ u.id }}"><button type="submit">Reset count</button></form>
+<form method="post" style="display:inline" onsubmit="return confirm('Remove this access?')"><input type="hidden" name="action" value="unl_del"><input type="hidden" name="id" value="{{ u.id }}"><button type="submit" class="red">Remove</button></form></td></tr>
+{% else %}<tr><td colspan="4">Nobody has unlimited access yet.</td></tr>{% endfor %}</table></div></div>
+
 <div class="card"><h3>Last 50 tries</h3><div class="scroll"><table><tr><th>Time (UTC)</th><th>User</th><th>Mail</th><th>Result</th></tr>
 {% for l in logs %}<tr><td>{{ l.ts }}</td><td>{{ l.user_id }}</td><td>{{ l.email or '-' }}</td><td>{{ l.result }}</td></tr>
 {% else %}<tr><td colspan="4">No tries yet.</td></tr>{% endfor %}</table></div></div>
@@ -328,6 +414,7 @@ def home():
             elif act == "delmail":
                 c.execute("DELETE FROM otp_assign WHERE mail_id=?", (int(f["id"]),))
                 c.execute("DELETE FROM otp_grants WHERE mail_id=?", (int(f["id"]),))
+                c.execute("DELETE FROM otp_unlimited WHERE mail_id=?", (int(f["id"]),))
                 c.execute("DELETE FROM otp_mails WHERE id=?", (int(f["id"]),))
                 c.commit()
                 flash("Mail deleted.")
@@ -346,6 +433,35 @@ def home():
                 c.execute("UPDATE otp_assign SET used=0 WHERE id=?", (int(f["id"]),))
                 c.commit()
                 flash("Used count reset.")
+            elif act == "unl_add":
+                try:
+                    uid = int(f["uid"].strip())
+                    mail_ids = ([r["id"] for r in c.execute("SELECT id FROM otp_mails").fetchall()]
+                                if f.get("mail_id") == "all" else [int(f["mail_id"])])
+                except (ValueError, KeyError):
+                    flash("User ID and mail must be valid.", "err")
+                    return redirect(url_for("otp_admin.home"))
+                if not mail_ids:
+                    flash("Add a mail first.", "err")
+                    return redirect(url_for("otp_admin.home"))
+                for mid in mail_ids:
+                    c.execute("INSERT OR IGNORE INTO otp_unlimited(user_id,mail_id) VALUES(?,?)", (uid, mid))
+                c.commit()
+                if f.get("notify"):
+                    try:
+                        web.db.queue_message(uid, "♾ <b>Unlimited OTP access</b> was given to you.\n"
+                                                  "Press <b>🔑 Get OTP</b> (or send /otp) any time you need a Netflix login code.")
+                    except Exception:
+                        pass
+                flash("Unlimited access given.")
+            elif act == "unl_reset":
+                c.execute("UPDATE otp_unlimited SET taken=0 WHERE id=?", (int(f["id"]),))
+                c.commit()
+                flash("Count reset.")
+            elif act == "unl_del":
+                c.execute("DELETE FROM otp_unlimited WHERE id=?", (int(f["id"]),))
+                c.commit()
+                flash("Access removed.")
             elif act == "unassign":
                 c.execute("DELETE FROM otp_assign WHERE id=?", (int(f["id"]),))
                 c.commit()
@@ -355,11 +471,13 @@ def home():
                              FROM otp_mails m ORDER BY m.id""").fetchall()
         assigns = c.execute("""SELECT a.*, m.email FROM otp_assign a
                                JOIN otp_mails m ON m.id=a.mail_id ORDER BY a.id DESC""").fetchall()
+        unl = c.execute("""SELECT u.*, m.email FROM otp_unlimited u
+                           JOIN otp_mails m ON m.id=u.mail_id ORDER BY u.id DESC""").fetchall()
         logs = c.execute("""SELECT l.*, m.email FROM otp_log l LEFT JOIN otp_mails m ON m.id=l.mail_id
                             ORDER BY l.id DESC LIMIT 50""").fetchall()
     finally:
         c.close()
-    return web.render_str(PAGE, mails=mails, assigns=assigns, logs=logs)
+    return web.render_str(PAGE, mails=mails, assigns=assigns, unl=unl, logs=logs)
 
 
 def register_admin(app):
