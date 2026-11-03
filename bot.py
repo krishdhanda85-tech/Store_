@@ -121,7 +121,7 @@ TEXT = {
         "welcome": "👋 <b>Welcome to {shop}!</b>\n\n✨ Premium digital products at great prices.\n⚡ Fast delivery • 🔒 Secure checkout • 🎧 Friendly support\n\n🌐 Choose your language / 请选择语言 👇",
         "menu_ready": "👋 <b>Welcome to {shop}!</b>\n\n✨ Your digital shop for premium subscriptions and services.\n⚡ Quick delivery • 💳 Easy wallet top-ups • 🎧 Support when you need it.\n\n👇 <b>Choose an option below to get started!</b>",
         "lang_set": "✅ Language saved.",
-        "shop_head": "🛍️ <b>Welcome to the Shop</b>\n\n<blockquote>🟢 Available products: <b>{avail}</b>\n📦 Total products: <b>{total}</b>\n⚡ Fast digital delivery</blockquote>\n\n🔷 Choose a category or browse products below ⬇️",
+        "shop_head": "🛍️ <b>Welcome to the Shop</b>\n\n<blockquote>🟢 Available products: <b>{avail}</b>\n📦 Total products: <b>{total}</b>\n⚡ Fast digital delivery</blockquote>\n\n🔷 Choose a product below ⬇️",
         "no_products": "🛍 <b>{shop}</b>\n\nNo products available right now.",
         "cat_head": "📂 <b>{cat}</b>\n\n🟢 Select your product below ⬇️",
         "btn_search": "🔎 Search",
@@ -1034,6 +1034,7 @@ def product_button(uid: int, p):
     return Btn("🔴 " + label.removeprefix("🟢 ") + " · SOLD OUT", callback_data=f"prod:{p['id']}", style="danger")
 
 
+FLAT_GRID = os.getenv("FLAT_GRID", "1").strip() != "0"     # 1 = only the 3-column product grid (no category folders)
 GRID_COLS = 3
 GRID_PAGE_SIZE = 30            # 10 rows x 3 columns
 SHORT_NAME = 18
@@ -1078,7 +1079,7 @@ def shop_view(uid: int, language: str, category: str = None, page: int = 0):
         text = tt(language, "shop_head", avail=avail, total=len(products))
         shown = list(products)
         nav_key = "shop"
-        cats = cat_children(None)
+        cats = [] if FLAT_GRID else cat_children(None)    # FLAT_GRID: no category folders, one 3-column grid of all products
         if cats and page == 0:        # categories (if the admin uses them) are one row of buttons above the grid
             for i in range(0, len(cats), GRID_COLS):
                 rows.append([category_button(c) for c in cats[i:i + GRID_COLS]])
