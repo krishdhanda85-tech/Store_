@@ -32,19 +32,87 @@ GENERIC_CATS = {"account", "accounts", "key", "keys", "link", "links", "code", "
                 "general", "auto", "automatic", "product", "products", "digital", "instant", ""}
 
 
+DEFAULT_ALIASES = """
+Amazon Prime = amazon prime video = prime video = amazon prime = prime vedio = amazon prime vedio = amazon video
+ChatGPT = chat gpt = gpt = openai chatgpt = open ai chatgpt = gpt plus
+YouTube = youtube premium = you tube = yt premium = yt
+Disney+ = disney plus = disneyplus = disney hotstar = hotstar disney = hotstar
+Spotify = spotify premium
+Gemini = google gemini = gemini ai = gemini advanced
+Perplexity = perplexity ai = perplexity pro
+Midjourney = mid journey
+CapCut = cap cut
+Canva = canva pro
+Microsoft 365 = office 365 = office365 = m365 = ms 365 = microsoft office
+LinkedIn = linked in = linkedin premium
+NordVPN = nord vpn
+ExpressVPN = express vpn
+Crunchyroll = crunchy roll
+Telegram Premium = tg premium = telegram prem
+"""
+
+# words that never change which product it is
+NOISE = {"buy", "account", "accounts", "acc", "subscription", "subs", "sub", "full", "instant", "delivery",
+         "warranty", "hw", "the", "for", "with", "new", "your", "get"}
+
+
 def _squash(s):
     return re.sub(r"[^a-z0-9]", "", (s or "").casefold())
 
 
-def _norm(name):
-    """-> (numbers tuple, alpha string) used to decide that two names are the same product."""
-    s = (name or "").casefold()
+def make_rules(custom=""):
+    """Alias rules: 'Label = phrase = phrase'. Your own lines win over the built-in ones."""
+    seen, rules = set(), []
+    for line in ((custom or "") + "\n" + DEFAULT_ALIASES).splitlines():
+        parts = [p.strip() for p in line.split("=") if p.strip()]
+        if len(parts) < 2:
+            continue
+        label = parts[0]
+        canon = _squash(label)
+        if not canon:
+            continue
+        for ph in parts:
+            key = (ph.casefold(), canon)
+            if key in seen:
+                continue
+            seen.add(key)
+            words = [re.escape(w) for w in re.split(r"[\s\-_]+", ph.casefold()) if w]
+            if not words:
+                continue
+            rx = re.compile(r"(?<![a-z0-9])" + r"[\s\-_]*".join(words) + r"(?![a-z0-9])")
+            rules.append({"canon": canon, "label": label, "phrase": ph, "rx": rx})
+    rules.sort(key=lambda r: -len(r["phrase"]))
+    return rules
+
+
+_DEFAULT_RULES = None
+
+
+def _rules(rules):
+    global _DEFAULT_RULES
+    if rules is not None:
+        return rules
+    if _DEFAULT_RULES is None:
+        _DEFAULT_RULES = make_rules("")
+    return _DEFAULT_RULES
+
+
+def _apply_aliases(text, rules):
+    t = (text or "").casefold()
+    for r in _rules(rules):
+        t = r["rx"].sub(" " + r["canon"] + " ", t)
+    return t
+
+
+def _norm(name, rules=None):
+    """-> (numbers tuple, alpha string): two names with the same value are the same product."""
+    s = _apply_aliases(name, rules)
+    s = re.sub(r"\(?\b\d+\s*(?:hw|hrs?|hours?)\b\)?", " ", s)          # "(24HW)" warranty hours are not a duration
     s = re.sub(r"(\d+)\s*(months?|mos?|m)\b", r"\1 month", s)
     s = re.sub(r"(\d+)\s*(days?|d)\b", r"\1 day", s)
     s = re.sub(r"(\d+)\s*(years?|yrs?|y)\b", r"\1 year", s)
-    s = s.replace("chat gpt", "chatgpt").replace("chat-gpt", "chatgpt")
     nums = tuple(sorted(re.findall(r"\d+", s)))
-    alpha = " ".join(sorted(re.findall(r"[a-z]+", s)))
+    alpha = " ".join(sorted(w for w in re.findall(r"[a-z]+", s) if w not in NOISE))
     return nums, alpha
 
 
@@ -52,26 +120,44 @@ def _gkey(n):
     return f"{','.join(n[0])}|{n[1]}"
 
 
-def guess_category(name, sup_cat, existing_cats):
+def guess_category(name, sup_cat, existing_cats, rules=None):
+    rs = _rules(rules)
+    t = _apply_aliases(name, rs)
+    words = set(re.findall(r"[a-z0-9]+", t))
+    found = [r for r in rs if r["canon"] in words]
+    # 1) one of YOUR categories that means the same brand (e.g. "Amazon prime" for a "Prime Video" product)
+    for c in existing_cats:
+        cw = set(re.findall(r"[a-z0-9]+", _apply_aliases(c, rs)))
+        if found and any(r["canon"] in cw for r in found):
+            return c
     sq = _squash(name)
     for c in sorted(existing_cats, key=lambda x: -len(x)):
         if len(_squash(c)) >= 3 and _squash(c) in sq:
             return c
+    # 2) the brand label from the alias table
+    if found:
+        return found[0]["label"][:60]
     for b in BRANDS:
         if _squash(b) in sq:
             return b
     sc = (sup_cat or "").strip()
     if sc.casefold() not in GENERIC_CATS:
         return sc[:60]
-    words = re.findall(r"[A-Za-z0-9]+", name or "")
-    return (words[0].title() if words else "")[:60]
+    ws = re.findall(r"[A-Za-z0-9]+", name or "")
+    return (ws[0].title() if ws else "")[:60]
 
 
-def build_groups(sups, existing_cats):
+def clean_name(n):
+    n = re.sub(r"^\s*buy\s+", "", n or "", flags=re.I)
+    n = re.sub(r"\s+", " ", n).strip().rstrip(".").strip()
+    return n or (n or "")
+
+
+def build_groups(sups, existing_cats, rules=None):
     groups = []   # [{nums, alpha, offers:[...]}]
     for s in sups:
         for it in s["items"]:
-            nums, alpha = _norm(it["name"])
+            nums, alpha = _norm(it["name"], rules)
             if not alpha:
                 continue
             offer = {"sid": s["id"], "sname": s["name"], "key": it["key"], "name": it["name"],
@@ -82,7 +168,6 @@ def build_groups(sups, existing_cats):
                 if g["nums"] != nums:
                     continue
                 if g["alpha"] == alpha or SequenceMatcher(None, g["alpha"], alpha).ratio() >= 0.9:
-                    # one supplier = one offer per group (keep the cheaper duplicate)
                     hit = g
                     break
             if hit is None:
@@ -102,10 +187,10 @@ def build_groups(sups, existing_cats):
         best = (instock or offs)[0]
         desc = next((o["description"] for o in ([best] + offs) if o["description"]), "")
         out.append({
-            "gkey": _gkey((g["nums"], g["alpha"])), "name": best["name"], "offers": offs, "best": best,
+            "gkey": _gkey((g["nums"], g["alpha"])), "name": clean_name(best["name"]), "offers": offs, "best": best,
             "stock": sum(o["stock"] for o in offs), "instock": bool(instock), "description": desc,
             "category": guess_category(best["name"], next((o["category"] for o in offs if o["category"]), ""),
-                                       existing_cats),
+                                       existing_cats, rules),
         })
     out.sort(key=lambda g: (g["category"].casefold(), g["name"].casefold()))
     return out
@@ -127,6 +212,12 @@ PAGE = r"""{% extends 'base.html' %}{% block body %}
 <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" name="instock" value="1" style="width:auto" {{ 'checked' if auto.instock }}> Only add products that are in stock</label>
 <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap"><button type="submit">Save</button></div></form>
 <form method="post" action="{{ url_for('compare_admin.auto_run') }}" style="margin-top:8px"><button type="submit" class="green sm">Run now</button></form></div>
+
+<div class="card"><h3>Smart matching</h3>
+<p class="muted" style="margin:0 0 8px">The bot already knows that Prime Video = Amazon Prime, Chat GPT = ChatGPT, 1M = 1 Month, and ignores words like "Buy", "Account" or "(24HW)". If it misses one, add your own line: <b>Name = other name = another name</b> (one per line).</p>
+<form method="post" action="{{ url_for('compare_admin.aliases_save') }}">
+<textarea name="aliases" rows="5" spellcheck="false" placeholder="Amazon Prime = prime video = prime vedio&#10;Gemini = google ai pro" style="width:100%">{{ aliases_text }}</textarea>
+<button type="submit" class="sm" style="margin-top:6px">Save</button></form></div>
 
 {% if not sups %}<div class="card">No supplier connected yet. <a href="{{ url_for('suppliers_admin.suppliers') }}">Add a supplier</a> first.</div>
 {% else %}
@@ -244,6 +335,7 @@ def price_for(cost, pct, fix, rnd):
 def pending_groups(db, show_hidden=False, max_age=60):
     """Groups that are not in the shop yet. -> (sups, errs, groups, skipped, hidden_n, existing_cats)"""
     sups, errs = db.catalog_options(max_age=max_age)
+    rules = make_rules(db.get_setting("compare_aliases", ""))
     linked = set()
     for d in db.sources_by_product().values():
         for o in d["offers"]:
@@ -252,12 +344,12 @@ def pending_groups(db, show_hidden=False, max_age=60):
     existing_cats = sorted({(p["category"] or "").strip() for p in products if (p["category"] or "").strip()})
     have = set()
     for p in products:
-        n = _norm(p["name"])
+        n = _norm(p["name"], rules)
         if n[1]:
             have.add(_gkey(n))
     ignored = _ignored(db)
     groups, skipped, hidden_n = [], 0, 0
-    for g in build_groups(sups, existing_cats):
+    for g in build_groups(sups, existing_cats, rules):
         is_linked = any((o["sid"], o["key"]) in linked for o in g["offers"])
         if is_linked or g["gkey"] in have:
             skipped += 1
@@ -360,7 +452,17 @@ def home():
         flash(e, "err")
     cat_list = sorted({g["category"] for g in groups if g["category"]} | set(existing_cats), key=str.casefold)
     return web.render_str(PAGE, sups=sups, groups=groups, cat_list=cat_list, skipped=skipped,
-                          hidden_n=hidden_n, show_hidden=show_hidden, auto=auto_settings(db))
+                          hidden_n=hidden_n, show_hidden=show_hidden, auto=auto_settings(db),
+                          aliases_text=db.get_setting("compare_aliases", ""))
+
+
+@bp.route("/compare/aliases", methods=["POST"])
+def aliases_save():
+    import web
+    txt = (request.form.get("aliases") or "")[:4000]
+    web.db.set_setting("compare_aliases", txt)
+    flash("Smart matching saved.")
+    return redirect(url_for("compare_admin.home"))
 
 
 @bp.route("/compare/auto", methods=["POST"])
