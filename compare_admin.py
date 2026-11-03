@@ -11,6 +11,7 @@
 """
 import json
 import math
+import os
 import re
 from difflib import SequenceMatcher
 
@@ -345,13 +346,14 @@ PAGE = r"""{% extends 'base.html' %}{% block body %}
 <label>Round the price</label>
 <select name="rnd"><option value="five" {{ 'selected' if auto.rnd == 'five' }}>Up to the next 5 cents</option><option value="x99" {{ 'selected' if auto.rnd == 'x99' }}>Ending .99</option><option value="none" {{ 'selected' if auto.rnd == 'none' }}>No rounding</option></select>
 <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" name="instock" value="1" style="width:auto" {{ 'checked' if auto.instock }}> Only add products that are in stock</label>
+<label>ONLY auto-add these brands / words (comma separated, leave empty = all products)</label><input name="only" value="{{ auto.only }}" placeholder="ChatGPT, Gemini, Canva, YouTube">
 <label>Never auto-add these brands (comma separated, you add them by hand)</label><input name="skip" value="{{ auto.skip }}" placeholder="Spotify, Netflix, Crunchyroll, Amazon Prime">
 <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap"><button type="submit">Save</button></div></form>
 <form method="post" action="{{ url_for('compare_admin.auto_run') }}" style="margin-top:8px"><button type="submit" class="green sm">Run now</button></form></div>
 
 <div class="card"><h3>Categories</h3>
 <p class="muted" style="margin:0 0 8px">Put all your existing products into the new <b>Type / Brand</b> folders (AI Tools, VPN, Music, OTT ...). You see a preview first. Products the bot does not know by name are sorted by Gemini AI (needs GEMINI_API_KEY on Railway).</p>
-<a href="{{ url_for('compare_admin.reorg') }}"><button type="button">Reorganize categories</button></a></div>
+<a href="{{ url_for('compare_admin.reorg') }}"><button type="button">Reorganize categories</button></a> <a href="{{ url_for('compare_admin.keep_page') }}"><button type="button" class="grey">Keep only my original products</button></a></div>
 
 <div class="card"><h3>Smart matching</h3>
 <p class="muted" style="margin:0 0 8px">The bot already knows that Prime Video = Amazon Prime, Chat GPT = ChatGPT, 1M = 1 Month, and ignores words like "Buy", "Account" or "(24HW)". If it misses one, add your own line: <b>Name = other name = another name</b> (one per line).</p>
@@ -460,6 +462,7 @@ def auto_settings(db):
             "pct": num("auto_import_pct", 40.0), "fix": num("auto_import_fix", 0.0),
             "rnd": str(db.get_setting("auto_import_rnd", "five")),
             "instock": str(db.get_setting("auto_import_instock", "1")) == "1",
+            "only": str(db.get_setting("auto_import_only", "") or ""),
             "skip": str(db.get_setting("auto_import_skip", "Spotify, Netflix, Crunchyroll, Amazon Prime, Prime Video") or "")}
 
 
@@ -567,9 +570,12 @@ def auto_import(db, limit=100):
     names = {re.sub(r"\s+", " ", p["name"]).strip().casefold(): p["id"] for p in db.list_products()}
     catalogs, added, below, problems, added_names = {}, 0, 0, [], []
     skip_words = [_squash(w) for w in re.split(r"[,\n]", st["skip"]) if _squash(w)]
+    only_words = [_squash(w) for w in re.split(r"[,\n]", st["only"]) if _squash(w)]
     for g in groups:
         if added >= limit:
             break
+        if only_words and not any(w in (_squash(g["name"]) + "|" + _squash(g["category"])) for w in only_words):
+            continue    # not on your "only" list: you add it by hand
         if st["instock"] and not g["instock"]:
             continue
         hay = _squash(g["name"]) + "|" + _squash(g["category"])
@@ -666,6 +672,7 @@ def auto_save():
     rnd = f.get("rnd", "five")
     db.set_setting("auto_import_rnd", rnd if rnd in ("five", "x99", "none") else "five")
     db.set_setting("auto_import_instock", "1" if f.get("instock") else "0")
+    db.set_setting("auto_import_only", (f.get("only") or "").strip()[:400])
     db.set_setting("auto_import_skip", (f.get("skip") or "").strip()[:200])
     flash("Auto mode saved. The bot will " + ("add new products by itself every 10 minutes." if f.get("on") else "not add products by itself."))
     return redirect(url_for("compare_admin.home"))
@@ -788,6 +795,103 @@ def reorg_apply():
         except Exception as e:
             flash(f"{r['name']}: {str(e)[:100]}", "err")
     flash(f"{done} product{'s' if done != 1 else ''} moved to the new categories.")
+    return redirect(url_for("compare_admin.home"))
+
+
+
+# ---------------------------------------------------------------- keep only your original products
+KEEP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "keep_products.json")
+
+
+def _kn(name):
+    return re.sub(r"\s+", " ", name or "").strip().casefold()
+
+
+def keep_list():
+    try:
+        with open(KEEP_FILE, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return []
+
+
+def keep_plan(db):
+    """-> (to_hide, to_show, to_create): current active extras, hidden ones to bring back, missing ones to create"""
+    keep = {_kn(k["name"]): k for k in keep_list()}
+    c = db.conn()
+    rows = c.execute("SELECT id,name,active,category FROM products ORDER BY id").fetchall()
+    c.close()
+    by_key, to_hide = {}, []
+    for r in rows:
+        k = _kn(r["name"])
+        if k in keep:
+            by_key.setdefault(k, []).append(r)
+        elif r["active"] == 1:
+            to_hide.append(dict(id=r["id"], name=r["name"], category=r["category"] or ""))
+    to_show, to_create = [], []
+    for k, item in keep.items():
+        rs = by_key.get(k)
+        if not rs:
+            to_create.append(item)
+        elif not any(r["active"] == 1 for r in rs):
+            to_show.append(dict(id=rs[0]["id"], name=rs[0]["name"]))
+    return to_hide, to_show, to_create
+
+
+def keep_apply(db):
+    """Hide every product that is not in your list (history stays), bring back / create the ones missing.
+    Auto mode is switched OFF so it does not add them again. -> (hidden, shown, created, problems)"""
+    to_hide, to_show, to_create = keep_plan(db)
+    hidden = shown = created = 0
+    problems = []
+    for p in to_hide:
+        r = db.delete_product(p["id"])
+        if r == "ok":
+            hidden += 1
+        else:
+            problems.append(f"{p['name']}: {r}")
+    for p in to_show:
+        c = db.conn()
+        c.execute("UPDATE products SET active=1 WHERE id=?", (p["id"],))
+        c.commit(); c.close()
+        shown += 1
+    for item in to_create:
+        pid = db.add_product(item["name"], float(item.get("price") or 0), item.get("kind") or "auto")
+        f = {k: item.get(k) for k in ("description", "delivery", "warranty", "category", "old_price", "prompt", "cost")
+             if item.get(k) not in (None, "")}
+        if f:
+            db.update_product(pid, **f)
+        created += 1
+    db.set_setting("auto_import_on", "0")
+    return hidden, shown, created, problems
+
+
+KEEP_PAGE = r"""{% extends 'base.html' %}{% block body %}
+<h2>Keep only my original {{ total }} products</h2>
+<p class="muted">Everything that is NOT on your original list is <b>hidden</b> from the bot (not deleted: orders and history stay, you can bring a product back anytime). Auto mode is switched OFF so it does not add them again.</p>
+<div class="card"><p><b>{{ hide|length }}</b> products will be hidden &nbsp;|&nbsp; <b>{{ show|length }}</b> hidden originals come back &nbsp;|&nbsp; <b>{{ create|length }}</b> missing originals are created</p>
+{% if hide or show or create %}<form method="post" action="{{ url_for('compare_admin.keep_run') }}" onsubmit="return confirm('Hide {{ hide|length }} products?')"><button type="submit" class="green">Apply</button></form>{% else %}<p class="muted">Your shop already has exactly your original products.</p>{% endif %}</div>
+{% if hide %}<div class="card"><h3>Will be hidden</h3><table>{% for p in hide %}<tr><td>{{ p.name }}</td><td class="muted">{{ p.category or '-' }}</td></tr>{% endfor %}</table></div>{% endif %}
+{% if show %}<div class="card"><h3>Will come back</h3><table>{% for p in show %}<tr><td>{{ p.name }}</td></tr>{% endfor %}</table></div>{% endif %}
+{% if create %}<div class="card"><h3>Will be created (link a supplier to them afterwards)</h3><table>{% for p in create %}<tr><td>{{ p.name }}</td><td>${{ p.price }}</td></tr>{% endfor %}</table></div>{% endif %}
+<p><a href="{{ url_for('compare_admin.home') }}" class="muted">Back to Compare</a></p>
+{% endblock %}"""
+
+
+@bp.route("/compare/keep")
+def keep_page():
+    import web
+    hide, show, create = keep_plan(web.db)
+    return web.render_str(KEEP_PAGE, hide=hide, show=show, create=create, total=len(keep_list()))
+
+
+@bp.route("/compare/keep/apply", methods=["POST"])
+def keep_run():
+    import web
+    h, s_, c_, problems = keep_apply(web.db)
+    flash(f"{h} hidden, {s_} brought back, {c_} created. Auto mode is OFF.")
+    for pr in problems[:6]:
+        flash(pr, "err")
     return redirect(url_for("compare_admin.home"))
 
 
