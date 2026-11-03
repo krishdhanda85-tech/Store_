@@ -1040,7 +1040,7 @@ def product_button(uid: int, p):
 # Brand folders shown at the top of the grid (everything else stays in the plain 3-column grid).
 # (folder name, words that must appear in the product name or category, no spaces)
 FOLDERS = [("Netflix", ("netflix",)), ("Spotify", ("spotify",)), ("Crunchyroll", ("crunchyroll", "crunchy")),
-           ("Amazon Prime", ("amazonprime", "primevideo", "primevedio")), ("YouTube", ("youtube",))]
+           ("Amazon Prime", ("amazonprime", "primevideo", "primevedio")), ("YouTube", ("youtube",)), ("Claude", ("claude",))]
 FOLDER_NAMES = [f[0] for f in FOLDERS]
 
 
