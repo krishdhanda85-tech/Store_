@@ -27,6 +27,7 @@ from provider import decrypt, encrypt
 
 log = logging.getLogger("netflix_otp")
 MAX_AGE_MIN = int(os.getenv("OTP_MAX_AGE_MIN", "20"))
+OTP_DIGITS = max(4, min(8, int(os.getenv("OTP_DIGITS", "4"))))   # Netflix sign-in code length
 BTN_LABEL = "🔑 Get OTP"
 
 SCHEMA = """
@@ -109,8 +110,11 @@ def fetch_netflix_mail(addr, pwd, host):
                 continue
             subject = str(make_header(decode_header(msg.get("Subject", ""))))
             text = _body_text(msg)
-            m = (re.search(r"(?<!\d)(\d{4,6})(?!\d)", subject)
-                 or re.search(r"code[^\d]{0,40}(\d{4,6})(?!\d)", text, re.I))
+            # Netflix login codes are exactly OTP_DIGITS (default 4) digits: look next to the word "code" first,
+            # then a lone number in the subject (a year like 2026 is ignored)
+            d = OTP_DIGITS
+            m = (re.search(r"code[^\d]{0,60}(?<!\d)(\d{%d})(?!\d)" % d, text, re.I)
+                 or re.search(r"(?<!\d)(\d{%d})(?!\d)" % d, re.sub(r"\b(19|20)\d\d\b", " ", subject)))
             code = m.group(1) if m else None
             link = None
             for l in re.findall(r"https://www\.netflix\.com/[^\s\"'<>\]\)]+", text):
