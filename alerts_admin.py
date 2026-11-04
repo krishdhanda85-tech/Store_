@@ -2,13 +2,11 @@
 
 * Lists products that are OUT of stock and products that are running LOW (auto-delivery products only,
   made-to-order products have no stock).
-* Activity log: other parts of the shop write short lines here (e.g. Compare auto mode "added 3 products").
-* Settings: low-stock limit, optional ONE daily Telegram summary, optional Telegram message when Auto mode
-  adds products.
+* Activity log: other parts of the shop write short lines here.
+* Settings: low-stock limit, optional ONE daily Telegram summary.
 
 Used by:  web.py  -> register(app)
           bot.py  -> summary(db)           (daily stock summary job)
-          compare_admin.py -> log_event(db, text)
 """
 import json
 import os
@@ -96,14 +94,13 @@ PAGE = r"""{% extends 'base.html' %}{% block body %}
 <label>Low stock limit (products with this many or fewer are "low")</label>
 <input name="limit" type="number" min="1" step="1" value="{{ limit }}">
 <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" name="digest" value="1" style="width:auto" {{ 'checked' if digest }}> Send ONE Telegram summary per day (out of stock / low)</label>
-<label style="display:flex;gap:8px;align-items:center"><input type="checkbox" name="notify" value="1" style="width:auto" {{ 'checked' if notify }}> Message me on Telegram when Auto mode adds products</label>
 <div style="margin-top:8px"><button type="submit">Save</button></div></form></div>
 
 <div class="card"><h3>Activity</h3>
 {% if events %}<table><tr><th>When</th><th>What</th></tr>
 {% for e in events %}<tr><td class="muted" style="white-space:nowrap">{{ e.when }}</td><td>{{ e.m }}</td></tr>{% endfor %}</table>
 <form method="post" action="{{ url_for('alerts_admin.clear') }}" style="margin-top:8px"><button type="submit" class="sm">Clear activity</button></form>
-{% else %}<p class="muted">No activity yet. Auto mode and other automatic jobs write here.</p>{% endif %}</div>
+{% else %}<p class="muted">No activity yet.</p>{% endif %}</div>
 {% endblock %}"""
 
 
@@ -114,8 +111,7 @@ def home():
     out, low, _m = summary(db)
     events = [{"when": _fmt(e.get("t")), "m": e.get("m", "")} for e in _load_log(db)[:100] if isinstance(e, dict)]
     return web.render_str(PAGE, out=out, low=low, limit=_threshold(db), events=events,
-                          digest=str(db.get_setting("lowstock_digest", "0")) == "1",
-                          notify=str(db.get_setting("auto_import_notify", "0")) == "1")
+                          digest=str(db.get_setting("lowstock_digest", "0")) == "1")
 
 
 @bp.route("/alerts/save", methods=["POST"])
@@ -129,7 +125,6 @@ def save():
         limit = 3
     db.set_setting("lowstock_threshold", str(limit))
     db.set_setting("lowstock_digest", "1" if f.get("digest") else "0")
-    db.set_setting("auto_import_notify", "1" if f.get("notify") else "0")
     flash("Stock alert settings saved.")
     return redirect(url_for("alerts_admin.home"))
 

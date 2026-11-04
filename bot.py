@@ -2914,25 +2914,6 @@ async def provider_job(context: ContextTypes.DEFAULT_TYPE):
     seen.intersection_update(alerts)     # a fixed problem can alert again if it returns
 
 
-async def autoimport_job(context: ContextTypes.DEFAULT_TYPE):
-    """Every 10 min: if Auto mode is ON, compare all suppliers and add new products (cheapest supplier,
-    category, description and markup price). Result goes to the website activity log (no Telegram spam)."""
-    import compare_admin
-    try:
-        await asyncio.to_thread(compare_admin.fix_misplaced, db)   # e.g. Duolingo wrongly inside OTT
-    except Exception as e:
-        log.warning("fix_misplaced failed: %s", e)
-    try:
-        if str(db.get_setting("auto_import_on", "0")) != "1":
-            return
-        r = await asyncio.to_thread(compare_admin.auto_import, db)
-    except Exception as e:
-        log.warning("auto import failed: %s", e)
-        return
-    if r["added"] and db.get_setting("auto_import_notify", "0") == "1":
-        await notify_admins(context, f"🤖 Auto mode added {r['added']} new product(s). See Stock alerts → Activity on the website.")
-
-
 # ---------------------------------------------------------------- one bot per seller
 async def _bind(update, context):
     """Runs first for every update: point `db`, `binance`, owner id... at THIS bot's shop."""
@@ -3771,7 +3752,6 @@ def build_application(tenant):
     app.job_queue.run_repeating(_in_shop(outbox_job), interval=5, first=5)
     app.job_queue.run_repeating(_in_shop(growth_bot.growth_job), interval=120, first=45)
     app.job_queue.run_repeating(_in_shop(provider_job), interval=120, first=15)
-    app.job_queue.run_repeating(_in_shop(autoimport_job), interval=600, first=90)
     app.job_queue.run_repeating(_in_shop(backup_job), interval=86400, first=600)
     app.job_queue.run_repeating(_in_shop(lowstock_job), interval=1800, first=120)
     app.job_queue.run_repeating(_in_shop(fampay_job), interval=45, first=30)

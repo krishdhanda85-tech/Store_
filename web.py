@@ -36,10 +36,8 @@ from assistant_admin import register as register_assistant_admin
 register_assistant_admin(app)
 from smart_admin import register as register_smart_admin
 register_smart_admin(app)
-from import_admin import register as register_import_admin
-register_import_admin(app)
-from compare_admin import register as register_compare_admin
-register_compare_admin(app)
+from catalog_admin import register as register_catalog_admin
+register_catalog_admin(app)
 from alerts_admin import register as register_alerts_admin
 register_alerts_admin(app)
 from netflix_otp import register_admin as register_otp_admin
@@ -252,8 +250,7 @@ tr:hover td{background:var(--bg)}
 {{ nl('orders','Orders','list') }}
 {{ nl('manual','Pending orders','clock',pending_count) }}
 {{ nl('products','Products','box') }}
-{{ nl('import_admin.home','Import products','link') }}
-{{ nl('compare_admin.home','Compare & import','link') }}
+{{ nl('catalog_admin.home','Supplier catalog','link') }}
 {{ nl('alerts_admin.home','Stock alerts','clock') }}
 {{ nl('profit_centre','Profit centre','card') }}
 <div class="grp">Payments</div>
@@ -573,7 +570,7 @@ d.addEventListener('keydown',function(e){
 
 <div class="page-head"><h2>Products</h2>
 <div style="display:flex;gap:8px;flex-wrap:wrap"><button class="sm" type="button" onclick="var b=document.getElementById('addbox');b.hidden=!b.hidden;if(!b.hidden){b.scrollIntoView({behavior:'smooth'});}">+ Add product</button>
-{% if suppliers_cat %}<button class="sm green" type="button" onclick="location='{{ url_for('compare_admin.home') }}'">Compare &amp; import</button><button class="sm grey" type="button" onclick="location='{{ url_for('import_admin.home') }}'">Import from supplier</button>{% endif %}</div></div>
+{% if suppliers_cat %}<button class="sm green" type="button" onclick="location='{{ url_for('catalog_admin.home') }}'">Supplier catalog</button>{% endif %}</div></div>
 
 <div class="sumline"><span>{{ products|length }} products</span>
 {% if ns.out %}<span class="b">{{ ns.out }} out of stock</span>{% endif %}
