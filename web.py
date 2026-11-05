@@ -1710,27 +1710,31 @@ def _lines(text):
     return [x.strip() for x in (text or "").splitlines() if x.strip()]
 
 
-_ACC_HDR = re.compile(r"^\s*(?:account|acc|id)\s*#?\s*\d+\s*[:.\-)]*\s*$", re.I)
+_ACC_HDR = re.compile(r"^\s*(?:account|acc)\s*#?\s*\d+\b(.*)$", re.I)
+_SEP = re.compile(r"^[\s=\-_*#~+.]{3,}$")
 
 
 def _items(text):
     """Split pasted/uploaded text into stock items.
-    If the text has headers like 'Account 1', 'Account 2', each header starts ONE item
-    (everything until the next header, blank lines ignored, header itself not stored).
-    Without such headers: one item per line, as before."""
+    A line starting with 'Account 1', 'ACCOUNT 2: mail@x.com (US)' ... starts ONE new item; everything
+    up to the next such line belongs to it. Blank lines and ==== / ---- separator lines are ignored.
+    If the header line carries data after the number (e.g. the e-mail) it is kept as the item's first
+    line; a bare 'Account 1' header is dropped. Text before the first header is ignored.
+    Without any such headers: one item per line, as before."""
     raw = (text or "").splitlines()
     if not any(_ACC_HDR.match(x) for x in raw):
         return _lines(text)
-    items, cur, started = [], [], False
+    items, cur = [], None
     for x in raw:
-        if _ACC_HDR.match(x):
+        m = _ACC_HDR.match(x)
+        if m:
             if cur:
                 items.append("\n".join(cur))
-            cur, started = [], True
-        elif started and x.strip():
+            cur = []
+            if re.sub(r"[\s:.\-)(]", "", m.group(1)):
+                cur.append(x.strip())
+        elif cur is not None and x.strip() and not _SEP.match(x):
             cur.append(x.strip())
-        elif not started and x.strip():
-            items.append(x.strip())      # text before the first header stays one item per line
     if cur:
         items.append("\n".join(cur))
     return items
