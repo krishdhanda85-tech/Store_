@@ -1,3 +1,4 @@
+import re
 import html as htmllib
 import logging
 import os
@@ -628,7 +629,7 @@ d.addEventListener('keydown',function(e){
 
 <div class="card" id="addbox" {% if products %}hidden{% endif %}>
 <h3>Add new product</h3>
-<form method="post" action="{{ url_for('create_product') }}" data-pf oninput="calc(this)">
+<form method="post" action="{{ url_for('create_product') }}" enctype="multipart/form-data" data-pf oninput="calc(this)">
 <label>Product name</label>
 <input name="name" placeholder="e.g. Netflix 1 month" required>
 <div class="two">
@@ -643,7 +644,9 @@ d.addEventListener('keydown',function(e){
 <label><input type="radio" name="kind" value="manual" onchange="document.getElementById('newstock').hidden=true"> Made to order</label>
 </div>
 <div id="newstock"><label>Stock - one item per line (login / key / link) <span class="hint">optional now, you can add later</span></label>
-<textarea name="links" rows="5" placeholder="email:password&#10;email:password"></textarea></div>
+<textarea name="links" rows="5" placeholder="email:password&#10;email:password"></textarea>
+<label>Or upload a .txt file <span class="hint">one item per line</span></label>
+<input type="file" name="stockfile" accept=".txt,text/plain" multiple></div>
 <label>Category <span class="hint">optional, same category = one button group in the bot</span></label>
 <input name="category" list="cats" placeholder="e.g. Streaming">
 <button type="submit">Add product</button>
@@ -688,8 +691,10 @@ d.addEventListener('keydown',function(e){
 {% if p.kind != 'manual' %}
 <div class="sec">
 <h4>Add stock</h4>
-<form method="post" action="{{ url_for('stock_add', pid=p.id) }}">
-<textarea name="links" rows="4" placeholder="One item per line (login / key / link)" required></textarea>
+<form method="post" action="{{ url_for('stock_add', pid=p.id) }}" enctype="multipart/form-data">
+<textarea name="links" rows="4" placeholder="One item per line (login / key / link)"></textarea>
+<label>Or upload a .txt file <span class="hint">one item per line</span></label>
+<input type="file" name="stockfile" accept=".txt,text/plain" multiple>
 <button type="submit">Add stock</button>
 </form>
 {% if its %}
@@ -1705,6 +1710,55 @@ def _lines(text):
     return [x.strip() for x in (text or "").splitlines() if x.strip()]
 
 
+_ACC_HDR = re.compile(r"^\s*(?:account|acc|id)\s*#?\s*\d+\s*[:.\-)]*\s*$", re.I)
+
+
+def _items(text):
+    """Split pasted/uploaded text into stock items.
+    If the text has headers like 'Account 1', 'Account 2', each header starts ONE item
+    (everything until the next header, blank lines ignored, header itself not stored).
+    Without such headers: one item per line, as before."""
+    raw = (text or "").splitlines()
+    if not any(_ACC_HDR.match(x) for x in raw):
+        return _lines(text)
+    items, cur, started = [], [], False
+    for x in raw:
+        if _ACC_HDR.match(x):
+            if cur:
+                items.append("\n".join(cur))
+            cur, started = [], True
+        elif started and x.strip():
+            cur.append(x.strip())
+        elif not started and x.strip():
+            items.append(x.strip())      # text before the first header stays one item per line
+    if cur:
+        items.append("\n".join(cur))
+    return items
+
+
+def _file_lines(field="stockfile"):
+    """Lines from uploaded .txt file(s) (one stock item per line). Returns [] if no file."""
+    out = []
+    for fl in request.files.getlist(field):
+        if not fl or not fl.filename:
+            continue
+        raw = fl.read(5 * 1024 * 1024 + 1)[:5 * 1024 * 1024]
+        txt = None
+        for enc in ("utf-8-sig", "utf-16", "cp1252", "latin-1"):
+            try:
+                txt = raw.decode(enc)
+                break
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+        out += _items(txt or "")
+    return out
+
+
+def _all_lines(text):
+    """Pasted text + uploaded txt file(s) together."""
+    return _items(text) + _file_lines()
+
+
 @app.route("/products/create", methods=["POST"])
 def create_product():
     """One step: product + cost + price + (optional) stock."""
@@ -1727,7 +1781,7 @@ def create_product():
     else:
         db.update_product(pid, cost=cost, category=(f.get("category", "").strip() or None))
         msg = f"'{name}' added. Cost ${cost:.2f}, price ${price:.2f}, {_profit_text(price, cost)}."
-    lines = _lines(f.get("links")) if kind == "auto" else []
+    lines = _all_lines(f.get("links")) if kind == "auto" else []
     if lines:
         n_added = db.add_stock_lines(pid, lines)
         msg += f" {n_added} stock item(s) added."
@@ -1758,9 +1812,9 @@ def quick_product(pid):
 
 @app.route("/products/<int:pid>/stock/add", methods=["POST"])
 def stock_add(pid):
-    lines = _lines(request.form.get("links"))
+    lines = _all_lines(request.form.get("links"))
     if not lines:
-        flash("Paste at least one item.", "err")
+        flash("Paste at least one item or upload a .txt file.", "err")
     else:
         n_added = db.add_stock_lines(pid, lines)
         flash(f"{n_added} item(s) added to stock." + (f" {db.last_stock_skipped} duplicate profile(s) skipped." if getattr(db, "last_stock_skipped", 0) else ""))
