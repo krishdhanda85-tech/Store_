@@ -18,73 +18,88 @@ bp = Blueprint("catalog_admin", __name__)
 
 PAGE = r"""{% extends 'base.html' %}{% block body %}
 <style>
-.cg-top{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px}
-.cg-top h2{margin:0}
-.cg-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-bottom:12px}
-.cg-st{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:10px 12px;box-shadow:var(--shadow)}
-.cg-st b{display:block;font-size:22px;line-height:1.2;font-weight:800}
-.cg-st span{font-size:12px;color:var(--muted)}
-.cg-st.hot{background:var(--accent);border-color:var(--accent)}
-.cg-st.hot b,.cg-st.hot span{color:var(--surface)}
+.cgx{background:#15102e;color:#fff;border-radius:22px;padding:14px 12px 12px;margin:-4px -4px 0}
+.cgx *{box-sizing:border-box}
+.cgx input,.cgx select{background:#221a47;border:1px solid #3a2f6b;color:#fff;border-radius:14px;margin:0}
+.cgx input::placeholder{color:#a79fd6}
+.cgx label{color:#c9c2ee;font-size:12.5px}
+.cgx .hint,.cgx .muted{color:#a79fd6}
+.cg-hero{background:linear-gradient(120deg,#7c3aed 0%,#ec4899 55%,#fb923c 100%);border-radius:22px;padding:16px 16px 14px;margin-bottom:12px;position:relative;overflow:hidden}
+.cg-hero:before{content:'';position:absolute;right:-26px;top:-26px;width:110px;height:110px;border-radius:50%;background:#ffffff22}
+.cg-hero:after{content:'';position:absolute;right:30px;bottom:-34px;width:70px;height:70px;border-radius:50%;background:#ffffff18}
+.cg-hero small{font-size:12px;letter-spacing:.06em;text-transform:uppercase;opacity:.9}
+.cg-hero b{display:block;font-size:34px;font-weight:700;line-height:1.1;margin-top:4px}
+.cg-hero .pills{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+.cg-hero .pills span{background:#ffffff2e;border-radius:999px;padding:4px 12px;font-size:12px}
+.cg-lbl{font-size:11.5px;letter-spacing:.06em;text-transform:uppercase;color:#a79fd6;margin:2px 2px 6px}
+.cg-sups{display:flex;gap:8px;overflow-x:auto;padding:2px 0 10px;scrollbar-width:none}
+.cg-sups::-webkit-scrollbar{display:none}
+.cg-sup{flex:none;width:auto;min-height:0!important;margin:0;text-align:left;border:0;border-radius:18px;padding:10px 16px;color:#fff;cursor:pointer;background:#221a47;border:2px solid transparent}
+.cg-sup b{display:block;font-size:14px;font-weight:700}
+.cg-sup span{font-size:11.5px;opacity:.85}
+.cg-sup.on{border-color:#fff;box-shadow:0 10px 20px -10px #000}
 .cg-search{position:relative}
-.cg-search input{margin:0 0 8px;padding-left:40px;border-radius:14px}
-.cg-search i{position:absolute;left:14px;top:13px;width:14px;height:14px;border:2px solid var(--muted);border-radius:50%;pointer-events:none}
-.cg-search i:after{content:'';position:absolute;width:2px;height:7px;background:var(--muted);right:-4px;bottom:-6px;transform:rotate(-45deg)}
-.cg-chips{display:flex;gap:6px;overflow-x:auto;padding:2px 0 8px;-webkit-overflow-scrolling:touch;scrollbar-width:none}
+.cg-search input{padding-left:42px;margin-bottom:10px;background:#221a47}
+.cg-search i{position:absolute;left:15px;top:14px;width:14px;height:14px;border:2px solid #a79fd6;border-radius:50%;pointer-events:none}
+.cg-search i:after{content:'';position:absolute;width:2px;height:7px;background:#a79fd6;right:-4px;bottom:-6px;transform:rotate(-45deg)}
+.cg-chips{display:flex;gap:7px;overflow-x:auto;padding:2px 0 10px;scrollbar-width:none}
 .cg-chips::-webkit-scrollbar{display:none}
-.cg-chip{flex:none;width:auto;min-height:0!important;margin:0;padding:7px 14px;border-radius:999px;border:1px solid var(--line2);background:var(--surface);color:var(--muted);font-size:13px;font-weight:600;cursor:pointer}
-.cg-chip.on{background:var(--ink);color:var(--surface);border-color:var(--ink)}
+.cg-chip{flex:none;width:auto;min-height:0!important;margin:0;padding:8px 16px;border-radius:999px;border:0;background:#2f2560;color:#fff;font-size:13px;font-weight:600;cursor:pointer}
+.cg-chip.on{background:#fff;color:#15102e}
 .cg-row2{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
-.cg-row2 select{flex:1;min-width:130px;margin:0;border-radius:12px}
-.cg-set{background:var(--accent-soft);border:1px solid var(--line);border-radius:16px;padding:12px 14px;margin:2px 0 12px}
+.cg-row2 select{flex:1;min-width:130px}
+.cg-set{background:#221a47;border-radius:16px;padding:12px 14px;margin:2px 0 12px}
 .cg-set summary{cursor:pointer;display:flex;justify-content:space-between;align-items:center;list-style:none;font-size:14px;font-weight:600}
 .cg-set summary::-webkit-details-marker{display:none}
-.cg-set summary b{background:var(--accent);color:var(--surface);font-size:12px;padding:4px 12px;border-radius:999px}
+.cg-set summary b{background:linear-gradient(120deg,#7c3aed,#ec4899);color:#fff;font-size:12px;padding:4px 12px;border-radius:999px}
 .cg-setbody{margin-top:12px}
 .cg-2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-.cg-setbody label{font-size:12.5px;color:var(--muted)}
 .cg-tools{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:2px 0 10px}
+.cg-tools button{background:#2f2560;color:#fff;border:0}
 .cg-tools .muted{margin-left:auto;font-size:12.5px}
-.cg-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(185px,1fr));gap:10px}
-@media(max-width:640px){.cg-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}}
-.cc{position:relative;display:flex;flex-direction:column;background:var(--surface);border:1.5px solid var(--line);border-radius:18px;padding:12px;cursor:pointer;box-shadow:var(--shadow);transition:transform .12s,border-color .12s}
+.cg-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:10px}
+@media(max-width:640px){.cg-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.cc{position:relative;overflow:hidden;min-height:178px;border-radius:22px;padding:14px;color:#fff;cursor:pointer;display:flex;flex-direction:column;justify-content:flex-end;transition:transform .12s}
 .cc:active{transform:scale(.98)}
 .cc[hidden]{display:none}
-.cc.on{border-color:var(--accent);background:var(--accent-soft)}
-.cc.added{opacity:.5;cursor:default}
-.cc .tick{position:absolute;top:10px;right:10px;width:24px;height:24px;border-radius:50%;border:1.5px solid var(--line2);display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:800;color:transparent;background:var(--surface)}
-.cc.on .tick{background:var(--accent);border-color:var(--accent);color:var(--surface)}
-.cc .logo{width:42px;height:42px;border-radius:13px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:18px;margin-bottom:10px}
-.cc input.cn{margin:0 0 6px;padding:4px 6px;min-height:0;font-size:14px;font-weight:700;line-height:1.25;border:1px solid transparent;background:transparent;border-radius:8px;text-overflow:ellipsis}
-.cc input.cn:focus{border-color:var(--accent);background:var(--field)}
-.cc .meta{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
-.cc .sp{font-size:11.5px;padding:2px 9px;border-radius:999px;background:var(--grey);color:var(--greyink);font-weight:700}
-.cc .st{font-size:11.5px;font-weight:700}
-.cc .st:before{content:'';display:inline-block;width:7px;height:7px;border-radius:50%;background:currentColor;margin-right:5px;vertical-align:1px}
-.cc .box{margin-top:auto;background:var(--bg);border-radius:12px;padding:8px 10px}
-.cc.on .box{background:var(--surface)}
-.cc .cost{font-size:11.5px;color:var(--muted);display:flex;justify-content:space-between}
-.cc .sell{display:flex;align-items:center;font-size:20px;font-weight:800;margin-top:2px}
-.cc .sell input{width:100%;margin:0 0 0 2px;padding:2px 4px;min-height:0;font-size:20px;font-weight:800;border:0;background:transparent;box-shadow:none;text-align:left}
-.cc .sell input:focus{box-shadow:none;background:transparent;border:0}
-.cc .pf{font-size:12px;font-weight:700;min-height:16px}
+.cc .wm{position:absolute;right:-6px;top:-18px;font-size:110px;font-weight:700;color:#ffffff24;line-height:1;pointer-events:none}
+.cc .tick{position:absolute;top:10px;left:10px;width:24px;height:24px;border-radius:50%;border:2px solid #ffffff88;display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:800;color:transparent}
+.cc.on{box-shadow:0 0 0 3px #fff,0 14px 24px -12px #000}
+.cc.on .tick{background:#fff;border-color:#fff;color:#15102e}
+.cc.added{opacity:.45;cursor:default}
+.cc input.cn{background:transparent;border:1px solid transparent;color:#fff;padding:3px 4px;margin:0 0 2px -4px;min-height:0;font-size:14px;font-weight:700;line-height:1.25;border-radius:8px;text-overflow:ellipsis}
+.cc input.cn:focus{border-color:#fff;background:#00000033}
+.cc .sell{display:flex;align-items:center;font-size:26px;font-weight:800;margin-top:4px}
+.cc .sell input{background:transparent;border:0;color:#fff;width:100%;min-width:0;padding:0 0 0 2px;margin:0;min-height:0;font-size:26px;font-weight:800;box-shadow:none}
+.cc .sell input:focus{background:#00000033;border-radius:8px}
+.cc .low{display:flex;justify-content:space-between;align-items:center;margin-top:4px;gap:6px}
+.cc .pf{background:#ffffff33;border-radius:999px;padding:2px 10px;font-size:12px;font-weight:700;min-height:20px}
+.cc .pf:empty{display:none}
+.cc .sk{font-size:12px;opacity:.92;white-space:nowrap}
+.cc .sp{position:absolute;top:10px;right:10px;background:#00000040;border-radius:999px;padding:2px 9px;font-size:11px;font-weight:700}
+.cc .cost{font-size:11.5px;opacity:.8}
 .cg-bar{position:sticky;bottom:10px;z-index:6;margin-top:14px}
-.cg-bar button{margin:0;display:flex;justify-content:space-between;align-items:center;gap:10px;border-radius:18px;padding:13px 18px;font-weight:800;box-shadow:0 10px 28px -10px #000a}
-.cg-bar small{display:block;font-weight:500;font-size:12px;opacity:.85}
+.cg-bar .in{background:#fff;color:#15102e;border-radius:22px;padding:8px 8px 8px 18px;display:flex;justify-content:space-between;align-items:center;gap:10px;box-shadow:0 16px 34px -10px #000}
+.cg-bar small{display:block;font-size:12px;color:#6b5fa8}
+.cg-bar b{font-size:14px}
+.cg-bar button{width:auto;margin:0;min-height:0;background:linear-gradient(120deg,#7c3aed,#ec4899);color:#fff;border:0;border-radius:16px;padding:12px 18px;font-size:14px;font-weight:700}
+.cg-bar button:disabled{opacity:.45}
 </style>
-
-<div class="cg-top"><h2>Supplier catalog</h2>
-<span class="muted">{{ sups|length }} supplier{{ '' if sups|length == 1 else 's' }} connected</span></div>
 
 {% if not sups %}<div class="card">No supplier connected yet. <a href="{{ url_for('suppliers_admin.suppliers') }}">Add a supplier</a> first.</div>
 {% else %}
-<div class="cg-stats">
-<div class="cg-st"><b>{{ total }}</b><span>Products</span></div>
-<div class="cg-st"><b id="stk">0</b><span>In stock</span></div>
-<div class="cg-st hot"><b id="selc">0</b><span>Selected</span></div>
-</div>
+<div class="cgx">
+<div class="cg-hero"><small>Supplier catalog</small><b>{{ total }} products</b>
+<div class="pills"><span><span id="stk">0</span> in stock</span><span>{{ sups|length }} supplier{{ '' if sups|length == 1 else 's' }}</span></div></div>
 
 <form method="post" action="{{ url_for('catalog_admin.create') }}" id="imp">
+
+<div class="cg-lbl">Take products from</div>
+{% set hues = [265, 205, 155, 35, 330, 0] %}
+<div class="cg-sups" id="supbar">
+<button type="button" class="cg-sup on" data-s="" style="background:linear-gradient(135deg,#7c3aed,#ec4899)"><b>All suppliers</b><span>{{ total }} products</span></button>
+{% for s in sups %}<button type="button" class="cg-sup" data-s="{{ s.id }}" style="background:linear-gradient(135deg,hsl({{ hues[loop.index0 % 6] }} 75% 55%),hsl({{ (hues[loop.index0 % 6] + 30) % 360 }} 70% 32%))"><b>{{ s.name }}</b><span>{{ s['items']|length }} products</span></button>{% endfor %}
+</div>
 
 <div class="cg-search"><i></i><input id="q" placeholder="Search product" oninput="filt()" autocomplete="off"></div>
 
@@ -94,7 +109,6 @@ PAGE = r"""{% extends 'base.html' %}{% block body %}
 </div>
 
 <div class="cg-row2">
-<select id="sup" onchange="filt()"><option value="">All suppliers</option>{% for s in sups %}<option value="{{ s.id }}">{{ s.name }} ({{ s['items']|length }})</option>{% endfor %}</select>
 <select id="sort" onchange="sortit()"><option value="name">Sort: A to Z</option><option value="cheap">Cheapest first</option><option value="profit">Most profit first</option><option value="stock">Most stock first</option></select>
 <button type="button" class="cg-chip on" id="instock" onclick="tg(this)">In stock</button>
 <button type="button" class="cg-chip on" id="hideadded" onclick="tg(this)">Hide added</button>
@@ -105,39 +119,38 @@ PAGE = r"""{% extends 'base.html' %}{% block body %}
 <div class="cg-2">
 <div><label>Markup %</label><input id="pct" type="number" step="1" min="0" value="40" oninput="recalc()"></div>
 <div><label>+ Fixed ($)</label><input id="fix" type="number" step="0.05" min="0" value="0" oninput="recalc()"></div></div>
-<label>Round</label><select id="rnd" onchange="recalc()"><option value="five" selected>Next 5 cents (1.23 → 1.25)</option><option value="x99">Ending .99</option><option value="none">No rounding</option></select>
+<label>Round</label><select id="rnd" onchange="recalc()" style="width:100%"><option value="five" selected>Next 5 cents (1.23 → 1.25)</option><option value="x99">Ending .99</option><option value="none">No rounding</option></select>
 <label>Category for all selected <span class="hint">empty = supplier's category</span></label>
-<input name="category" list="cats" placeholder="e.g. AI tools"><datalist id="cats">{% for c in cats %}<option value="{{ c }}">{% endfor %}</datalist>
-<p class="muted" style="margin:4px 0 6px">Prices you type by hand are kept when you change the markup.</p>
+<input name="category" list="cats" placeholder="e.g. AI tools" style="width:100%"><datalist id="cats">{% for c in cats %}<option value="{{ c }}">{% endfor %}</datalist>
+<p class="muted" style="margin:6px 0">Prices you type by hand are kept when you change the markup.</p>
 <button type="button" class="grey sm" onclick="resetPrices()">Reset prices</button>
 </div></details>
 
 <div class="cg-tools">
-<button type="button" class="grey sm" onclick="selShown(true)">Select all shown</button>
-<button type="button" class="grey sm" onclick="selShown(false)">Clear</button>
+<button type="button" class="sm" onclick="selShown(true)">Select all shown</button>
+<button type="button" class="sm" onclick="selShown(false)">Clear</button>
 <span class="muted" id="shown"></span></div>
 
 <div class="cg-grid" id="list">
 {% for r in rows %}
-<div class="cc imp-row{{ ' added' if r.added }}" data-name="{{ r.name|lower }}" data-sid="{{ r.sid }}" data-cat="{{ r.category }}" data-stock="{{ r.stock }}" data-cost="{{ '%.4f' % r.cost }}" data-added="{{ 1 if r.added else 0 }}">
+<div class="cc imp-row{{ ' added' if r.added }}" style="background:linear-gradient(155deg,hsl({{ r.hue }} 80% 58%),hsl({{ (r.hue + 25) % 360 }} 75% 30%))" data-name="{{ r.name|lower }}" data-sid="{{ r.sid }}" data-cat="{{ r.category }}" data-stock="{{ r.stock }}" data-cost="{{ '%.4f' % r.cost }}" data-added="{{ 1 if r.added else 0 }}">
 <input type="checkbox" class="pick" name="pick" value="{{ loop.index0 }}" hidden {{ 'disabled' if r.added }}>
-<span class="tick">&#10003;</span>
-<div class="logo" style="background:hsl({{ r.hue }} 70% 50% / .16);color:hsl({{ r.hue }} 60% 42%)">{{ (r.name[:1] or '?')|upper }}</div>
+<span class="wm">{{ (r.name[:1] or '?')|upper }}</span><span class="tick">&#10003;</span><span class="sp">{{ r.sname }}</span>
 <input class="cn" name="name_{{ loop.index0 }}" value="{{ r.name }}" maxlength="120" title="{{ r.name }}" {{ 'disabled' if r.added }}>
-<div class="meta"><span class="sp">{{ r.sname }}</span>
-{% if r.added %}<span class="st paid">In shop</span>{% else %}<span class="st {{ 'paid' if r.stock > 0 else 'failed' }}">{{ ('stock ' ~ r.stock) if r.stock > 0 else 'out of stock' }}</span>{% endif %}</div>
-<div class="box"><div class="cost"><span>Cost ${{ '%.2f' % r.cost }}</span><span class="pf"></span></div>
-<div class="sell">$<input class="pr" name="price_{{ loop.index0 }}" type="number" step="0.01" min="0.01" aria-label="Sell price" {{ 'disabled' if r.added }}></div></div>
+<div class="cost">cost ${{ '%.2f' % r.cost }}</div>
+<div class="sell">$<input class="pr" name="price_{{ loop.index0 }}" type="number" step="0.01" min="0.01" aria-label="Sell price" {{ 'disabled' if r.added }}></div>
+<div class="low"><span class="pf"></span><span class="sk">{% if r.added %}In shop{% elif r.stock > 0 %}{{ r.stock }} left{% else %}out of stock{% endif %}</span></div>
 <input type="hidden" name="sid_{{ loop.index0 }}" value="{{ r.sid }}"><input type="hidden" name="key_{{ loop.index0 }}" value="{{ r.key }}">
 </div>
 {% endfor %}
 </div>
 
-<div class="cg-bar"><button type="submit" class="green" id="go" disabled><span><span id="goc">0 selected</span><small id="gop">Tap cards to select</small></span><span>Add to shop &rarr;</span></button></div>
+<div class="cg-bar"><div class="in"><div><b id="goc">0 selected</b><small id="gop">Tap tiles to select</small></div><button type="submit" id="go" disabled>Add to shop &rarr;</button></div></div>
 </form>
+</div>
 
 <script>
-var curCat='';
+var curCat='',curSup='';
 function rows(){return Array.prototype.slice.call(document.querySelectorAll('.imp-row'));}
 function calc(cost){
   var p=cost*(1+(parseFloat(document.getElementById('pct').value)||0)/100)+(parseFloat(document.getElementById('fix').value)||0);
@@ -150,7 +163,7 @@ function prof(r){
   var c=parseFloat(r.dataset.cost),i=r.querySelector('.pr'),p=parseFloat(i.value),o=r.querySelector('.pf');
   if(isNaN(p)||i.disabled){o.textContent='';r.dataset.profit=0;return;}
   var d=p-c;r.dataset.profit=d;
-  o.textContent=(d>=0?'+$':'-$')+Math.abs(d).toFixed(2)+(c>0?' ('+Math.round(d/c*100)+'%)':'');o.className='pf '+(d>0?'paid':'failed');
+  o.textContent=(d>=0?'+$':'-$')+Math.abs(d).toFixed(2)+(c>0?' ('+Math.round(d/c*100)+'%)':'');
 }
 function sumtxt(){
   var m=document.getElementById('rnd'),f=parseFloat(document.getElementById('fix').value)||0;
@@ -160,10 +173,10 @@ function recalc(){sumtxt();rows().forEach(function(r){var i=r.querySelector('.pr
 function resetPrices(){rows().forEach(function(r){delete r.querySelector('.pr').dataset.manual;});recalc();}
 function tg(b){b.classList.toggle('on');filt();}
 function filt(){
-  var q=document.getElementById('q').value.toLowerCase().trim(),sp=document.getElementById('sup').value,
+  var q=document.getElementById('q').value.toLowerCase().trim(),
       st=document.getElementById('instock').classList.contains('on'),ha=document.getElementById('hideadded').classList.contains('on'),n=0;
   rows().forEach(function(r){
-    var hide=(q&&r.dataset.name.indexOf(q)<0)||(sp&&r.dataset.sid!==sp)||(curCat&&r.dataset.cat!==curCat)||(st&&+r.dataset.stock<=0)||(ha&&r.dataset.added==='1');
+    var hide=(q&&r.dataset.name.indexOf(q)<0)||(curSup&&r.dataset.sid!==curSup)||(curCat&&r.dataset.cat!==curCat)||(st&&+r.dataset.stock<=0)||(ha&&r.dataset.added==='1');
     r.hidden=!!hide;if(!hide)n++;
   });
   document.getElementById('shown').textContent=n+' of '+rows().length+' shown';
@@ -185,8 +198,7 @@ function count(){
   sel.forEach(function(r){t+=parseFloat(r.dataset.profit)||0;});
   b.disabled=!n;
   document.getElementById('goc').textContent=n+' selected';
-  document.getElementById('selc').textContent=n;
-  document.getElementById('gop').textContent=n?('Profit if each sells once: $'+t.toFixed(2)):'Tap cards to select';
+  document.getElementById('gop').textContent=n?('Profit if each sells once: $'+t.toFixed(2)):'Tap tiles to select';
 }
 rows().forEach(function(r){
   r.addEventListener('click',function(e){
@@ -198,6 +210,12 @@ rows().forEach(function(r){
 document.getElementById('chips').addEventListener('click',function(e){
   var b=e.target.closest('.cg-chip');if(!b)return;
   curCat=b.dataset.c;
+  Array.prototype.forEach.call(this.children,function(x){x.classList.toggle('on',x===b);});
+  filt();
+});
+document.getElementById('supbar').addEventListener('click',function(e){
+  var b=e.target.closest('.cg-sup');if(!b)return;
+  curSup=b.dataset.s;
   Array.prototype.forEach.call(this.children,function(x){x.classList.toggle('on',x===b);});
   filt();
 });
