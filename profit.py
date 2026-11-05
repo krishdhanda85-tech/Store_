@@ -9,7 +9,8 @@ reseller API) is covered without touching those code paths.  Safe to call on eve
 """
 from datetime import datetime, timedelta, timezone
 
-RANGES = [("today", "Today"), ("7d", "7 days"), ("30d", "30 days"), ("all", "All time")]
+RANGES = [("today", "Today"), ("yesterday", "Yesterday"), ("day_before", "2 days ago"),
+          ("7d", "7 days"), ("30d", "30 days"), ("all", "All time")]
 
 
 def _tables(c):
@@ -88,6 +89,45 @@ def fill_missing_costs(c):
     return n
 
 
+def _parse_day(s):
+    try:
+        return datetime.strptime((s or "").strip()[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def window(rng, dfrom=None, dto=None):
+    """Return (start_iso, end_iso, label, rng).  end is EXCLUSIVE; either may be None (= no limit).
+
+    A custom date range (dfrom / dto as YYYY-MM-DD, both inclusive) wins over `rng` and gives rng='custom'.
+    Days are UTC days, the same as every other chart on the site.
+    """
+    a, b = _parse_day(dfrom), _parse_day(dto)
+    if a or b:
+        a, b = a or b, b or a
+        if a > b:
+            a, b = b, a
+        label = a.strftime("%d %b %Y") if a == b else "%s - %s" % (a.strftime("%d %b %Y"), b.strftime("%d %b %Y"))
+        return a.isoformat(), (b + timedelta(days=1)).isoformat(), label, "custom"
+    now = datetime.now(timezone.utc)
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if rng in ("yesterday", "day_before"):
+        day = today - timedelta(days=1 if rng == "yesterday" else 2)
+        return day.isoformat(), (day + timedelta(days=1)).isoformat(), day.strftime("%d %b %Y"), rng
+    s = since(rng)
+    return s, None, dict(RANGES).get(rng, "All time"), rng
+
+
+def where_ts(col, start, end):
+    """SQL condition (no WHERE) and args for a timestamp column inside [start, end)."""
+    conds, args = [], []
+    if start:
+        conds.append("%s >= ?" % col); args.append(start)
+    if end:
+        conds.append("%s < ?" % col); args.append(end)
+    return " AND ".join(conds), tuple(args)
+
+
 def since(rng):
     now = datetime.now(timezone.utc)
     if rng == "today":
@@ -109,12 +149,14 @@ def _sales_cte(c):
     return sql + ") "
 
 
-def profit_data(c, rng="30d", pid=None, ledger_limit=300):
+def profit_data(c, rng="30d", pid=None, ledger_limit=300, dfrom=None, dto=None):
     sc = _sales_cte(c)
     conds, args = [], []
-    s = since(rng)
+    s, e, _lbl, _r = window(rng, dfrom, dto)
     if s:
         conds.append("x.ts >= ?"); args.append(s)
+    if e:
+        conds.append("x.ts < ?"); args.append(e)
     if pid:
         conds.append("x.product_id = ?"); args.append(pid)
     w = (" WHERE " + " AND ".join(conds)) if conds else ""
