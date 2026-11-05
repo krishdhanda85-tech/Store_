@@ -105,6 +105,7 @@ def fetch_netflix_mail(addr, pwd, host):
         _, data = M.search(None, '(FROM "netflix.com")')
         ids = data[0].split()[-6:]
         oldest = datetime.now(timezone.utc) - timedelta(minutes=MAX_AGE_MIN)
+        best_code = best_link = None
         for i in reversed(ids):
             _, d = M.fetch(i, "(RFC822)")
             msg = email.message_from_bytes(d[0][1])
@@ -118,10 +119,11 @@ def fetch_netflix_mail(addr, pwd, host):
                 continue
             subject = str(make_header(decode_header(msg.get("Subject", ""))))
             text = _body_text(msg)
-            # Netflix login codes are exactly OTP_DIGITS (default 4) digits: look next to the word "code" first,
+            # Netflix login codes are exactly OTP_DIGITS (default 4) digits. Look next to the word "code" in
+            # English / Spanish / Portuguese / French / Italian / German ("codigo", "código", "codice", "kod"),
             # then a lone number in the subject (a year like 2026 is ignored)
             d = OTP_DIGITS
-            m = (re.search(r"code[^\d]{0,60}(?<!\d)(\d{%d})(?!\d)" % d, text, re.I)
+            m = (re.search(r"(?:code|c[oó]digo|codigo|codice|kod|cod\.?)[^\d]{0,80}(?<!\d)(\d{%d})(?!\d)" % d, text, re.I)
                  or re.search(r"(?<!\d)(\d{%d})(?!\d)" % d, re.sub(r"\b(19|20)\d\d\b", " ", subject)))
             code = m.group(1) if m else None
             link = None
@@ -129,8 +131,19 @@ def fetch_netflix_mail(addr, pwd, host):
                 if re.search(r"verify|travel|update-primary|households|password", l, re.I):
                     link = l
                     break
-            if code or link:
-                return {"code": code, "link": link}
+            if code and not best_code:
+                best_code = code
+            if link and not best_link:
+                best_link = link
+            if best_code and best_link:
+                break
+        # A sign-in code always wins. A plain "verify email" link is useless next to a code, so it is dropped then.
+        if best_code:
+            if best_link and re.search(r"verifyemail", best_link, re.I):
+                best_link = None
+            return {"code": best_code, "link": best_link}
+        if best_link:
+            return {"code": None, "link": best_link}
         return None
     finally:
         try:
