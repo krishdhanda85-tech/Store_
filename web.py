@@ -60,7 +60,7 @@ TEMPLATES = {
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#14170f">
+<meta name="theme-color" content="#2a1a6e">
 <title>{{ shop }} Admin</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -237,6 +237,43 @@ button:hover{background:var(--accent2);border-color:var(--accent2);color:#fff}
 body.bare{background:linear-gradient(135deg,#5b6cf0,#8a63f0)}
 th{text-transform:none;letter-spacing:0;font-size:12.5px}
 tr:hover td{background:var(--bg)}
+
+/* theme v3: glass (purple-pink gradient) for the whole admin site */
+:root:root:root:root{--bg:rgba(45,28,115,.9);--surface:rgba(255,255,255,.10);--ink:#fff;--muted:rgba(255,255,255,.72);--line:rgba(255,255,255,.18);--line2:rgba(255,255,255,.28);--field:rgba(255,255,255,.12);--accent:#fff;--accent2:#ece7ff;--accent-soft:rgba(255,255,255,.14);--link:#fff;--paid:#8ff0c8;--pend:#ffd08a;--fail:#ffb0b6;--errbg:rgba(240,80,90,.32);--grey:rgba(255,255,255,.16);--greyink:#fff;--side:rgba(30,16,85,.62);--sidetxt:rgba(255,255,255,.78);--sideon:rgba(255,255,255,.14);--hero:rgba(255,255,255,.12);--bar:rgba(255,255,255,.28);--shadow:none;color-scheme:dark}
+html{background:#1a1250}
+body,body.bare{background:linear-gradient(165deg,#5a2bc0 0%,#2a6fd6 26%,#1a1250 55%,#d9509a 100%) fixed;color:#fff}
+.card,.stat,.kpi,.todo a,.seg,.sub,.facts div,.tr-widget>button,.tr-widget .tr-body{background:rgba(255,255,255,.10);border:1px solid rgba(255,255,255,.22);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}
+.card,.stat.lead{border-radius:26px}.kpi,.stat{border-radius:22px}
+.side{background:var(--side);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);border-right:1px solid rgba(255,255,255,.18)}
+.topbar{background:rgba(30,16,85,.78);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border-bottom:1px solid rgba(255,255,255,.18)}
+.mark{background:linear-gradient(135deg,#f0457a,#8a63f0);color:#fff}
+.scroll table thead th,.scroll table tr:first-child th{background:rgba(58,36,140,.95);color:#fff}
+tr:hover td{background:rgba(255,255,255,.08)}
+th,td{border-bottom-color:rgba(255,255,255,.16)}
+input,textarea,select{background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.28);color:#fff;border-radius:14px}
+input:focus,textarea:focus,select:focus{border-color:#fff;box-shadow:0 0 0 3px rgba(255,255,255,.22)}
+input::placeholder,textarea::placeholder{color:rgba(255,255,255,.6)}
+option{color:#1b1a30;background:#fff}
+button{background:#fff;border-color:#fff;color:#2a1a6e;border-radius:99px}
+button:hover{background:#ece7ff;border-color:#ece7ff;color:#2a1a6e}
+.red{background:rgba(240,80,90,.85);border-color:transparent;color:#fff}.red:hover{background:#f0505a;color:#fff}
+.green{background:rgba(40,190,140,.85);border-color:transparent;color:#fff}.green:hover{background:#28be8c;color:#fff}
+.grey{background:rgba(255,255,255,.16);border-color:rgba(255,255,255,.28);color:#fff}.grey:hover{background:rgba(255,255,255,.26);color:#fff}
+.topbar button,.themebtn,.tools input.tf{background:transparent;color:#fff}
+.themebtn{display:none}
+.chip,.btnlink,.seg a{background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.25);color:#fff}
+.seg{border-radius:99px}.seg a{border-color:transparent;background:transparent}
+.chip:hover{border-color:#fff;color:#fff}
+.seg a.on,.tabs a.on,.chip.on{background:#fff;border-color:#fff;color:#2a1a6e}
+.btnlink:hover{background:rgba(255,255,255,.24);color:#fff}
+.badge{background:#fff;color:#c2306e}
+.side a.nl.on{background:linear-gradient(90deg,#e8305f,#f0457a);color:#fff}
+.msg{background:rgba(255,255,255,.14);border-color:rgba(255,255,255,.3)}
+.donut::after{background:#2a1a6e}
+#pal .box{background:rgba(40,24,110,.95)}#pal a{color:#fff}
+code{background:rgba(255,255,255,.16);color:#fff}
+a:hover{text-decoration:underline}
+@media(max-width:900px){.card{border-radius:22px}}
 </style></head><body class="{{ 'app' if session.get('ok') else 'bare' }}">
 {% macro ico(n) %}<svg viewBox="0 0 24 24" aria-hidden="true">{% if n=='home' %}<path d="M3 11l9-8 9 8"/><path d="M5 10v10h14V10"/>{% elif n=='box' %}<path d="M21 8l-9-5-9 5 9 5 9-5z"/><path d="M3 8v8l9 5 9-5V8"/><path d="M12 13v8"/>{% elif n=='list' %}<path d="M8 6h13M8 12h13M8 18h13"/><path d="M3 6h.01M3 12h.01M3 18h.01"/>{% elif n=='clock' %}<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>{% elif n=='card' %}<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18"/>{% elif n=='qr' %}<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3zM20 14v.01M20 20v.01M17 20h-3"/>{% elif n=='users' %}<circle cx="9" cy="8" r="4"/><path d="M2 21c0-4 3-7 7-7s7 3 7 7"/><path d="M17 4a4 4 0 010 8M22 21c0-3-2-5.5-5-6.5"/>{% elif n=='help' %}<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3.5"/><path d="M5.6 5.6l3.9 3.9M14.5 14.5l3.9 3.9M18.4 5.6l-3.9 3.9M9.5 14.5l-3.9 3.9"/>{% elif n=='tag' %}<path d="M3 12V3h9l9 9-9 9-9-9z"/><circle cx="7.5" cy="7.5" r="1.2"/>{% elif n=='key' %}<circle cx="8" cy="15" r="4"/><path d="M11 12l9-9M16 7l3 3"/>{% elif n=='shield' %}<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/>{% elif n=='sliders' %}<path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/>{% elif n=='out' %}<path d="M9 21H5V3h4"/><path d="M16 17l5-5-5-5M21 12H9"/>{% elif n=='link' %}<path d="M10 14a5 5 0 007 0l3-3a5 5 0 00-7-7l-1 1"/><path d="M14 10a5 5 0 00-7 0l-3 3a5 5 0 007 7l1-1"/>{% elif n=='menu' %}<path d="M4 6h16M4 12h16M4 18h16"/>{% endif %}</svg>{% endmacro %}
 {% macro nl(ep, label, icon, count=0, alt='') %}<a class="nl {{ 'on' if request.endpoint == ep or request.endpoint == alt }}" href="{{ url_for(ep) }}">{{ ico(icon) }}<span>{{ label }}</span>{% if count %}<span class="badge">{{ count }}</span>{% endif %}</a>{% endmacro %}
@@ -354,7 +391,7 @@ d.addEventListener('keydown',function(e){
 {% if signup != 'closed' %}<p class="muted" style="margin:14px 0 0"><a href="{{ url_for('register_seller') }}">Want your own shop? Create a seller account</a></p>{% endif %}</div>{% endblock %}""",
     "dashboard.html": """{% extends 'base.html' %}{% block body %}
 <style>
-.gl{--g:rgba(255,255,255,.10);--gb:rgba(255,255,255,.22);background:linear-gradient(165deg,#5a2bc0 0%,#2a6fd6 26%,#1a1250 55%,#d9509a 92%);border-radius:30px;padding:22px;color:#fff;margin-bottom:84px}
+.gl{--g:rgba(255,255,255,.10);--gb:rgba(255,255,255,.22);color:#fff;margin-bottom:84px}
 .gl a{color:#fff}.gl .m{opacity:.78}
 .gl .gc{background:var(--g);border:1px solid var(--gb);border-radius:26px;padding:16px 18px;margin-bottom:12px}
 .gl h2{color:#fff;font-size:24px;margin:0 0 12px}.gl h3{color:#fff;font-size:16px;margin:0 0 8px}
@@ -382,7 +419,7 @@ d.addEventListener('keydown',function(e){
 .gl .note{background:rgba(255,170,80,.25);border:1px solid rgba(255,200,120,.5);border-radius:18px;padding:10px 14px;margin-bottom:12px;font-size:13px}
 .gl .xl2{display:flex;justify-content:space-between;font-size:11px;opacity:.7;margin-top:4px}
 .gnav{display:none}
-@media(max-width:900px){.gl{padding:16px;border-radius:26px}.gl .g2c{grid-template-columns:1fr}
+@media(max-width:900px){.gl .g2c{grid-template-columns:1fr}
 .gnav{display:flex;position:fixed;left:12px;right:12px;bottom:calc(10px + env(safe-area-inset-bottom,0px));z-index:30;justify-content:space-around;background:rgba(40,24,100,.88);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border:1px solid rgba(255,255,255,.25);border-radius:26px;padding:8px 4px}
 .gnav a,.gnav button{background:none;border:0;color:#fff;font:inherit;font-size:12px;text-align:center;text-decoration:none;opacity:.8;min-height:44px;width:auto;margin:0;padding:2px 10px}.gnav .on{opacity:1;font-weight:700}
 .gnav svg{width:22px;height:22px;display:block;margin:0 auto 2px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}}
