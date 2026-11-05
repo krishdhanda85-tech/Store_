@@ -235,6 +235,22 @@ def _norm(name):
     return re.sub(r"\s+", " ", name or "").strip()
 
 
+def _drop_stale_link(db, sid, key):
+    """Remove the supplier link of a deleted (hidden) product so the item can be added to the shop again."""
+    c = db.conn()
+    try:
+        ids = [r[0] for r in c.execute(
+            "SELECT ps.product_id FROM product_sources ps JOIN products p ON p.id = ps.product_id "
+            "WHERE ps.supplier_id=? AND ps.provider_key=? AND p.active=0", (sid, key)).fetchall()]
+        for pid in ids:
+            c.execute("DELETE FROM product_sources WHERE product_id=? AND supplier_id=?", (pid, sid))
+            c.execute("DELETE FROM source_settings WHERE product_id=?", (pid,))
+        if ids:
+            c.commit()
+    finally:
+        c.close()
+
+
 @bp.route("/catalog")
 def home():
     import web
@@ -242,8 +258,13 @@ def home():
     sups, errs = db.catalog_options(max_age=60)
     for e in errs:
         flash(e, "err")
+    # only products that are really in the shop count: a deleted (hidden) product keeps its supplier link,
+    # which used to make its supplier item look "In shop" forever
+    live_ids = {p["id"] for p in db.list_products()}
     linked = set()
-    for d in db.sources_by_product().values():
+    for pid, d in db.sources_by_product().items():
+        if pid not in live_ids:
+            continue
         for o in d["offers"]:
             linked.add((o["supplier_id"], o["provider_key"]))
     shop_names = {_norm(p["name"]).casefold() for p in db.list_products()}
@@ -319,6 +340,7 @@ def create():
                     fields["description"] = item["description"][:1000]
             if fields:
                 db.update_product(pid, **fields)
+            _drop_stale_link(db, sid, key)
             db.add_source(pid, sid, key)
             ok += 1
             src = db.sources_by_product().get(pid)
