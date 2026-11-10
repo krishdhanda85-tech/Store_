@@ -140,14 +140,36 @@ class BinancePayClient:
 
     # ---------- shared ----------
     def _reserve(self, order_id, base_amount, method):
-        """Store the exact requested amount; payment is matched by submitted TX hash, not decimal slots."""
-        # Keep payment amounts to 2 decimals; 0.4 and 0.40 resolve identically.
-        payable = float(Decimal(str(base_amount)).quantize(Decimal("0.01")))
+        """Create an immutable payment intent; never overwrite an existing/paid order."""
+        order_id = str(order_id or "").strip()
+        if not order_id or len(order_id) > 128 or any(ord(ch) < 32 for ch in order_id):
+            raise ValueError("Invalid payment order ID.")
+        amount = Decimal(str(base_amount))
+        if not amount.is_finite() or amount <= 0 or amount > Decimal("1000000"):
+            raise ValueError("Invalid payment amount.")
+        payable_d = amount.quantize(Decimal("0.01"))
+        if payable_d <= 0:
+            raise ValueError("Payment amount is too small.")
+        payable = float(payable_d)
         c = self._conn()
-        c.execute("INSERT OR REPLACE INTO crypto_payments(order_id,payable,created_ms,txid,method,submitted_txid) VALUES(?,?,?,NULL,?,NULL)",
-                  (order_id, payable, int(time.time() * 1000), method))
-        c.commit(); c.close()
-        return payable
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            old = c.execute("SELECT payable,method,txid FROM crypto_payments WHERE order_id=?", (order_id,)).fetchone()
+            if old:
+                if Decimal(str(old["payable"])) != payable_d or (old["method"] or "bsc") != method:
+                    raise ValueError("This order ID is already bound to a different payment. Create a new order ID.")
+                # Idempotent retry: retain original creation time, submitted hash and paid state.
+                c.commit()
+                return float(old["payable"])
+            c.execute("INSERT INTO crypto_payments(order_id,payable,created_ms,txid,method,submitted_txid) VALUES(?,?,?,NULL,?,NULL)",
+                      (order_id, payable, int(time.time() * 1000), method))
+            c.commit()
+            return payable
+        except Exception:
+            c.rollback()
+            raise
+        finally:
+            c.close()
 
     def submit_tx_hash(self, order_id, tx_hash):
         """Attach one user-provided transaction hash; reject reused hashes and malformed input."""
@@ -241,15 +263,45 @@ class BinancePayClient:
         if not txid:
             return "PENDING"
         tx = self._rpc("eth_getTransactionByHash", [txid])
-        if not tx:
+        if not tx or str(tx.get("hash") or "").lower() != txid:
             return "PENDING"
+        # Refuse an RPC endpoint pointed at the wrong EVM network.
+        chain_id = int(self._rpc("eth_chainId", []), 16)
+        if chain_id != 56:  # BNB Smart Chain mainnet
+            raise RuntimeError(f"Wrong EVM network: expected BSC chainId 56, got {chain_id}.")
         receipt = self._rpc("eth_getTransactionReceipt", [txid])
         if not receipt or int(receipt.get("status", "0x0"), 16) != 1:
+            return "PENDING"
+        if str(receipt.get("transactionHash") or "").lower() != txid:
             return "PENDING"
         latest = int(self._rpc("eth_blockNumber", []), 16)
         block = int(receipt.get("blockNumber", "0x0"), 16)
         if latest - block + 1 < CONFIRMATIONS:
             return "PENDING"
+
+        # Bind the receipt to the canonical transaction/block and reject old hashes.
+        # A successful transaction from before this deposit was created is NOT payment.
+        tx_block = int(tx.get("blockNumber") or "0x0", 16)
+        if tx_block != block:
+            return "PENDING"
+        tx_hash = str(tx.get("hash") or "").lower()
+        if tx_hash != txid:
+            return "PENDING"
+        block_data = self._rpc("eth_getBlockByNumber", [hex(block), False])
+        if not block_data or int(block_data.get("number") or "0x0", 16) != block:
+            return "PENDING"
+        canonical_hash = str(block_data.get("hash") or "").lower()
+        if not canonical_hash or str(receipt.get("blockHash") or "").lower() != canonical_hash:
+            return "PENDING"
+        if str(tx.get("blockHash") or "").lower() != canonical_hash:
+            return "PENDING"
+        block_timestamp = int(block_data.get("timestamp") or "0x0", 16)
+        created_ms = int(row["created_ms"])
+        if block_timestamp * 1000 < created_ms:
+            log.warning("Rejecting pre-existing BSC transaction for order %s: tx=%s block_time=%s created_ms=%s",
+                        order_id, txid, block_timestamp, created_ms)
+            return "PENDING"
+
         payable = Decimal(str(row["payable"]))
         deposit_to = self.deposit_address.lower()
         token = self.contract.lower()
