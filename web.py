@@ -31,6 +31,8 @@ app.register_blueprint(reseller_api_blueprint)
 register_reseller_admin(app, db)
 from suppliers_admin import register as register_suppliers_admin
 register_suppliers_admin(app, db)
+from topup_admin import register as register_topup_admin
+register_topup_admin(app, db)
 from growth_admin import register as register_growth_admin
 register_growth_admin(app)
 from assistant_admin import register as register_assistant_admin
@@ -313,6 +315,7 @@ a:hover{text-decoration:underline}
 <div class="grp">System</div>
 {% if is_main %}{{ nl('sellers_admin.sellers','Sellers','users',pending_sellers) }}{% else %}{{ nl('connect','Bot & payments','link') }}{% endif %}
 {{ nl('suppliers_admin.suppliers','Suppliers API','link') }}
+{% if is_main %}{{ nl('topup_admin.topup','Supplier top-up','key') }}{% endif %}
 {{ nl('reseller_admin.resellers','Resellers API','key') }}
 {{ nl('admins','Admins','shield') }}
 {{ nl('emojis','Premium emojis','tag') }}

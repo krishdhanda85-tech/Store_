@@ -20,6 +20,7 @@ from telegram.ext import (
 )
 
 import agents
+import binance_withdraw
 import fampay_verify
 import growth_bot
 import netflix_otp
@@ -2877,6 +2878,45 @@ async def unlinkapi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Unlinked.")
 
 
+async def withdraw_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner only: /withdraw <amount> [yes]  - sends USDT to the fixed supplier wallet address."""
+    if not is_owner(update.effective_user.id):
+        return
+    if not binance_withdraw.configured():
+        await update.message.reply_text("Fill BINANCE_WD_KEY, BINANCE_WD_SECRET and WD_ADDRESS in binance_withdraw.py first.")
+        return
+    args = context.args or []
+    if not args:
+        try:
+            bal = await asyncio.to_thread(binance_withdraw.spot_balance)
+            await update.message.reply_text(f"Withdraw balance: {bal} {binance_withdraw.cfg('WD_COIN')}\n"
+                                            "Usage: /withdraw <amount> yes")
+        except Exception as e:
+            await update.message.reply_text(f"Error: {str(e)[:300]}")
+        return
+    try:
+        amt = binance_withdraw.parse_amount(args[0])
+    except ValueError as e:
+        await update.message.reply_text(str(e))
+        return
+    addr = binance_withdraw.cfg("WD_ADDRESS")
+    if len(args) < 2 or args[1].lower() != "yes":
+        await update.message.reply_text(f"Send {amt} {binance_withdraw.cfg('WD_COIN')} ({binance_withdraw.cfg('WD_NETWORK')}) "
+                                        f"to {addr[:6]}...{addr[-6:]}?\nConfirm: /withdraw {amt} yes")
+        return
+    try:
+        wid = await asyncio.to_thread(binance_withdraw.withdraw, amt)
+        await update.message.reply_text(f"✅ Withdrawal sent. Binance id: {wid}\nHash (TXID) ka wait kar raha hoon...")
+        txid = await asyncio.to_thread(binance_withdraw.wait_txid, wid)
+        if txid:
+            context.bot_data["last_wd_txid"] = txid
+            await update.message.reply_text(f"TXID:\n<code>{html.escape(txid)}</code>", parse_mode=ParseMode.HTML)
+        else:
+            await update.message.reply_text("TXID abhi nahi aaya. Thodi der baad Binance history mein dekho.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Withdrawal failed: {str(e)[:300]}")
+
+
 async def apibalance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
         return
@@ -3742,6 +3782,7 @@ def build_application(tenant):
     app.add_handler(CommandHandler("linkapi", linkapi))
     app.add_handler(CommandHandler("unlinkapi", unlinkapi))
     app.add_handler(CommandHandler("apibalance", apibalance))
+    app.add_handler(CommandHandler("withdraw", withdraw_cmd))
     app.add_handler(CallbackQueryHandler(texts_callback, pattern=r"^tx:"))
     netflix_otp.register_bot(app)
     app.add_handler(CallbackQueryHandler(on_callback))

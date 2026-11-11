@@ -37,6 +37,10 @@ from datetime import datetime, timezone
 import requests
 
 from db import Database
+try:
+    import supplier_topup
+except Exception:       # optional: auto top-up of supplier balance (Binance + Telethon)
+    supplier_topup = None
 
 try:
     from cryptography.fernet import Fernet
@@ -884,8 +888,22 @@ class ShopDB(Database):
         return alerts
 
     # ------------------------------------------------------------ buying
+    def _needs_topup(self, m, need):
+        """True when this supplier has top-up configured and its API balance is below the cost."""
+        if not supplier_topup or not supplier_topup.has_config(m["sname"], m["supplier_id"], self):
+            return False
+        try:
+            s = self.get_supplier(m["supplier_id"])
+            return balance_for(s) + 1e-9 < float(m["cost"]) * need
+        except Exception:
+            log.exception("balance check failed for %s (using normal purchase path)", m["sname"])
+            return False
+
     def fetch_stock(self, pid, need, unit=None):
         """Buy `need` items for product `pid` from the best supplier and put them in our stock.
+        Suppliers whose API balance covers the cost are used first (direct API). A supplier with
+        too little balance is topped up last: bot withdraws from Binance, Telethon sends the hash
+        to that supplier's bot, then the API purchase runs.
         Returns 'ok' / 'stock' (no supplier could supply it) / 'error' (supplier failed)."""
         with _buy_lock:
             prod = Database.get_product(self, pid)
@@ -895,6 +913,24 @@ class ShopDB(Database):
             cands = self._candidates(c, pid)
             c.close()
             had_error = False
+
+            def attempt(m, topup):
+                nonlocal had_error
+                try:
+                    if topup:
+                        s = self.get_supplier(m["supplier_id"])
+                        supplier_topup.ensure_funds(self, s, float(m["cost"]) * need, balance_for)
+                    self._fetch_from_provider(prod, m, need)
+                    return "ok"
+                except Exception as e:
+                    had_error = True
+                    if supplier_topup and isinstance(e, supplier_topup.TopupError):
+                        log.error("top-up failed for %s: %s", m["sname"], e)
+                        return "next"                  # nothing bought from the supplier: next one is safe
+                    log.exception("purchase failed: product %s via %s", pid, m["sname"])
+                    return "next" if _clean_failure(e) else "stop"   # money may be spent: never try another
+
+            later = []
             for m in cands:
                 if int(m["stock"] or 0) < need:
                     continue
@@ -902,14 +938,20 @@ class ShopDB(Database):
                     log.warning("blocked sale below cost: product %s unit %s cost %s (%s)",
                                 pid, unit, m["cost"], m["sname"])
                     continue
-                try:
-                    self._fetch_from_provider(prod, m, need)
+                if self._needs_topup(m, need):
+                    later.append(m)                    # short balance: only if no funded supplier works
+                    continue
+                r = attempt(m, False)
+                if r == "ok":
                     return "ok"
-                except Exception as e:
-                    had_error = True
-                    log.exception("purchase failed: product %s via %s", pid, m["sname"])
-                    if not _clean_failure(e):          # money may have been spent: never try another supplier
-                        return "error"
+                if r == "stop":
+                    return "error"
+            for m in later:
+                r = attempt(m, True)
+                if r == "ok":
+                    return "ok"
+                if r == "stop":
+                    return "error"
             return "error" if had_error else "stock"
 
     def buy_with_balance(self, uid, pid, qty, unit):
