@@ -1,1040 +1,2383 @@
-"""
-Multi-supplier bridge for the Digital Store bot.
-
-You can add ANY number of suppliers (APIs) on the admin site -> "Suppliers API".
-Each shop product can be linked to one product on each supplier, and YOU choose
-where it is bought from:
-
-  * "I choose"  : your chosen supplier is used first (e.g. Gemini @ 0.37 on supplier A)
-  * "Cheapest"  : the cheapest supplier that has enough stock is used
-  * Fallback    : if the first supplier fails or is out of stock, the next one is tried
-
-Flow when a buyer pays: your own stock is used first; only the missing quantity is
-bought from the chosen supplier, put into your stock, then the normal
-buy_with_balance() debits the buyer and delivers.
-
-API formats (each supplier can have a different one):
-  * cupponhub : the original format  (?action=products / balance / purchase, X-API-Key)
-  * generic   : any JSON API - you map the URL paths and field names in a small JSON
-                config on the Suppliers page (see GENERIC_DEFAULT below)
-
-Env (optional): CUPPON_API_KEY / PROVIDER_API_BASE still work - they become a supplier
-called "CupponHub" automatically, so old setups keep working.
-API keys of suppliers are stored ENCRYPTED (same secret as the reseller keys:
-API_KEY_SECRET, else BOT_TOKEN).
-"""
-import base64
-import hashlib
-import json
+import re
+import html as htmllib
 import logging
 import os
-import threading
+import hmac
+import hashlib
 import time
-import uuid
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+import csv
+import io
+from datetime import datetime, timedelta, timezone
 
 import requests
 
-from db import Database
-try:
-    import supplier_topup
-except Exception:       # optional: auto top-up of supplier balance (Binance + Telethon)
-    supplier_topup = None
+from flask import Flask, request, session, redirect, url_for, render_template, render_template_string, flash, Response
+from jinja2 import DictLoader
 
-try:
-    from cryptography.fernet import Fernet
-except Exception:       # library missing -> supplier keys cannot be stored
-    Fernet = None
+import provider
+import tenancy
+import sellers_web
+from flask import g
 
-log = logging.getLogger("provider")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 
-ENV_BASE = os.getenv("PROVIDER_API_BASE", "https://cupponhub.shop/reseller/api/")
-ENV_KEY = os.getenv("CUPPON_API_KEY", "")
-ENABLED = True            # suppliers are managed on the admin site now
-MAX_QTY = 500
+tenancy.init_all()
+db = tenancy.db                  # always the shop of the logged-in person (see guard() below)
 
-_buy_lock = threading.RLock()
-_cat_cache = {}           # (supplier id, base_url, key) -> (time, [normalized products]); key parts keep shops apart
+app = Flask(__name__)
+from reseller_api import api as reseller_api_blueprint
+from reseller_admin import register as register_reseller_admin
+app.register_blueprint(reseller_api_blueprint)
+register_reseller_admin(app, db)
+from suppliers_admin import register as register_suppliers_admin
+register_suppliers_admin(app, db)
+from topup_admin import register as register_topup_admin
+register_topup_admin(app, db)
+from growth_admin import register as register_growth_admin
+register_growth_admin(app)
+from assistant_admin import register as register_assistant_admin
+register_assistant_admin(app)
+from smart_admin import register as register_smart_admin
+register_smart_admin(app)
+from catalog_admin import register as register_catalog_admin
+register_catalog_admin(app)
+from compare_admin import register as register_compare_admin
+register_compare_admin(app)
+from alerts_admin import register as register_alerts_admin
+register_alerts_admin(app)
+from folders_admin import register as register_folders_admin
+register_folders_admin(app)
+from netflix_otp import register_admin as register_otp_admin
+register_otp_admin(app)
+from netflix_admin import register_admin as register_netflix_admin
+register_netflix_admin(app)
+app.config["MAX_CONTENT_LENGTH"] = 3 * 1024 * 1024   # QR uploads
+app.secret_key = os.getenv("SECRET_KEY") or hashlib.sha256(
+    ("shop-admin:" + ADMIN_PASSWORD).encode()
+).hexdigest()
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=bool(os.getenv("RAILWAY_ENVIRONMENT")),
+)
 
-
-def _ck(s):
-    return (s["id"], s.get("base_url") or "", s.get("key") or "")
-
-
-def _cache_drop(sid):
-    for k in [k for k in _cat_cache if k[0] == sid]:
-        _cat_cache.pop(k, None)
-
-
-class ProviderError(Exception):
-    """The supplier answered with an error. rejected=True means it clearly refused the request
-    (nothing was bought), so trying another supplier is safe."""
-
-    def __init__(self, status, code, rejected=True):
-        super().__init__(f"{status}: {code}")
-        self.status, self.code, self.rejected = status, code, rejected
-
-
-class Unreachable(RuntimeError):
-    """Could not talk to the supplier. clean=True means the request never left (connection
-    refused/DNS), so nothing was bought and another supplier may be tried."""
-
-    def __init__(self, msg, clean):
-        super().__init__(msg)
-        self.clean = clean
-
-
-def _clean_failure(e):
-    """True when it is certain no money was spent, so falling back to another supplier is safe."""
-    if isinstance(e, ProviderError):
-        return e.rejected and (e.status < 500 or e.status == 503)
-    return bool(getattr(e, "clean", False))
-
-
-def _now():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
-
-# ------------------------------------------------------------------ key encryption
-def _fernet():
-    if Fernet is None:
-        return None
-    secret = os.getenv("API_KEY_SECRET") or os.getenv("BOT_TOKEN") or ""
-    if not secret:
-        return None
-    return Fernet(base64.urlsafe_b64encode(hashlib.sha256(secret.encode()).digest()))
-
-
-def encrypt(text):
-    f = _fernet()
-    if not f:
-        raise ValueError("Cannot store the key safely: set API_KEY_SECRET (and install 'cryptography').")
-    return f.encrypt(text.encode()).decode()
-
-
-def decrypt(token):
-    f = _fernet()
-    if not f or not token:
-        return ""
-    try:
-        return f.decrypt(token.encode()).decode()
-    except Exception:
-        return ""
-
-
-# ------------------------------------------------------------------ format 1: cupponhub
-def _ch_call(s, method, action, params=None, body=None, idem=None):
-    headers = {"X-API-Key": s["key"]}
-    if idem:
-        headers["Idempotency-Key"] = idem
-    r = requests.request(method, s["base_url"], headers=headers, json=body, timeout=20,
-                         params={"action": action, **(params or {})})
-    try:
-        data = r.json()
-    except ValueError:
-        raise ProviderError(r.status_code, "bad_response", rejected=False)
-    if not data.get("ok"):
-        raise ProviderError(r.status_code, data.get("error", "unknown"))
-    return data
-
-
-def _ch_catalog(s):
-    return [{"key": str(p["key"]), "name": str(p["name"]),
-             "cost": float(p["price_usdt_from"]), "stock": int(p["stock"]),
-             "description": str(p.get("description") or "").strip(),
-             "category": str(p.get("category") or "").strip()}
-            for p in _ch_call(s, "GET", "products")["products"]]
-
-
-def _ch_balance(s):
-    return float(_ch_call(s, "GET", "balance")["balance_usdt"])
-
-
-def _ch_purchase(s, key, qty, idem):
-    o = _ch_call(s, "POST", "purchase", body={"product": key, "quantity": qty}, idem=idem)["order"]
-    return {"order_id": str(o["order_id"]), "items": [str(x) for x in o["items"]],
-            "total": float(o["total_usdt"]), "stock_left": int(o["stock_left"])}
-
-
-# ------------------------------------------------------------------ format 2: generic JSON
-# Edit this on the Suppliers page. Paths are added to the Base URL. Field names can be dotted
-# ("data.items"). Only change what differs from your supplier's documentation.
-GENERIC_DEFAULT = {
-    "auth_header": "Authorization",        # e.g. "X-API-Key"
-    "auth_prefix": "Bearer ",              # use "" when the key is sent as-is
-    "products": {"method": "GET", "path": "/products", "list": "products",
-                 "key": "id", "name": "name", "cost": "price", "stock": "stock",
-                 "description": "description", "category": "category"},
-    "balance": {"method": "GET", "path": "/balance", "field": "balance"},
-    "purchase": {"method": "POST", "path": "/purchase", "send": "json",
-                 "product_param": "product_id", "qty_param": "quantity",
-                 "idem_header": "Idempotency-Key",
-                 "order_id": "order_id", "items": "items", "item_field": "",
-                 "total": "total", "stock_left": "stock_left"},
+# ---------------------------------------------------------------- templates
+TEMPLATES = {
+    "base.html": """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#2a1a6e">
+<title>{{ shop }} Admin</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<script>try{var t=localStorage.getItem("theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+<style>
+:root{--bg:#f2eee6;--surface:#fffdf8;--ink:#1b1a16;--muted:#6d6a5f;--line:#e4dfd2;--line2:#d2ccbb;--field:#fffdf8;--accent:#0d6b57;--accent2:#095544;--accent-soft:#e1efe8;--link:#0d6b57;--paid:#0d7a56;--pend:#a45f00;--fail:#c2361f;--errbg:#fbe9e4;--grey:#ebe6d9;--greyink:#2b2a24;--side:#14170f;--sidetxt:#a9ad9b;--sideon:#232818;--bar:#cfe3d9;--hero:#14170f;--lime:#d4f54a;--shadow:0 1px 0 #00000008,0 8px 24px -16px #3a35201f}
+@media(prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#0d0f0a;--surface:#151810;--ink:#eceee3;--muted:#8f9484;--line:#242819;--line2:#323724;--field:#0f120b;--accent:#d4f54a;--accent2:#c1e43a;--accent-soft:#232b10;--link:#d4f54a;--paid:#79e0a6;--pend:#f0bb4c;--fail:#ff8270;--errbg:#3a1f1a;--grey:#22261a;--greyink:#e2e5d6;--side:#0a0c07;--sidetxt:#8f9484;--sideon:#1c2112;--bar:#2c3517;--hero:#1b2012;--shadow:none}}
+:root[data-theme=dark]{--bg:#0d0f0a;--surface:#151810;--ink:#eceee3;--muted:#8f9484;--line:#242819;--line2:#323724;--field:#0f120b;--accent:#d4f54a;--accent2:#c1e43a;--accent-soft:#232b10;--link:#d4f54a;--paid:#79e0a6;--pend:#f0bb4c;--fail:#ff8270;--errbg:#3a1f1a;--grey:#22261a;--greyink:#e2e5d6;--side:#0a0c07;--sidetxt:#8f9484;--sideon:#1c2112;--bar:#2c3517;--hero:#1b2012;--shadow:none}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;font-family:'Instrument Sans',ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--ink);line-height:1.55;font-size:15px}
+a{color:var(--link);text-decoration:none}a:hover{text-decoration:underline}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+h2,h3,.brand,.big,.stat span,.stat.lead span{font-family:'Bricolage Grotesque','Instrument Sans',system-ui,sans-serif}
+h2{font-size:32px;letter-spacing:-.035em;font-weight:700;margin:0 0 18px;line-height:1.1}
+h3{font-size:17px;font-weight:650;margin:0 0 10px;letter-spacing:-.015em}
+p{margin:0 0 10px}
+code{background:var(--accent-soft);color:var(--ink);padding:2px 7px;border-radius:6px;font-size:13px;overflow-wrap:anywhere}
+body.app{display:grid;grid-template-columns:258px minmax(0,1fr);min-height:100vh}
+body.bare{display:grid;place-items:center;min-height:100vh;padding:20px;background:var(--hero)}
+main{width:100%;max-width:1160px;margin:0 auto;padding:34px 32px 80px}
+body.bare main{max-width:420px;padding:0}
+.side{position:sticky;top:0;height:100vh;overflow-y:auto;background:var(--side);padding:20px 14px 16px;display:flex;flex-direction:column;scrollbar-width:thin}
+.brand{display:flex;align-items:center;gap:11px;padding:2px 8px 16px;color:#f4f6ea;font-weight:700;font-size:19px;letter-spacing:-.03em}
+.mark{width:34px;height:34px;border-radius:10px;background:var(--lime);color:#14170f;display:grid;place-items:center;font-weight:800;flex:none;font-family:'Bricolage Grotesque',sans-serif}
+.grp{margin:20px 10px 6px;font-size:11px;font-weight:700;color:#6f7560;letter-spacing:.12em;text-transform:uppercase}
+.side a.nl,.themebtn{display:flex;align-items:center;gap:11px;padding:9px 11px;border-radius:10px;color:var(--sidetxt);font-weight:550;font-size:14.5px;text-decoration:none}
+.side a.nl:hover,.themebtn:hover{background:var(--sideon);color:#f4f6ea;text-decoration:none}
+.side a.nl.on{background:var(--lime);color:#14170f;font-weight:700}
+.side svg,.topbar svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;flex:none}
+.side .badge{margin-left:auto}
+.side .out{margin-top:auto;padding-top:16px;border-top:1px solid #ffffff12}
+.topbar,.scrim{display:none}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:18px;padding:24px;margin-bottom:18px;box-shadow:var(--shadow)}
+.stats,.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-bottom:18px}
+@media(min-width:760px){.stats,.grid{grid-template-columns:repeat(5,1fr)}}
+.stat{background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:16px 18px;box-shadow:var(--shadow)}
+.stat small{display:block;color:var(--muted);font-weight:600;font-size:12.5px}
+.stat span{display:block;margin-top:6px;font-size:28px;font-weight:700;letter-spacing:-.03em;font-variant-numeric:tabular-nums}
+.stat.lead{grid-column:1/-1;background:var(--hero);border-color:var(--hero);padding:26px 28px;border-radius:20px}
+.stat.lead small{color:#a4aa94}.stat.lead span{font-size:46px;color:var(--lime)}
+.scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th,td{text-align:left;padding:13px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--muted);font-weight:650;font-size:12px;letter-spacing:.04em;text-transform:uppercase;white-space:nowrap;border-bottom:1px solid var(--line2)}
+td{font-variant-numeric:tabular-nums}
+tr:last-child td{border-bottom:0}
+tr:hover td{background:var(--accent-soft)}
+td form{margin:0 0 6px}td input{min-width:92px;margin:0 0 6px}td button{width:auto;padding:8px 14px;margin:0}
+.paid{color:var(--paid)}.pending,.processing{color:var(--pend)}.failed,.refunded{color:var(--fail)}
+td.paid,td.pending,td.processing,td.failed,td.refunded{font-weight:700}
+td.paid::before,td.pending::before,td.processing::before,td.failed::before,td.refunded::before{content:'';display:inline-block;width:8px;height:8px;border-radius:3px;background:currentColor;margin-right:8px;vertical-align:1px}
+input,textarea,select,button{width:100%;padding:11px 13px;margin:6px 0;border-radius:11px;border:1px solid var(--line2);background:var(--field);color:var(--ink);font:inherit;font-size:15px}
+input:focus,textarea:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 4px var(--accent-soft);outline:0}
+input::placeholder,textarea::placeholder{color:var(--muted);opacity:.75}
+label{display:block;color:var(--muted);font-size:13px;font-weight:600;margin-top:12px}
+button{background:var(--ink);border-color:var(--ink);color:var(--surface);font-weight:650;cursor:pointer;transition:transform .12s,background .15s}
+button:hover{background:var(--accent);border-color:var(--accent);color:#fff}
+button:active{transform:scale(.98)}
+.red{background:var(--fail);border-color:var(--fail);color:#fff}.red:hover{background:var(--fail);border-color:var(--fail);filter:brightness(.9);color:#fff}
+.green{background:#13805a;border-color:#13805a;color:#fff}.green:hover{background:#0e6a4a;border-color:#0e6a4a;color:#fff}
+.grey{background:var(--grey);border-color:var(--grey);color:var(--greyink)}.grey:hover{background:var(--line2);border-color:var(--line2);color:var(--ink)}
+.sm{width:auto;padding:7px 13px;font-size:13px;margin:0}
+.inline{display:flex;gap:8px;align-items:center}.inline input{margin:0}.inline button{width:auto;margin:0;white-space:nowrap}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.row{display:flex;gap:8px;flex-wrap:wrap}.row button{flex:1;min-width:110px}
+.msg{padding:13px 16px;border-radius:14px;background:var(--accent-soft);border:1px solid var(--line2);margin-bottom:16px;overflow-wrap:anywhere}
+.msg.err,.err{background:var(--errbg);border-color:var(--fail)}
+.msg b{font-weight:700}
+.muted{color:var(--muted);font-size:13px}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all;font-size:13.5px}
+.badge{display:inline-block;background:var(--ink);color:var(--surface);border-radius:99px;padding:1px 9px;font-size:12px;font-weight:800;line-height:1.55}
+.side .badge{background:#f0b84a;color:#1b1405}
+.side a.nl.on .badge{background:#14170f;color:var(--lime)}
+.login{padding:34px 28px}
+.login .mark{width:48px;height:48px;border-radius:14px;font-size:22px;margin-bottom:16px}
+.login h2{font-size:30px;margin-bottom:4px}
+.login button{margin-top:16px;padding:13px}
+body.bare .card{border-color:transparent;border-radius:24px}
+.page-head{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:20px}
+.page-head h2{margin:0}
+.seg{display:inline-flex;background:var(--surface);border:1px solid var(--line);border-radius:99px;padding:4px}
+.seg a,.tabs a{padding:6px 14px;border-radius:99px;font-size:13px;font-weight:650;color:var(--muted);text-decoration:none}
+.seg a:hover{color:var(--ink);text-decoration:none}
+.seg a.on,.tabs a.on{background:var(--ink);color:var(--surface)}
+.lead2{background:var(--hero);color:#f1f3e6;border-radius:24px;padding:30px 32px;margin-bottom:14px;display:grid;grid-template-columns:1.2fr 1.2fr 1fr;gap:28px;align-items:start}
+.lead2 small{color:#a4aa94;font-weight:600;font-size:12.5px;display:block;letter-spacing:.04em;text-transform:uppercase}
+.lead2 .big{font-size:54px;font-weight:700;letter-spacing:-.045em;font-variant-numeric:tabular-nums;line-height:1.05;margin-top:6px}
+.lead2 .big.profit{color:var(--lime)}.lead2 .big.loss{color:#ff8a7a}
+.lead2 .sub{color:#a4aa94;font-size:13px;margin-top:6px}
+.lead2 .mini{display:grid;gap:10px;font-size:14px}
+.lead2 .mini div{display:flex;justify-content:space-between;gap:12px;border-bottom:1px solid #ffffff1a;padding-bottom:10px}
+.lead2 .mini div:last-child{border-bottom:0;padding-bottom:0}
+.lead2 .mini span{color:#a4aa94}.lead2 .mini b{font-variant-numeric:tabular-nums}
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+.chart{display:flex;align-items:flex-end;gap:5px;height:180px;margin-top:18px}
+.chart .col{flex:1;min-width:0;height:100%;display:flex;flex-direction:column;justify-content:flex-end}
+.chart .bar{background:var(--bar);border-radius:6px 6px 2px 2px;display:flex;align-items:flex-end;min-height:3px}
+.chart .bar i{display:block;width:100%;background:var(--accent);border-radius:6px 6px 2px 2px}
+.xl{display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-top:8px}
+.dot{display:inline-block;width:9px;height:9px;border-radius:3px;margin:0 5px 0 12px}
+.dot.rev{background:var(--bar)}.dot.prof{background:var(--accent)}
+.hint{font-weight:500;color:var(--muted);font-size:12.5px}
+.tools{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:0 0 12px}
+.tools input.tf{margin:0;max-width:300px;padding:9px 12px 9px 36px;border-radius:99px;background:var(--field) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23889' stroke-width='2' stroke-linecap='round'%3E%3Ccircle cx='11' cy='11' r='7'/%3E%3Cpath d='M20 20l-4-4'/%3E%3C/svg%3E") no-repeat 13px 50%}
+.chips{display:inline-flex;gap:6px;flex-wrap:wrap}
+.chip{width:auto;margin:0;padding:6px 13px;border-radius:99px;font-size:13px;font-weight:650;background:var(--surface);color:var(--muted);border:1px solid var(--line2)}
+.chip:hover{background:var(--surface);border-color:var(--ink);color:var(--ink)}
+.chip.on{background:var(--ink);border-color:var(--ink);color:var(--surface)}
+.btnlink{display:inline-flex;align-items:center;gap:6px;padding:9px 16px;border-radius:99px;background:var(--grey);color:var(--greyink);font-weight:650;font-size:13px;text-decoration:none}
+.btnlink:hover{background:var(--line2);text-decoration:none}
+.count{margin-left:auto;font-size:13px;color:var(--muted)}
+th[data-sort]{cursor:pointer;user-select:none}th[data-sort]:hover{color:var(--ink)}
+th[data-dir=asc]::after{content:' ↑'}th[data-dir=desc]::after{content:' ↓'}
+.scroll table thead th,.scroll table tr:first-child th{position:sticky;top:0;background:var(--surface);z-index:1}
+.empty{padding:30px 10px;text-align:center;color:var(--muted)}
+.msg.toast{transition:opacity .4s,transform .4s}.msg.toast.gone{opacity:0;transform:translateY(-6px)}
+.copyable{cursor:copy}.copyable.copied{outline:2px solid var(--paid)}
+.themebtn{width:100%;margin:6px 0 0;border:0;background:transparent;text-align:left}
+.kbd{font-size:11px;border:1px solid #ffffff2a;border-radius:5px;padding:0 5px;color:var(--sidetxt)}
+#pal{position:fixed;inset:0;background:#000a;z-index:10000;display:none;align-items:flex-start;justify-content:center;padding:12vh 14px 0}
+#pal.open{display:flex}
+#pal .box{width:100%;max-width:480px;background:var(--surface);border:1px solid var(--line2);border-radius:18px;padding:10px;box-shadow:0 24px 70px #0007}
+#pal input{margin:0 0 6px}
+#pal a{display:block;padding:10px 12px;border-radius:10px;color:var(--ink);font-weight:600;text-decoration:none}
+#pal a.sel,#pal a:hover{background:var(--accent-soft);text-decoration:none}
+.tr-widget{position:fixed;left:14px;bottom:14px;z-index:900}
+.tr-widget>button{width:auto;margin:0;padding:8px 13px;border-radius:99px;font-size:13px;background:var(--surface);color:var(--ink);border:1px solid var(--line2);box-shadow:var(--shadow)}
+.tr-widget .tr-body{display:none;margin-top:8px;background:var(--surface);border:1px solid var(--line2);padding:8px 10px;border-radius:14px}
+.tr-widget.open .tr-body{display:block}
+@media(max-width:900px){
+body.app{display:block}
+.side{position:fixed;top:0;bottom:0;left:0;width:278px;height:auto;transform:translateX(-102%);transition:transform .22s ease;z-index:40}
+body.nav-open .side{transform:none}
+.scrim{position:fixed;inset:0;background:#0009;z-index:30}body.nav-open .scrim{display:block}
+.topbar{display:flex;align-items:center;gap:12px;position:sticky;top:0;z-index:20;background:var(--side);color:#f4f6ea;padding:10px 14px;font-weight:700;font-family:'Bricolage Grotesque',sans-serif}
+.topbar button{width:auto;margin:0;padding:7px 9px;background:transparent;border-color:#ffffff30;color:#f4f6ea;line-height:0}
+.topbar .mark{width:30px;height:30px;border-radius:9px;font-size:14px}
+main{padding:22px 14px 70px}
+h2{font-size:26px}
+.card{padding:18px;border-radius:16px}
+.stat.lead span{font-size:36px}
+.lead2{grid-template-columns:1fr;padding:22px;gap:20px;border-radius:20px}.lead2 .big{font-size:40px}
+.cols,.two{grid-template-columns:1fr}
+.chart{height:140px}.stat span{font-size:23px}
+.stats .stat:last-child:nth-child(odd){grid-column:1/-1}
+button,input,select,textarea{min-height:44px}.sm,.chip,.btnlink{min-height:40px}.tr-widget{bottom:76px}
 }
+@media(prefers-reduced-motion:reduce){*{transition:none!important}}
+
+/* theme v2: light dashboard like the reference */
+:root{--bg:#eef0f8;--surface:#fff;--ink:#1f2440;--muted:#7a809b;--line:#e8eaf3;--line2:#d9dcea;--field:#fff;--accent:#5b6cf0;--accent2:#4a5ae0;--accent-soft:#eceefe;--link:#4a5ae0;--grey:#eef0f8;--greyink:#2b3050;--side:#fff;--sidetxt:#5d6482;--sideon:#f3f4fb;--bar:#c9cffa;--hero:#1f2440;--shadow:0 2px 14px #5b6cf014}
+@media(prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#11132a;--surface:#1a1d3a;--ink:#eceefb;--muted:#8d93b5;--line:#2a2e52;--line2:#363b66;--field:#14172f;--accent:#7a88ff;--accent2:#6676f0;--accent-soft:#262b57;--link:#9aa5ff;--grey:#252950;--greyink:#e4e7fb;--side:#161933;--sidetxt:#9ba1c4;--sideon:#22264a;--bar:#343a78;--hero:#1a1d3a;--shadow:none}}
+:root[data-theme=dark]{--bg:#11132a;--surface:#1a1d3a;--ink:#eceefb;--muted:#8d93b5;--line:#2a2e52;--line2:#363b66;--field:#14172f;--accent:#7a88ff;--accent2:#6676f0;--accent-soft:#262b57;--link:#9aa5ff;--grey:#252950;--greyink:#e4e7fb;--side:#161933;--sidetxt:#9ba1c4;--sideon:#22264a;--bar:#343a78;--hero:#1a1d3a;--shadow:none}
+body,h2,h3,.brand,.big,.stat span,.mark,.topbar{font-family:'Plus Jakarta Sans',ui-sans-serif,system-ui,sans-serif}
+.card,.stat{border:0;border-radius:14px}
+.side{border-right:1px solid var(--line)}
+.brand{color:var(--ink)}
+.mark{background:linear-gradient(135deg,#f0457a,#e8305f);color:#fff}
+.grp{color:var(--muted)}
+.side a.nl:hover,.themebtn:hover{background:var(--sideon);color:var(--ink)}
+.side a.nl.on{background:linear-gradient(90deg,#e8305f,#f0457a);color:#fff;box-shadow:0 6px 14px -6px #e8305f99}
+.side .out{border-top:1px solid var(--line)}
+.kbd{border-color:var(--line2)}
+.side a.nl.on .badge{background:#fff;color:#e8305f}
+button{background:var(--accent);border-color:var(--accent);color:#fff}
+button:hover{background:var(--accent2);border-color:var(--accent2);color:#fff}
+.themebtn{background:transparent;color:var(--sidetxt)}.themebtn:hover{background:var(--sideon);color:var(--ink)}
+.seg a.on,.tabs a.on,.chip.on{background:var(--accent);border-color:var(--accent);color:#fff}
+.chip:hover{border-color:var(--accent);color:var(--accent)}
+.badge{background:#e8305f;color:#fff}
+.topbar{background:var(--side);color:var(--ink);border-bottom:1px solid var(--line)}
+.topbar button{color:var(--ink);border-color:var(--line2)}
+body.bare{background:linear-gradient(135deg,#5b6cf0,#8a63f0)}
+th{text-transform:none;letter-spacing:0;font-size:12.5px}
+tr:hover td{background:var(--bg)}
+
+/* theme v3: glass (purple-pink gradient) for the whole admin site */
+:root:root:root:root{--bg:rgba(45,28,115,.9);--surface:rgba(255,255,255,.10);--ink:#fff;--muted:rgba(255,255,255,.72);--line:rgba(255,255,255,.18);--line2:rgba(255,255,255,.28);--field:rgba(255,255,255,.12);--accent:#fff;--accent2:#ece7ff;--accent-soft:rgba(255,255,255,.14);--link:#fff;--paid:#8ff0c8;--pend:#ffd08a;--fail:#ffb0b6;--errbg:rgba(240,80,90,.32);--grey:rgba(255,255,255,.16);--greyink:#fff;--side:rgba(30,16,85,.62);--sidetxt:rgba(255,255,255,.78);--sideon:rgba(255,255,255,.14);--hero:rgba(255,255,255,.12);--bar:rgba(255,255,255,.28);--shadow:none;color-scheme:dark}
+html{background:#1a1250}
+body,body.bare{background:linear-gradient(165deg,#5a2bc0 0%,#2a6fd6 26%,#1a1250 55%,#d9509a 100%) fixed;color:#fff}
+.card,.stat,.kpi,.todo a,.seg,.sub,.facts div,.tr-widget>button,.tr-widget .tr-body{background:rgba(255,255,255,.10);border:1px solid rgba(255,255,255,.22);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}
+.card,.stat.lead{border-radius:26px}.kpi,.stat{border-radius:22px}
+.side{background:var(--side);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);border-right:1px solid rgba(255,255,255,.18)}
+.topbar{background:rgba(30,16,85,.78);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border-bottom:1px solid rgba(255,255,255,.18)}
+.mark{background:linear-gradient(135deg,#f0457a,#8a63f0);color:#fff}
+.scroll table thead th,.scroll table tr:first-child th{background:rgba(58,36,140,.95);color:#fff}
+tr:hover td{background:rgba(255,255,255,.08)}
+th,td{border-bottom-color:rgba(255,255,255,.16)}
+input,textarea,select{background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.28);color:#fff;border-radius:14px}
+input:focus,textarea:focus,select:focus{border-color:#fff;box-shadow:0 0 0 3px rgba(255,255,255,.22)}
+input::placeholder,textarea::placeholder{color:rgba(255,255,255,.6)}
+option{color:#1b1a30;background:#fff}
+button{background:#fff;border-color:#fff;color:#2a1a6e;border-radius:99px}
+button:hover{background:#ece7ff;border-color:#ece7ff;color:#2a1a6e}
+.red{background:rgba(240,80,90,.85);border-color:transparent;color:#fff}.red:hover{background:#f0505a;color:#fff}
+.green{background:rgba(40,190,140,.85);border-color:transparent;color:#fff}.green:hover{background:#28be8c;color:#fff}
+.grey{background:rgba(255,255,255,.16);border-color:rgba(255,255,255,.28);color:#fff}.grey:hover{background:rgba(255,255,255,.26);color:#fff}
+.topbar button,.themebtn,.tools input.tf{background:transparent;color:#fff}
+.themebtn{display:none}
+.chip,.btnlink,.seg a{background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.25);color:#fff}
+.seg{border-radius:99px}.seg a{border-color:transparent;background:transparent}
+.chip:hover{border-color:#fff;color:#fff}
+.seg a.on,.tabs a.on,.chip.on{background:#fff;border-color:#fff;color:#2a1a6e}
+.btnlink:hover{background:rgba(255,255,255,.24);color:#fff}
+.badge{background:#fff;color:#c2306e}
+.side a.nl.on{background:linear-gradient(90deg,#e8305f,#f0457a);color:#fff}
+.msg{background:rgba(255,255,255,.14);border-color:rgba(255,255,255,.3)}
+.donut::after{background:#2a1a6e}
+#pal .box{background:rgba(40,24,110,.95)}#pal a{color:#fff}
+code{background:rgba(255,255,255,.16);color:#fff}
+a:hover{text-decoration:underline}
+@media(max-width:900px){.card{border-radius:22px}}
+</style></head><body class="{{ 'app' if session.get('ok') else 'bare' }}">
+{% macro ico(n) %}<svg viewBox="0 0 24 24" aria-hidden="true">{% if n=='home' %}<path d="M3 11l9-8 9 8"/><path d="M5 10v10h14V10"/>{% elif n=='box' %}<path d="M21 8l-9-5-9 5 9 5 9-5z"/><path d="M3 8v8l9 5 9-5V8"/><path d="M12 13v8"/>{% elif n=='list' %}<path d="M8 6h13M8 12h13M8 18h13"/><path d="M3 6h.01M3 12h.01M3 18h.01"/>{% elif n=='clock' %}<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>{% elif n=='card' %}<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18"/>{% elif n=='qr' %}<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3zM20 14v.01M20 20v.01M17 20h-3"/>{% elif n=='users' %}<circle cx="9" cy="8" r="4"/><path d="M2 21c0-4 3-7 7-7s7 3 7 7"/><path d="M17 4a4 4 0 010 8M22 21c0-3-2-5.5-5-6.5"/>{% elif n=='help' %}<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3.5"/><path d="M5.6 5.6l3.9 3.9M14.5 14.5l3.9 3.9M18.4 5.6l-3.9 3.9M9.5 14.5l-3.9 3.9"/>{% elif n=='tag' %}<path d="M3 12V3h9l9 9-9 9-9-9z"/><circle cx="7.5" cy="7.5" r="1.2"/>{% elif n=='key' %}<circle cx="8" cy="15" r="4"/><path d="M11 12l9-9M16 7l3 3"/>{% elif n=='shield' %}<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/>{% elif n=='sliders' %}<path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/>{% elif n=='out' %}<path d="M9 21H5V3h4"/><path d="M16 17l5-5-5-5M21 12H9"/>{% elif n=='link' %}<path d="M10 14a5 5 0 007 0l3-3a5 5 0 00-7-7l-1 1"/><path d="M14 10a5 5 0 00-7 0l-3 3a5 5 0 007 7l1-1"/>{% elif n=='menu' %}<path d="M4 6h16M4 12h16M4 18h16"/>{% endif %}</svg>{% endmacro %}
+{% macro nl(ep, label, icon, count=0, alt='') %}<a class="nl {{ 'on' if request.endpoint == ep or request.endpoint == alt }}" href="{{ url_for(ep) }}">{{ ico(icon) }}<span>{{ label }}</span>{% if count %}<span class="badge">{{ count }}</span>{% endif %}</a>{% endmacro %}
+{% if session.get('ok') %}
+<div class="topbar"><button type="button" onclick="document.body.classList.toggle('nav-open')" aria-label="Open menu">{{ ico('menu') }}</button><span class="mark">{{ shop[:1]|upper }}</span><span>{{ shop }}</span></div>
+<div class="scrim" onclick="document.body.classList.remove('nav-open')"></div>
+<aside class="side">
+<div class="brand"><span class="mark">{{ shop[:1]|upper }}</span><span>{{ shop }}</span></div>
+{{ nl('dashboard','Dashboard','home') }}
+<div class="grp">Sales</div>
+{{ nl('orders','Orders','list') }}
+{{ nl('manual','Pending orders','clock',pending_count) }}
+{{ nl('products','Products','box') }}
+{{ nl('folders_admin.home','Folders','box') }}
+{{ nl('catalog_admin.home','Supplier catalog','link') }}
+{{ nl('compare_admin.pick','Compare prices','sliders',0,'compare_admin.view') }}
+{{ nl('alerts_admin.home','Stock alerts','clock') }}
+{{ nl('profit_centre','Profit centre','card') }}
+<div class="grp">Payments</div>
+{{ nl('upipay','UPI payments','card',upi_pending) }}
+{{ nl('upi','UPI setup','qr') }}
+<div class="grp">Customers</div>
+{{ nl('users','Users','users') }}
+{{ nl('tickets','Support','help',open_tickets,'ticket') }}
+{{ nl('assistant_admin.home','AI Assistant','help') }}
+{{ nl('smart_admin.home','Smart Promo','sliders') }}
+{{ nl('netflix_admin.home','Netflix customers','users') }}
+{{ nl('otp_admin.home','Netflix OTP','key') }}
+{{ nl('userprices','User prices','tag') }}
+<div class="grp">Growth</div>
+{{ nl('growth_admin.home','Growth settings','sliders') }}
+{{ nl('growth_admin.promos','Promo codes','tag') }}
+{{ nl('growth_admin.deals','Flash deals','clock') }}
+{{ nl('growth_admin.bulk','Bulk prices','box') }}
+{{ nl('growth_admin.broadcast','Broadcast','link') }}
+{{ nl('growth_admin.reviews','Reviews','help') }}
+{{ nl('growth_admin.leaderboard','Leaderboard','users') }}
+<div class="grp">System</div>
+{% if is_main %}{{ nl('sellers_admin.sellers','Sellers','users',pending_sellers) }}{% else %}{{ nl('connect','Bot & payments','link') }}{% endif %}
+{{ nl('suppliers_admin.suppliers','Suppliers API','link') }}
+{% if is_main %}{{ nl('topup_admin.topup','Supplier top-up','key') }}{% endif %}
+{{ nl('reseller_admin.resellers','Resellers API','key') }}
+{{ nl('admins','Admins','shield') }}
+{{ nl('emojis','Premium emojis','tag') }}
+{{ nl('settings','Settings','sliders') }}
+<div class="out"><button type="button" class="themebtn" id="themebtn">{{ ico('sliders') }}<span>Switch theme</span></button><button type="button" class="themebtn" id="palbtn">{{ ico('list') }}<span>Quick jump</span><span class="kbd" style="margin-left:auto">Ctrl K</span></button>{{ nl('logout','Log out','out') }}</div>
+</aside>
+{% endif %}
+<div class="content"><main>
+{% with m = get_flashed_messages(with_categories=true) %}
+{% for cat, text in m %}<div class="msg {{ 'err' if cat == 'err' else '' }}">{{ text }}</div>{% endfor %}
+{% endwith %}
+{% if session.get('ok') and not is_main and tstatus == 'pending' %}<div class="msg err"><b>Waiting for approval.</b> The platform owner has to approve your shop before your bot goes live. You can already fill in <a href="{{ url_for('connect') }}">Bot &amp; payments</a>.</div>{% endif %}
+{% if session.get('ok') and not is_main and tstatus == 'active' and not bot_ready %}<div class="msg err"><b>Your bot is not connected yet.</b> Open <a href="{{ url_for('connect') }}">Bot &amp; payments</a> and add your bot token and Telegram ID.</div>{% endif %}
+{% if session.get('ok') and shop_closed %}<div class="msg err"><b>The shop is CLOSED.</b> Customers cannot use the bot.
+<form method="post" action="{{ url_for('shop_toggle') }}" style="margin:8px 0 0"><input type="hidden" name="state" value="open"><input type="hidden" name="back" value="{{ request.path }}"><button type="submit" class="green sm">Open the shop</button></form></div>{% endif %}
+{% block body %}{% endblock %}
+</main></div><div class="tr-widget" id="google_translate_element"><button type="button" id="trbtn" aria-expanded="false">🌐 Language</button><div class="tr-body"><div id="google_translate_inner"></div></div></div>
+<script>
+function googleTranslateElementInit(){new google.translate.TranslateElement({pageLanguage:'en',includedLanguages:'en,es',autoDisplay:false},'google_translate_inner');}
+</script><script src="https://translate.google.com/translate_a/element.js?cb=googleTranslateElementInit"></script>
+<div id="pal" role="dialog" aria-label="Quick jump"><div class="box"><input id="palin" placeholder="Jump to a page..." autocomplete="off"><div id="pallist"></div></div></div>
+<script>
+(function(){
+var d=document,$=function(q,r){return (r||d).querySelector(q)},$$=function(q,r){return Array.prototype.slice.call((r||d).querySelectorAll(q))};
+/* theme */
+var tb=$('#themebtn');if(tb)tb.addEventListener('click',function(){var cur=d.documentElement.getAttribute('data-theme');if(!cur)cur=matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light';var n=cur==='dark'?'light':'dark';d.documentElement.setAttribute('data-theme',n);try{localStorage.setItem('theme',n)}catch(e){}});
+/* translate widget toggle */
+var trb=$('#trbtn');if(trb)trb.addEventListener('click',function(){var w=$('#google_translate_element');w.classList.toggle('open');trb.setAttribute('aria-expanded',w.classList.contains('open'))});
+/* toasts */
+$$('.msg').forEach(function(m){if(m.classList.contains('err')||m.querySelector('form,a'))return;m.classList.add('toast');setTimeout(function(){m.classList.add('gone');setTimeout(function(){m.remove()},450)},5000)});
+/* copy on click */
+$$('code,.mono').forEach(function(el){el.classList.add('copyable');el.title='Click to copy';el.addEventListener('click',function(){var t=el.textContent.trim();if(navigator.clipboard)navigator.clipboard.writeText(t).then(function(){el.classList.add('copied');setTimeout(function(){el.classList.remove('copied')},700)})})});
+/* table tools: search, status chips, sort, row count */
+$$('.scroll > table').forEach(function(t){
+ var rows=$$('tr',t).filter(function(r){return !r.querySelector('th')&&r.children.length>1});
+ if(rows.length<6||t.hasAttribute('data-nofilter')||t.querySelector('input,textarea,select'))return;
+ var wrap=t.parentNode,tools=d.createElement('div');tools.className='tools';
+ var inp=d.createElement('input');inp.className='tf';inp.type='search';inp.placeholder='Filter rows (press / )';inp.setAttribute('aria-label','Filter rows');
+ var cnt=d.createElement('span');cnt.className='count';
+ tools.appendChild(inp);
+ var statuses={};rows.forEach(function(r){var c=r.querySelector('td.paid,td.pending,td.processing,td.failed,td.refunded');if(c){var k=c.className.split(' ')[0];r.setAttribute('data-st',k);statuses[k]=1}});
+ var active='';
+ var keys=Object.keys(statuses);
+ if(keys.length>1){var ch=d.createElement('span');ch.className='chips';['all'].concat(keys).forEach(function(k){var b=d.createElement('button');b.type='button';b.className='chip'+(k==='all'?' on':'');b.textContent=k==='all'?'All':k.charAt(0).toUpperCase()+k.slice(1);b.addEventListener('click',function(){active=k==='all'?'':k;$$('.chip',ch).forEach(function(x){x.classList.remove('on')});b.classList.add('on');apply()});ch.appendChild(b)});tools.appendChild(ch)}
+ tools.appendChild(cnt);wrap.parentNode.insertBefore(tools,wrap);
+ function apply(){var q=inp.value.toLowerCase().trim(),n=0;rows.forEach(function(r){var ok=(!q||r.textContent.toLowerCase().indexOf(q)>-1)&&(!active||r.getAttribute('data-st')===active);r.style.display=ok?'':'none';if(ok)n++});cnt.textContent=n+' of '+rows.length}
+ inp.addEventListener('input',apply);apply();
+ var ths=$$('th',t);ths.forEach(function(th,i){th.setAttribute('data-sort','');th.addEventListener('click',function(){var dir=th.getAttribute('data-dir')==='asc'?'desc':'asc';ths.forEach(function(x){x.removeAttribute('data-dir')});th.setAttribute('data-dir',dir);var body=rows[0].parentNode;rows.slice().sort(function(a,b){var x=(a.children[i]||{}).textContent||'',y=(b.children[i]||{}).textContent||'';var nx=parseFloat(x.replace(/[^0-9.-]/g,'')),ny=parseFloat(y.replace(/[^0-9.-]/g,''));var c=(!isNaN(nx)&&!isNaN(ny)&&/^[ @0-9.,-]*$/.test(x.trim().slice(0,1)+'0'))?nx-ny:x.localeCompare(y);return dir==='asc'?c:-c}).forEach(function(r){body.appendChild(r)})})});
+});
+/* quick jump palette */
+var pal=$('#pal'),pin=$('#palin'),pl=$('#pallist'),links=$$('.side a.nl').map(function(a){return {t:a.textContent.replace(/[0-9]+$/,'').trim(),h:a.href}});
+function draw(){var q=pin.value.toLowerCase();pl.innerHTML='';links.filter(function(l){return l.t.toLowerCase().indexOf(q)>-1}).forEach(function(l,i){var a=d.createElement('a');a.href=l.h;a.textContent=l.t;if(i===0)a.className='sel';pl.appendChild(a)})}
+function openPal(){if(!pal)return;pal.classList.add('open');pin.value='';draw();pin.focus()}
+function closePal(){pal.classList.remove('open')}
+if(pal){pin.addEventListener('input',draw);pin.addEventListener('keydown',function(e){if(e.key==='Enter'){var a=$('a',pl);if(a)location.href=a.href}});pal.addEventListener('click',function(e){if(e.target===pal)closePal()});var pb=$('#palbtn');if(pb)pb.addEventListener('click',function(){d.body.classList.remove('nav-open');openPal()})}
+d.addEventListener('keydown',function(e){
+ if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='k'){e.preventDefault();openPal();return}
+ if(e.key==='Escape'&&pal)closePal();
+ var tag=(e.target.tagName||'').toLowerCase();
+ if(e.key==='/'&&tag!=='input'&&tag!=='textarea'&&tag!=='select'){var f=$('input.tf');if(f){e.preventDefault();f.focus()}}
+});
+})();
+</script>
+</body></html>""",
+    "login.html": """{% extends 'base.html' %}{% block body %}
+<div class="card login">
+<div class="mark">{{ shop[:1]|upper }}</div>
+<h2>{{ shop }}</h2>
+<p class="muted">Sign in to manage your store.</p>
+<form method="post">
+<label for="em">E-mail <span class="muted">(sellers; leave empty if you are the platform owner)</span></label>
+<input id="em" type="email" name="email" placeholder="you@example.com" autofocus>
+<label for="pw">Password</label>
+<input id="pw" type="password" name="password" placeholder="Password" required>
+<button type="submit">Sign in</button>
+</form>
+{% if signup != 'closed' %}<p class="muted" style="margin:14px 0 0"><a href="{{ url_for('register_seller') }}">Want your own shop? Create a seller account</a></p>{% endif %}</div>{% endblock %}""",
+    "dashboard.html": """{% extends 'base.html' %}{% block body %}
+<style>
+.gl{--g:rgba(255,255,255,.10);--gb:rgba(255,255,255,.22);color:#fff;margin-bottom:84px}
+.gl a{color:#fff}.gl .m{opacity:.78}
+.gl .gc{background:var(--g);border:1px solid var(--gb);border-radius:26px;padding:16px 18px;margin-bottom:12px}
+.gl h2{color:#fff;font-size:24px;margin:0 0 12px}.gl h3{color:#fff;font-size:16px;margin:0 0 8px}
+.gl .chips2{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px}
+.gl .chips2 a{padding:7px 14px;border-radius:99px;font-size:13px;font-weight:650;background:var(--g);border:1px solid var(--gb);text-decoration:none;min-height:36px;display:inline-flex;align-items:center}
+.gl .chips2 a.on{background:#fff;color:#2a1a6e}
+.gl form.df{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.gl form.df input{width:auto;flex:1;min-width:130px;margin:0;background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.28);color:#fff;color-scheme:dark;border-radius:14px}
+.gl form.df button{background:#fff;color:#2a1a6e;border:0;border-radius:99px;padding:0 20px;font-weight:700;min-height:40px;width:auto;margin:0}
+.gl .hero b{display:block;font-size:38px;font-weight:800;letter-spacing:-.02em;line-height:1.15;font-variant-numeric:tabular-nums}
+.gl .hero svg{width:100%;height:70px;display:block;margin-top:8px}
+.gl .tiles{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-bottom:12px}
+.gl .tiles .gc{margin:0;padding:14px 16px;border-radius:22px}
+.gl .tiles small{display:block;opacity:.8;font-size:13px}.gl .tiles b{font-size:24px;font-weight:800;font-variant-numeric:tabular-nums}
+.gl .tiles em{display:block;font-style:normal;font-size:12px;opacity:.7}
+.gl .row{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 0;border-top:1px solid rgba(255,255,255,.18)}
+.gl .row:first-of-type{border-top:0}.gl .row small{display:block;opacity:.7;font-size:12px}
+.gl .pill{border-radius:99px;padding:3px 13px;font-size:12px;font-weight:650;white-space:nowrap}
+.gl .p-paid{background:rgba(60,200,150,.35);color:#d9fff0}.gl .p-pend{background:rgba(255,170,80,.42);color:#fff0dc}.gl .p-fail{background:rgba(240,80,90,.45);color:#ffe3e5}
+.gl .g2c{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.gl .bar{height:9px;border-radius:9px;background:rgba(255,255,255,.18);margin-top:5px;overflow:hidden}.gl .bar i{display:block;height:100%;background:#fff;border-radius:9px}
+.gl .cb{display:flex;align-items:flex-end;gap:3px;height:110px;margin-top:8px}.gl .cb div{flex:1;height:100%;display:flex;align-items:flex-end}.gl .cb i{display:block;width:100%;min-height:3px;border-radius:4px 4px 0 0;background:rgba(255,255,255,.85)}
+.gl .todo2{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+.gl .todo2 a{padding:8px 14px;border-radius:99px;background:var(--g);border:1px solid var(--gb);font-weight:650;font-size:13px;text-decoration:none}.gl .todo2 a b{background:#fff;color:#c2361f;border-radius:99px;padding:1px 8px;margin-right:6px}
+.gl .note{background:rgba(255,170,80,.25);border:1px solid rgba(255,200,120,.5);border-radius:18px;padding:10px 14px;margin-bottom:12px;font-size:13px}
+.gl .xl2{display:flex;justify-content:space-between;font-size:11px;opacity:.7;margin-top:4px}
+.gnav{display:none}
+@media(max-width:900px){.gl .g2c{grid-template-columns:1fr}
+.gnav{display:flex;position:fixed;left:12px;right:12px;bottom:calc(10px + env(safe-area-inset-bottom,0px));z-index:30;justify-content:space-around;background:rgba(40,24,100,.88);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border:1px solid rgba(255,255,255,.25);border-radius:26px;padding:8px 4px}
+.gnav a,.gnav button{background:none;border:0;color:#fff;font:inherit;font-size:12px;text-align:center;text-decoration:none;opacity:.8;min-height:44px;width:auto;margin:0;padding:2px 10px}.gnav .on{opacity:1;font-weight:700}
+.gnav svg{width:22px;height:22px;display:block;margin:0 auto 2px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}}
+</style>
+<div class="gl">
+<h2>Dashboard</h2>
+<div class="chips2">{% for k, lbl in ranges %}<a href="{{ url_for('dashboard', range=k) }}" class="{{ 'on' if k == rng }}">{{ lbl }}</a>{% endfor %}</div>
+<div class="gc"><form method="get" action="{{ url_for('dashboard') }}" class="df">
+<input type="date" name="from" value="{{ dfrom }}" max="{{ d.today }}" aria-label="From date"><span class="m">to</span>
+<input type="date" name="to" value="{{ dto }}" max="{{ d.today }}" aria-label="To date"><button>Show</button></form></div>
+{% set low_n = d.low|length %}
+<div class="todo2">
+{% if pending_count %}<a href="{{ url_for('manual') }}"><b>{{ pending_count }}</b>Orders to deliver</a>{% endif %}
+{% if upi_pending %}<a href="{{ url_for('upipay') }}"><b>{{ upi_pending }}</b>UPI payments to check</a>{% endif %}
+{% if open_tickets %}<a href="{{ url_for('tickets') }}"><b>{{ open_tickets }}</b>Open support tickets</a>{% endif %}
+{% if low_n %}<a href="{{ url_for('products') }}"><b>{{ low_n }}</b>Products low on stock</a>{% endif %}
+</div>
+{% if d.nocost %}<div class="note">{{ d.nocost }} sale{{ '' if d.nocost == 1 else 's' }} in this period {{ 'has' if d.nocost == 1 else 'have' }} no cost price, so profit looks too high. <a href="{{ url_for('products') }}"><u>Set the cost price</u></a></div>{% endif %}
+<div class="gc hero"><span class="m" style="font-size:13px">Profit (USDT) &middot; {{ d.period }}</span>
+<b>${{ '%.2f'|format(d.profit) }}</b><span class="m" style="font-size:13px">{{ '%.1f'|format(d.margin) }}% margin</span>
+<svg viewBox="0 0 600 190" preserveAspectRatio="none" aria-hidden="true"><path d="{{ d.rev_line }}" fill="none" stroke="rgba(255,255,255,.45)" stroke-width="2" vector-effect="non-scaling-stroke" stroke-linejoin="round"/><path d="{{ d.prof_line }}" fill="none" stroke="#fff" stroke-width="3.5" stroke-linecap="round" vector-effect="non-scaling-stroke" stroke-linejoin="round"/></svg>
+<div class="xl2"><span>{{ d.days[0].label }}</span><span>{{ d.days[-1].label }}</span></div></div>
+<div class="tiles">
+<div class="gc"><small>Revenue</small><b>${{ '%.2f'|format(d.rev) }}</b><em>Cost ${{ '%.2f'|format(d.cost) }}</em></div>
+<div class="gc"><small>Orders</small><b>{{ d.n }}</b><em>{{ d.units }} items</em></div>
+<div class="gc"><small>New users</small><b>{{ d.new_users }}</b><em>{{ d.users }} total</em></div>
+<div class="gc"><small>Pending</small><b>{{ d.pending + d.processing }}</b><em>{{ d.failed }} failed</em></div>
+</div>
+<div class="gc"><h3>Recent orders</h3>
+{% for o in rows %}<div class="row"><div>{{ o.product or o.product_id }}<small>#{{ o.id }} &middot; {{ ('@' ~ o.username) if o.username else o.user_id }} &middot; {{ o.quantity }} &times; &middot; {{ '%.2f'|format(o.amount) }}</small></div>
+<span class="pill {{ 'p-paid' if o.status == 'paid' else ('p-fail' if o.status == 'failed' else 'p-pend') }}">{{ o.status|capitalize }}</span></div>
+{% else %}<div class="m" style="padding-top:6px">No orders in this period.</div>{% endfor %}
+<p style="margin:10px 0 0"><a href="{{ url_for('orders') }}"><u>See all orders</u></a></p></div>
+<div class="g2c">
+<div class="gc"><h3>Best sellers</h3>
+{% for t in d.top %}<div class="row"><div>{{ t.name }}<small>{{ t.units }} sold &middot; ${{ '%.2f'|format(t.rev) }}</small></div><b>{{ '%.2f'|format(t.profit) }}</b></div>
+{% else %}<div class="m">No sales in this period.</div>{% endfor %}</div>
+<div class="gc"><h3>Products bought</h3>
+{% for x in d.prod %}<div style="margin-top:8px"><div style="display:flex;justify-content:space-between;font-size:13.5px;gap:8px"><span>{{ x.name }}</span><span>{{ x.units }}</span></div><div class="bar"><i style="width:{{ (x.units / d.prod_max * 100)|round(1) }}%"></i></div></div>
+{% else %}<div class="m">No sales in this period.</div>{% endfor %}</div>
+</div>
+<div class="g2c">
+<div class="gc"><h3>New customers per day</h3><span class="m" style="font-size:13px">{{ d.cust_total }} joined</span>
+<div class="cb">{% for x in d.cust_days %}<div title="{{ x.label }}: {{ x.n }}"><i style="height:{{ x.h }}%"></i></div>{% endfor %}</div>
+<div class="xl2"><span>{{ d.cust_days[0].label }}</span><span>{{ d.cust_days[-1].label }}</span></div></div>
+<div class="gc"><h3>Running low on stock</h3>
+{% for p in d.low %}<div class="row"><span>{{ p.name }}</span><span class="pill {{ 'p-fail' if p.stock == 0 else 'p-pend' }}">{{ 'Out' if p.stock == 0 else (p.stock ~ ' left') }}</span></div>
+{% else %}<div class="m">All products have enough stock.</div>{% endfor %}
+<p style="margin:10px 0 0"><a href="{{ url_for('products') }}"><u>Add stock</u></a></p></div>
+</div>
+<div class="m" style="font-size:12.5px;display:flex;gap:16px;flex-wrap:wrap;padding:2px 6px">
+<span>Bot sales ${{ '%.2f'|format(d.bot.rev) }}</span><span>Reseller API ${{ '%.2f'|format(d.api.rev) }}</span><span>Deposits ${{ '%.2f'|format(d.dep_amt) }}</span></div>
+</div>
+<nav class="gnav" aria-label="Quick menu">
+<a href="{{ url_for('dashboard') }}" class="on"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 11l9-8 9 8"/><path d="M5 10v10h14V10"/></svg>Home</a>
+<a href="{{ url_for('orders') }}"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h13M8 12h13M8 18h13"/><path d="M3 6h.01M3 12h.01M3 18h.01"/></svg>Orders</a>
+<a href="{{ url_for('products') }}"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 8l-9-5-9 5 9 5 9-5z"/><path d="M3 8v8l9 5 9-5V8"/><path d="M12 13v8"/></svg>Products</a>
+<button type="button" onclick="document.body.classList.toggle('nav-open')"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 6h.01M12 6h.01M19 6h.01M5 12h.01M12 12h.01M19 12h.01M5 18h.01M12 18h.01M19 18h.01"/></svg>More</button>
+</nav>{% endblock %}""",
+    "profit.html": """{% extends 'base.html' %}{% block body %}
+<div class="page-head"><h2>Profit centre</h2><a class="btnlink" href="{{ url_for('profit_export', range=rng, product=pid, **{'from': dfrom, 'to': dto}) }}">Download CSV</a></div>
+<div class="card"><form method="get" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+<input type="date" name="from" value="{{ dfrom }}" style="width:auto;margin:0" aria-label="From date"><span class="muted">to</span>
+<input type="date" name="to" value="{{ dto }}" style="width:auto;margin:0" aria-label="To date"><button class="chip on" style="min-height:40px">Show dates</button>
+{% for k, label in ranges %}<a href="{{ url_for('profit_centre', range=k, product=pid) }}" class="chip {{ 'on' if k == rng }}" style="text-decoration:none;display:inline-flex;align-items:center">{{ label }}</a>{% endfor %}
+<select name="product" onchange="this.form.submit()"><option value="">All products</option>{% for p in prods %}<option value="{{ p.id }}" {{ 'selected' if p.id == pid }}>{{ p.name }}</option>{% endfor %}</select>
+{% if rng != 'custom' %}<input type="hidden" name="range" value="{{ rng }}">{% endif %}</form>
+<p style="margin:8px 0 0">Showing: <b>{{ period }}</b></p>
+<p class="muted" style="margin:8px 0 0">Each sale keeps the cost it was sold at. Changing a price or cost later does <b>not</b> change old profit.</p></div>
+{% if d.nocost %}<div class="msg">{{ d.nocost }} sale{{ '' if d.nocost == 1 else 's' }} in this view {{ 'has' if d.nocost == 1 else 'have' }} no cost, so profit looks too high.
+<form method="post" action="{{ url_for('profit_fill') }}" style="display:inline"><button class="chip">Fill with current cost</button></form></div>{% endif %}
+<div class="card"><div class="kpis">
+<div class="kpi"><div><small>Revenue (USDT)</small><b>{{ '%.2f'|format(d.rev) }}</b><em>{{ d.n }} orders, {{ d.units }} items</em></div></div>
+<div class="kpi"><div><small>Cost paid</small><b>{{ '%.2f'|format(d.cost) }}</b></div></div>
+<div class="kpi"><div><small>Profit</small><b class="{{ 'paid' if d.profit >= 0 else 'failed' }}">{{ '%.2f'|format(d.profit) }}</b><em>{{ '%.1f'|format(d.margin) }}% margin, {{ '%.3f'|format(d.per_item) }} per item</em></div></div>
+</div></div>
+<div class="card"><h3 style="margin-top:0">By product</h3><div class="scroll"><table>
+<tr><th>Product</th><th>Sold</th><th>Revenue</th><th>Cost</th><th>Profit</th></tr>
+{% for r in d.by_product %}<tr><td>{{ r.name }}</td><td>{{ r.units }}</td><td>{{ '%.2f'|format(r.rev) }}</td><td>{{ '%.2f'|format(r.cost) }}</td><td><span class="{{ 'paid' if r.profit >= 0 else 'failed' }}">{{ '%.2f'|format(r.profit) }}</span></td></tr>
+{% else %}<tr><td colspan="5" class="empty">No paid sales in this period.</td></tr>{% endfor %}
+</table></div></div>
+<div class="card"><h3 style="margin-top:0">Every sale</h3><div class="scroll"><table>
+<tr><th>Date</th><th>Product</th><th>Qty</th><th>Price each</th><th>Cost each</th><th>Profit</th></tr>
+{% for r in d.ledger %}<tr><td>{{ (r.ts or '')[:16].replace('T',' ') }}{% if r.src == 'api' %} <small class="muted">API</small>{% endif %}</td><td>{{ r.name }}</td><td>{{ r.q }}</td>
+<td>{{ '%.3f'|format(r.unit_price or 0) }}</td><td>{{ '%.3f'|format(r.uc) if r.uc is not none else '-' }}</td>
+<td><span class="{{ 'paid' if r.profit >= 0 else 'failed' }}">{{ '%.2f'|format(r.profit) }}</span></td></tr>
+{% else %}<tr><td colspan="6" class="empty">No sales yet.</td></tr>{% endfor %}
+</table></div></div>
+<div class="card"><h3 style="margin-top:0">Price &amp; cost changes</h3><div class="scroll"><table>
+<tr><th>When (UTC)</th><th>Product</th><th>What</th><th>Old</th><th>New</th></tr>
+{% for r in d.changes %}<tr><td>{{ (r.ts or '')[:16] }}</td><td>{{ r.name }}</td><td>{{ r.field }}</td><td>{{ '%.3f'|format(r.old_value) if r.old_value is not none else '-' }}</td><td>{{ '%.3f'|format(r.new_value) if r.new_value is not none else '-' }}</td></tr>
+{% else %}<tr><td colspan="5" class="empty">Changes are recorded from now on.</td></tr>{% endfor %}
+</table></div></div>{% endblock %}""",
+    "orders.html": """{% extends 'base.html' %}{% block body %}
+<div class="page-head"><h2>Orders</h2><a class="btnlink" href="{{ url_for('orders_export') }}">Download CSV</a></div>
+<div class="card">{% include 'orders_table.html' %}</div>{% endblock %}""",
+    "orders_table.html": """<div class="scroll"><table>
+<tr><th>Order</th><th>User</th><th>Product</th><th>Qty</th><th>Amount</th><th>Status</th><th>Created</th></tr>
+{% for o in rows %}<tr>
+<td>{{ o.id }}</td>
+<td>{{ ('@' ~ o.username) if o.username else o.user_id }}</td>
+<td>{{ o.product or o.product_id }}</td>
+<td>{{ o.quantity }}</td>
+<td>{{ '%.2f'|format(o.amount) }}</td>
+<td class="{{ o.status }}">{{ o.status }}{% if o.failure_reason %} ({{ o.failure_reason }}){% endif %}</td>
+<td>{{ (o.created_at or '')[:16].replace('T',' ') }}</td>
+</tr>{% else %}<tr><td colspan="7" class="empty">No orders yet. They appear here as soon as a customer buys.</td></tr>{% endfor %}
+</table></div>""",
+    "admins.html": """{% extends 'base.html' %}{% block body %}
+<h2>Bot admins</h2>
+<div class="card"><div class="scroll"><table>
+<tr><th>Telegram ID</th><th>Added</th><th></th></tr>
+{% for a in rows %}<tr><td>{{ a.user_id }}</td>
+<td>{{ (a.added_at or '')[:16].replace('T',' ') }}</td>
+<td><form method="post" action="{{ url_for('remove_admin', uid=a.user_id) }}" onsubmit="return confirm('Remove this admin?')">
+<button type="submit" class="red sm">Remove</button></form></td></tr>
+{% else %}<tr><td colspan="3">No extra admins. (The owner always has access.)</td></tr>{% endfor %}
+</table></div></div>
+<div class="card"><h3>Add admin</h3>
+<form method="post" action="{{ url_for('add_admin') }}">
+<input name="uid" type="number" placeholder="Telegram numeric ID" required>
+<button type="submit">Add admin</button></form></div>{% endblock %}""",
+    "userprices.html": """{% extends 'base.html' %}{% block body %}
+<h2>User-specific prices</h2>
+<div class="card"><div class="scroll"><table>
+<tr><th>Username</th><th>Product</th><th>Price</th><th></th></tr>
+{% for r in rows %}<tr><td>@{{ r.username }}</td><td>{{ r.product or r.product_id }}</td>
+<td>{{ '%.2f'|format(r.price) }}</td>
+<td><form method="post" action="{{ url_for('delete_user_price') }}">
+<input type="hidden" name="username" value="{{ r.username }}">
+<input type="hidden" name="pid" value="{{ r.product_id }}">
+<button type="submit" class="red sm">Delete</button></form></td></tr>
+{% else %}<tr><td colspan="4">No user-specific prices set.</td></tr>{% endfor %}
+</table></div></div>
+<div class="card"><h3>Set user price</h3>
+<form method="post" action="{{ url_for('set_user_price') }}">
+<input name="username" placeholder="Telegram username (without @)" required>
+<select name="pid" required>
+{% for p in products %}<option value="{{ p.id }}">{{ p.id }} - {{ p.name }} (default {{ p.price }})</option>{% endfor %}
+</select>
+<input name="price" type="number" step="0.01" min="0" placeholder="Price (USDT)" required>
+<button type="submit">Save</button></form></div>{% endblock %}""",
+    "products.html": """{% extends 'base.html' %}{% block body %}
+<style>
+[hidden]{display:none!important}
+.pbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
+.pbar input{margin:0;flex:1;min-width:160px}
+.sumline{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+.sumline span{background:var(--surface);border:1px solid var(--line);border-radius:99px;padding:5px 12px;font-size:13px;font-weight:700;color:var(--muted)}
+.sumline span.w{color:var(--pend);border-color:var(--pend)}
+.sumline span.b{color:var(--fail);border-color:var(--fail)}
+.prod{background:var(--surface);border:1px solid var(--line);border-radius:14px;margin-bottom:10px;box-shadow:var(--shadow)}
+.prod>summary{list-style:none;cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:12px;padding:14px 16px;flex-wrap:wrap}
+.prod>summary::-webkit-details-marker{display:none}
+.prod[open]>summary{border-bottom:1px solid var(--line)}
+.pn{min-width:0;flex:1 1 200px}
+.pn b{display:block;font-size:15.5px;overflow-wrap:anywhere}
+.pn small{color:var(--muted);font-size:12.5px}
+.pm{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.pill{border-radius:99px;padding:3px 10px;font-size:12.5px;font-weight:700;background:var(--grey);color:var(--greyink)}
+.pill.ok{background:var(--accent-soft);color:var(--paid)}
+.pill.low{background:#f0b84a33;color:var(--pend)}
+.pill.out{background:var(--errbg);color:var(--fail)}
+.pr{font-weight:800;font-variant-numeric:tabular-nums}
+.pf{font-weight:800;font-size:13px;border-radius:8px;padding:3px 9px}
+.pf.good{background:var(--accent-soft);color:var(--paid)}
+.pf.bad{background:var(--errbg);color:var(--fail)}
+.pf.warn{background:#f0b84a33;color:var(--pend)}
+.pbody{padding:6px 16px 16px}
+.sec{margin-top:16px;padding-top:14px;border-top:1px dashed var(--line2)}
+.sec:first-child{margin-top:8px;padding-top:0;border-top:0}
+.sec h4{margin:0 0 4px;font-size:14px;font-weight:800}
+.profit{margin:10px 0 4px;padding:10px 12px;border-radius:10px;background:var(--grey);color:var(--greyink);font-weight:800;font-size:14px}
+.profit.good{background:var(--accent-soft);color:var(--paid)}
+.profit.bad{background:var(--errbg);color:var(--fail)}
+.chips{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:6px 0 2px}
+.chips small{color:var(--muted);font-weight:600;font-size:12.5px}
+.chip{width:auto;margin:0;padding:5px 11px;font-size:13px;border-radius:99px;background:var(--grey);border-color:var(--grey);color:var(--greyink)}
+.chip:hover{background:var(--line2);border-color:var(--line2)}
+.seg2{display:flex;gap:8px;margin:6px 0}
+.seg2 label{flex:1;margin:0;display:flex;align-items:center;gap:8px;padding:10px 12px;border:1px solid var(--line2);border-radius:10px;cursor:pointer;color:var(--ink);font-size:14px}
+.seg2 input{width:auto;margin:0}
+.sub{margin-top:12px;border:1px solid var(--line);border-radius:10px;background:var(--bg)}
+.sub>summary{cursor:pointer;padding:10px 12px;font-weight:700;font-size:13.5px;color:var(--muted)}
+.sub>div{padding:0 12px 12px}
+.srow{display:flex;gap:8px;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);padding:6px 0}
+.srow .mono{font-size:12.5px;min-width:0;flex:1}
+.srow form{margin:0}
+.srow button{margin:0}
+.note{background:#f0b84a22;border:1px solid #f0b84a77;border-radius:10px;padding:10px 12px;margin-bottom:14px;font-size:14px}
+</style>
+{% set ns = namespace(out=0, nc=0) %}
+{% for p in products %}{% set u0 = p.cost if p.cost is not none else p.api_cost %}{% if u0 is not number %}{% set ns.nc = ns.nc + 1 %}{% endif %}{% if p.kind != 'manual' and p.stock == 0 %}{% set ns.out = ns.out + 1 %}{% endif %}{% endfor %}
+{% set cats = products|map(attribute='category')|select|unique|list %}
+<datalist id="cats">{% for c in cats %}<option value="{{ c }}">{% endfor %}</datalist>
+
+<div class="page-head"><h2>Products</h2>
+<div style="display:flex;gap:8px;flex-wrap:wrap"><button class="sm" type="button" onclick="var b=document.getElementById('addbox');b.hidden=!b.hidden;if(!b.hidden){b.scrollIntoView({behavior:'smooth'});}">+ Add product</button>
+{% if suppliers_cat %}<button class="sm green" type="button" onclick="location='{{ url_for('catalog_admin.home') }}'">Supplier catalog</button>{% endif %}</div></div>
+
+<div class="sumline"><span>{{ products|length }} products</span>
+{% if ns.out %}<span class="b">{{ ns.out }} out of stock</span>{% endif %}
+{% if ns.nc %}<span class="w">{{ ns.nc }} without cost</span>{% endif %}</div>
+
+{% if ns.nc %}<div class="note"><b>{{ ns.nc }} product{{ '' if ns.nc == 1 else 's' }} without a cost price.</b> Their sales are counted as 100% profit on the dashboard. Open the product marked <b>Set cost</b> and enter what you paid.</div>{% endif %}
+
+<div class="card" id="addbox" {% if products %}hidden{% endif %}>
+<h3>Add new product</h3>
+<form method="post" action="{{ url_for('create_product') }}" enctype="multipart/form-data" data-pf oninput="calc(this)">
+<label>Product name</label>
+<input name="name" placeholder="e.g. Netflix 1 month" required>
+<div class="two">
+<div><label>Cost - what you paid (USDT)</label><input name="cost" type="number" step="0.01" min="0" inputmode="decimal" placeholder="0.90" required></div>
+<div><label>Selling price (USDT)</label><input name="price" type="number" step="0.01" min="0" inputmode="decimal" placeholder="1.10" required></div>
+</div>
+<div class="chips"><small>Profit:</small>{% for x in ['0.10','0.20','0.50','1.00'] %}<button type="button" class="chip" data-add="{{ x }}" onclick="chip(this)">+{{ x }}</button>{% endfor %}</div>
+<div class="profit">Profit per item: enter cost and price</div>
+<label>Type</label>
+<div class="seg2">
+<label><input type="radio" name="kind" value="auto" checked onchange="document.getElementById('newstock').hidden=false"> Auto delivery</label>
+<label><input type="radio" name="kind" value="manual" onchange="document.getElementById('newstock').hidden=true"> Made to order</label>
+</div>
+<div id="newstock"><label>Stock - one item per line (login / key / link) <span class="hint">optional now, you can add later</span></label>
+<textarea name="links" rows="5" placeholder="email:password&#10;email:password"></textarea>
+<label>Or upload a .txt file <span class="hint">one item per line</span></label>
+<input type="file" name="stockfile" accept=".txt,text/plain" multiple></div>
+<label>Category <span class="hint">optional, same category = one button group in the bot</span></label>
+<input name="category" list="cats" placeholder="e.g. Streaming">
+<button type="submit">Add product</button>
+</form></div>
+
+{% if products %}<details class="card" style="margin-bottom:14px"><summary style="cursor:pointer;font-weight:800">How customers see your products in the bot</summary>
+<style>.pv{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;margin-top:12px;max-width:520px}
+.pv span{background:var(--grey);color:var(--greyink);border-radius:9px;padding:9px 8px;font-size:13px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pv span.x{background:var(--errbg);color:var(--fail)}</style>
+<div class="pv">{% for p in products|sort(attribute='name', case_sensitive=false) %}<span class="{{ 'x' if p['kind'] != 'manual' and p['stock'] <= 0 }}" title="{{ p['name'] }}">{{ p['name'] }}</span>{% endfor %}</div>
+<p class="muted" style="margin:10px 0 0">A to Z, 3 per row. Red = out of stock. Names that are too long get cut in the bot, so keep them short.</p></details>{% endif %}
+
+{% if products|length > 6 %}<div class="pbar"><input type="search" placeholder="Search products..." oninput="filt(this.value)"></div>{% endif %}
+
+{% for p in products %}
+{% set u = p.cost if p.cost is not none else p.api_cost %}
+{% set its = items.get(p.id, []) %}
+<details class="prod" id="p{{ p.id }}" data-name="{{ (p.name ~ ' ' ~ (p.category or ''))|lower }}" {% if open_id == p.id %}open{% endif %}>
+<summary>
+<div class="pn"><b>{{ p.name }}</b><small>{{ p.category or 'No category' }} · {{ 'Made to order' if p.kind == 'manual' else 'Auto delivery' }}</small></div>
+<div class="pm">
+{% if p.kind != 'manual' %}<span class="pill {{ 'out' if p.stock == 0 else ('low' if p.stock <= 3 else 'ok') }}">{{ 'Out of stock' if p.stock == 0 else (p.stock ~ ' in stock') }}</span>{% endif %}
+<span class="pr">${{ '%.2f'|format(p.price) }}</span>
+{% if u is number %}<span class="pf {{ 'good' if p.price - u > 0 else 'bad' }}">{{ '+' if p.price - u >= 0 else '-' }}${{ '%.2f'|format((p.price - u)|abs) }}</span>{% else %}<span class="pf warn">Set cost</span>{% endif %}
+</div>
+</summary>
+<div class="pbody">
+
+<div class="sec">
+<h4>Price and cost</h4>
+<form method="post" action="{{ url_for('quick_product', pid=p.id) }}" data-pf oninput="calc(this)">
+<div class="two">
+<div><label>Cost - what you paid (USDT)</label><input name="cost" type="number" step="0.01" min="0" inputmode="decimal" value="{{ p.cost if p.cost is not none else '' }}" placeholder="{{ ('%.2f' % p.api_cost) if p.api_key else '0.90' }}" {{ '' if p.api_key else 'required' }}></div>
+<div><label>Selling price (USDT)</label><input name="price" type="number" step="0.01" min="0" inputmode="decimal" value="{{ p.price }}" required></div>
+</div>
+<div class="chips"><small>Profit:</small>{% for x in ['0.10','0.20','0.50','1.00'] %}<button type="button" class="chip" data-add="{{ x }}" onclick="chip(this)">+{{ x }}</button>{% endfor %}</div>
+<div class="profit">Profit per item</div>
+<button type="submit">Save price</button>
+</form>
+</div>
+
+{% if p.kind != 'manual' %}
+<div class="sec">
+<h4>Add stock</h4>
+<form method="post" action="{{ url_for('stock_add', pid=p.id) }}" enctype="multipart/form-data">
+<textarea name="links" rows="4" placeholder="One item per line (login / key / link)"></textarea>
+<label>Or upload a .txt file <span class="hint">one item per line</span></label>
+<input type="file" name="stockfile" accept=".txt,text/plain" multiple>
+<button type="submit">Add stock</button>
+</form>
+{% if its %}
+<details class="sub"><summary>View or remove stock ({{ p.stock if not p.api_key else (p.stock - p.api_stock) }} own items)</summary><div>
+{% for it in its %}<div class="srow" style="display:block;margin:10px 0;padding:10px;border:1px solid var(--line);border-radius:10px">
+<form method="post" action="{{ url_for('stock_edit', pid=p.id, sid=it.id) }}">
+<textarea name="link" rows="2" required style="width:100%;box-sizing:border-box">{{ it.link }}</textarea>
+<div style="display:flex;gap:8px;margin-top:6px"><button class="sm" type="submit">Save item</button>
+</form><form method="post" action="{{ url_for('stock_delete', pid=p.id, sid=it.id) }}" onsubmit="return confirm('Remove this unsold item?')"><button class="red sm" type="submit">Remove</button></form></div></div>{% endfor %}
+<form method="post" action="{{ url_for('stock_clear', pid=p.id) }}" onsubmit="return confirm('Remove ALL unsold stock of this product? Sold items stay in order history.')" style="margin-top:12px">
+<button class="red" type="submit">Remove all unsold stock</button></form>
+</div></details>
+{% endif %}
+</div>
+{% endif %}
+
+<details class="sub"><summary>More settings (name, category, description, delivery...)</summary><div>
+<form method="post" action="{{ url_for('edit_product', pid=p.id) }}">
+<input type="hidden" name="price" value="{{ p.price }}"><input type="hidden" name="cost" value="{{ p.cost if p.cost is not none else '' }}">
+<label>Name</label><input name="name" value="{{ p.name }}" required>
+<label>Old price <span class="hint">optional, shows a % discount in the bot</span></label>
+<input name="old_price" type="number" step="0.01" min="0" value="{{ p.old_price or '' }}">
+<label>Category <span class="hint">same category = grouped under one button, empty = listed directly</span></label>
+<input name="category" list="cats" value="{{ p.category or '' }}">
+<label>Type</label>
+<select name="kind">
+<option value="auto" {{ 'selected' if p.kind != 'manual' }}>Automatic delivery (from stock)</option>
+<option value="manual" {{ 'selected' if p.kind == 'manual' }}>Made to order (customer sends an email, you deliver by hand)</option>
+</select>
+<label>Delivery time <span class="hint">empty = Instant</span></label>
+<input name="delivery" value="{{ p.delivery or '' }}">
+<label>Warranty <span class="hint">made-to-order only, e.g. 30 days. Automatic products: write it in the description</span></label>
+<input name="warranty" value="{{ p.warranty or '' }}">
+<label>Question asked before buying <span class="hint">made-to-order only</span></label>
+<input name="prompt" value="{{ p.prompt or '' }}" placeholder="Send an email that you haven't linked to Spotify before.">
+<label>Description <span class="hint">one point per line, write the warranty here</span></label>
+<textarea name="description" rows="4">{{ p.description or '' }}</textarea>
+<button type="submit">Save changes</button>
+</form>
+{% set src = sources.get(p.id) %}
+<div style="margin-top:14px">
+<label>Suppliers (API) {% if p.api_key %}<span class="muted">· active cost ${{ '%.2f' % p.api_cost }} · profit ${{ '%.2f' % (p.price - p.api_cost) }}/item</span>{% endif %}</label>
+{% if src %}
+<div class="scroll"><table>
+<tr><th>Supplier</th><th>Product key</th><th>Cost</th><th>Stock</th><th>Profit</th><th></th></tr>
+{% for o in src.offers %}<tr>
+<td>{{ o.sname }}{% if src.mode == 'manual' and src.chosen == o.supplier_id %} <span class="muted">(first choice)</span>{% endif %}</td>
+<td><code>{{ o.provider_key }}</code></td><td>${{ '%.2f' % o.cost }}</td><td>{{ o.stock }}</td>
+<td class="{{ 'paid' if p.price > o.cost else 'failed' }}">${{ '%.2f' % (p.price - o.cost) }}</td>
+<td><form method="post" action="{{ url_for('source_edit', pid=p.id) }}"><input type="hidden" name="action" value="remove"><input type="hidden" name="source_id" value="{{ o.id }}"><button class="red sm" type="submit">Remove</button></form></td>
+</tr>{% endfor %}
+</table></div>
+<form method="post" action="{{ url_for('source_edit', pid=p.id) }}" style="margin-top:10px">
+<input type="hidden" name="action" value="mode">
+<label>Which supplier to buy from</label>
+<select name="mode">
+<option value="manual" {{ 'selected' if src.mode == 'manual' }}>I choose the supplier</option>
+<option value="cheapest" {{ 'selected' if src.mode == 'cheapest' }}>Automatically the cheapest one that has stock</option>
+</select>
+<label>My choice <span class="hint">used first when "I choose"</span></label>
+<select name="chosen">{% for o in src.offers %}<option value="{{ o.supplier_id }}" {{ 'selected' if src.chosen == o.supplier_id }}>{{ o.sname }} · ${{ '%.2f' % o.cost }} · stock {{ o.stock }}</option>{% endfor %}</select>
+<label style="display:flex;gap:8px;align-items:center"><input type="checkbox" name="fallback" value="1" style="width:auto" {{ 'checked' if src.fallback }}> If it fails or is out of stock, try the other suppliers</label>
+<button type="submit">Save</button></form>
+{% endif %}
+{% if suppliers_cat %}
+<form method="post" action="{{ url_for('source_edit', pid=p.id) }}" style="margin-top:10px" onsubmit="return chkOffer(this)">
+<input type="hidden" name="action" value="add">
+<label>Add a supplier product <span class="hint">type a few letters to search</span></label>
+<input list="offers" placeholder="Search supplier products..." autocomplete="off" oninput="pickOffer(this)">
+<input type="hidden" name="offer" value="">
+<button type="submit">Add</button></form>
+{% else %}<p class="muted" style="margin-top:8px">No supplier connected yet. <a href="{{ url_for('suppliers_admin.suppliers') }}">Add a supplier</a>.</p>{% endif %}
+</div>
+</div></details>
+
+<form method="post" action="{{ url_for('delete_product', pid=p.id) }}" onsubmit="return confirm('Delete this product? It disappears from the shop. Old orders keep their history.')" style="margin-top:14px">
+<button class="red" type="submit">Delete product</button></form>
+</div>
+</details>
+{% else %}<div class="card">No products yet. Use the form above to add your first one.</div>{% endfor %}
+
+{% if suppliers_cat %}<datalist id="offers">{% for sp in suppliers_cat %}{% for a in sp['items'] %}<option value="{{ a.name }} · ${{ '%.2f' % a.cost }} · stock {{ a.stock }} · {{ sp.name }}" data-v="{{ sp.id }}|{{ a.key }}"></option>{% endfor %}{% endfor %}</datalist>{% endif %}
+<script>
+var OM=null;
+function pickOffer(i){
+  if(!OM){OM={};document.querySelectorAll('#offers option').forEach(function(o){OM[o.value]=o.dataset.v;});}
+  i.nextElementSibling.value=OM[i.value]||'';
+}
+function chkOffer(f){
+  if(!f.offer.value){alert('Pick a product from the suggestions list first.');return false;}
+  return true;
+}
+function calc(f){
+  var o=f.querySelector('.profit');if(!o)return;
+  var c=parseFloat(f.cost.value),p=parseFloat(f.price.value);
+  if(isNaN(p)){o.textContent='Profit per item: enter the price';o.className='profit';return;}
+  if(isNaN(c)){o.textContent='Profit per item: enter the cost to see it';o.className='profit';return;}
+  var d=p-c,m=p>0?Math.round(d/p*100):0;
+  o.textContent='Profit per item: '+(d<0?'-':'')+'$'+Math.abs(d).toFixed(2)+' ('+m+'% margin)';
+  o.className='profit '+(d>0?'good':(d<0?'bad':''));
+}
+function chip(b){
+  var f=b.form,c=parseFloat(f.cost.value);
+  if(isNaN(c)){f.cost.focus();return;}
+  f.price.value=(c+parseFloat(b.dataset.add)).toFixed(2);calc(f);
+}
+function filt(q){
+  q=q.toLowerCase();
+  document.querySelectorAll('details.prod').forEach(function(d){d.hidden=q&&d.dataset.name.indexOf(q)<0;});
+}
+document.querySelectorAll('form[data-pf]').forEach(calc);
+if(location.hash){var t=document.querySelector(location.hash);if(t&&t.tagName==='DETAILS'){t.open=true;t.scrollIntoView();}}
+</script>
+{% endblock %}""",
+    "manual.html": """{% extends 'base.html' %}{% block body %}
+<h2>Pending orders</h2>
+<p class="muted">Made-to-order items to deliver by hand. Marking an order done (or refunding it) tells the customer in the bot - once.</p>
+{% for o in rows %}
+<div class="card">
+<b>{{ o.product or o.product_id }}</b> <span class="muted">· ${{ '%.2f'|format(o.amount) }} · {{ o.id }} · {{ (o.created_at or '')[:16].replace('T',' ') }}</span><br>
+<span class="muted">Customer: {{ ('@' ~ o.username) if o.username else o.user_id }} ({{ o.user_id }})</span>
+<div class="row" style="margin-top:8px;align-items:center">
+<span class="mono" id="c{{ loop.index }}" style="flex:1">{{ o.contact }}</span>
+<button type="button" class="grey" style="flex:0 0 auto;min-width:80px" onclick="navigator.clipboard.writeText(document.getElementById('c{{ loop.index }}').innerText);this.innerText='Copied'">Copy</button>
+</div>
+<form method="post">
+<input name="note" placeholder="Message to the customer (optional)">
+<div class="row">
+<button class="green" formaction="{{ url_for('manual_done', oid=o.id) }}">Mark done</button>
+<button class="grey" formaction="{{ url_for('manual_note', oid=o.id) }}">Send note only</button>
+<button class="red" formaction="{{ url_for('manual_reject', oid=o.id) }}" onclick="return confirm('Refund this order to the customer wallet?')">Refund</button>
+</div></form></div>
+{% else %}{% if not rrows %}<div class="card">Nothing to deliver right now.</div>{% endif %}{% endfor %}
+{% if rrows %}<h3 style="margin-top:18px">Reseller API orders</h3>
+<p class="muted">Orders placed by your resellers' bots. Mark done = the details go to the reseller API automatically and their bot sends them to its customer. Refund returns the money to the reseller.</p>{% endif %}
+{% for o in rrows %}
+<div class="card">
+<b>{{ o.product or o.product_id }}</b> <span class="muted">· x{{ o.quantity }} · ${{ '%.2f'|format(o.amount) }} · {{ o.id }} · {{ (o.created_at or '')[:16].replace('T',' ') }}</span><br>
+<span class="muted">Reseller: {{ o.reseller_name }} · Customer ref: {{ o.customer_ref or '-' }} · Contact: {{ o.contact or '-' }}</span>
+<form method="post" style="margin-top:8px">
+<textarea name="details" rows="2" placeholder="Delivery details for the customer (1 line per item, e.g. email:password / link)"></textarea>
+<div class="row">
+<button class="green" formaction="{{ url_for('manual_reseller_done', oid=o.id) }}" onclick="return confirm('Mark DONE and send to the reseller customer?')">Mark done</button>
+<button class="red" formaction="{{ url_for('manual_reseller_reject', oid=o.id) }}" onclick="return confirm('Refund this order to the reseller?')">Refund</button>
+</div></form></div>
+{% endfor %}{% endblock %}""",
+    "users.html": """{% extends 'base.html' %}{% block body %}
+<style>
+[hidden]{display:none!important}
+.pbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
+.pbar input{margin:0;flex:1;min-width:160px}
+.pbar select{width:auto;margin:0}
+.sumline{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+.sumline span{background:var(--surface);border:1px solid var(--line);border-radius:99px;padding:5px 12px;font-size:13px;font-weight:700;color:var(--muted)}
+.prod{background:var(--surface);border:1px solid var(--line);border-radius:14px;margin-bottom:10px;box-shadow:var(--shadow)}
+.prod>summary{list-style:none;cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:12px;padding:14px 16px;flex-wrap:wrap}
+.prod>summary::-webkit-details-marker{display:none}
+.prod[open]>summary{border-bottom:1px solid var(--line)}
+.pn{min-width:0;flex:1 1 200px}
+.pn b{display:block;font-size:15.5px;overflow-wrap:anywhere}
+.pn small{color:var(--muted);font-size:12.5px}
+.pm{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.pill{border-radius:99px;padding:3px 10px;font-size:12.5px;font-weight:700;background:var(--grey);color:var(--greyink)}
+.pill.ok{background:var(--accent-soft);color:var(--paid)}
+.pill.zero{background:var(--grey);color:var(--muted)}
+.pr{font-weight:800;font-size:13px;color:var(--muted);font-variant-numeric:tabular-nums}
+.pbody{padding:6px 16px 16px}
+.facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin:10px 0 4px}
+.facts div{background:var(--bg);border-radius:10px;padding:9px 12px}
+.facts small{display:block;color:var(--muted);font-weight:600;font-size:12px}
+.facts b{font-size:16px;font-variant-numeric:tabular-nums}
+.sec{margin-top:14px;padding-top:12px;border-top:1px dashed var(--line2)}
+.sec h4{margin:0 0 4px;font-size:14px;font-weight:800}
+.chips{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:6px 0 2px}
+.chip{width:auto;margin:0;padding:5px 11px;font-size:13px;border-radius:99px;background:var(--grey);border-color:var(--grey);color:var(--greyink)}
+.chip:hover{background:var(--line2);border-color:var(--line2)}
+.btns{display:flex;gap:8px}.btns button{flex:1}
+</style>
+<div class="page-head"><h2>Users</h2></div>
+<div class="sumline"><span>{{ tot.n }} users</span><span>Wallets hold ${{ '%.2f'|format(tot.bal or 0) }}</span><span>Total spent ${{ '%.2f'|format(tot.spent or 0) }}</span></div>
+<form method="get" class="pbar">
+<input name="q" value="{{ q }}" placeholder="Search @username or Telegram ID" type="search">
+<select name="sort" onchange="this.form.submit()">
+{% for k, lbl in [('new','Newest'),('spent','Top spenders'),('balance','Highest balance')] %}<option value="{{ k }}" {{ 'selected' if sort == k }}>{{ lbl }}</option>{% endfor %}
+</select>
+<button type="submit" class="sm">Search</button>
+</form>
+{% for u in rows %}
+<details class="prod" {% if rows|length == 1 %}open{% endif %}>
+<summary>
+<div class="pn"><b>{{ ('@' ~ u.username) if u.username else 'No username' }}</b><small>ID {{ u.user_id }} · joined {{ (u.created_at or '')[:10] }}</small></div>
+<div class="pm"><span class="pill {{ 'ok' if (u.balance or 0) > 0 else 'zero' }}">Balance ${{ '%.2f'|format(u.balance or 0) }}</span><span class="pr">Spent ${{ '%.2f'|format(u.spent or 0) }}</span></div>
+</summary>
+<div class="pbody">
+<div class="facts">
+<div><small>Balance</small><b>${{ '%.2f'|format(u.balance or 0) }}</b></div>
+<div><small>Total spent</small><b>${{ '%.2f'|format(u.spent or 0) }}</b></div>
+<div><small>Paid orders</small><b>{{ u.n_orders }}</b></div>
+<div><small>Referral earned</small><b>${{ '%.2f'|format(u.ref_earned or 0) }}</b></div>
+</div>
+<div class="sec">
+<h4>Add or remove wallet money</h4>
+<form method="post" action="{{ url_for('topup', uid=u.user_id) }}">
+<input name="amount" type="number" step="0.01" min="0.01" inputmode="decimal" placeholder="Amount (USDT)" required>
+<div class="chips">{% for x in ['1','5','10','20','50'] %}<button type="button" class="chip" onclick="this.form.amount.value='{{ x }}'">${{ x }}</button>{% endfor %}</div>
+<input name="note" placeholder="Note to the customer (optional)">
+<div class="btns"><button type="submit" name="dir" value="add" class="green">Add money</button>
+<button type="submit" name="dir" value="remove" class="red">Remove money</button></div>
+</form>
+</div>
+<div class="sec"><button type="button" class="chip" onclick="navigator.clipboard&&navigator.clipboard.writeText('{{ u.user_id }}');this.textContent='Copied'">Copy Telegram ID</button></div>
+</div>
+</details>
+{% else %}<div class="card">No users found.</div>{% endfor %}
+{% if rows|length >= 50 %}<p class="muted">Showing the first 50. Use search to find someone specific.</p>{% endif %}
+{% endblock %}""",
+    "tickets.html": """{% extends 'base.html' %}{% block body %}
+<style>
+.pbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
+.pbar input{margin:0;flex:1;min-width:160px}
+.tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}
+.tabs a{padding:7px 14px;border-radius:99px;font-size:13.5px;font-weight:700;color:var(--muted);background:var(--surface);border:1px solid var(--line);text-decoration:none}
+.tabs a.on{background:var(--side);border-color:var(--side);color:#fff}
+.tabs a b{margin-left:5px;font-variant-numeric:tabular-nums}
+.tk{display:block;background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:14px 16px;margin-bottom:10px;box-shadow:var(--shadow);color:var(--ink);text-decoration:none}
+.tk:hover{border-color:var(--accent);text-decoration:none}
+.tk.wait{border-left:4px solid var(--pend)}
+.tk .top{display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap}
+.tk .who{font-weight:800;overflow-wrap:anywhere}
+.tk .who span{color:var(--muted);font-weight:600;font-size:12.5px;margin-left:6px}
+.tk .prev{color:var(--muted);font-size:14px;margin-top:6px;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow-wrap:anywhere}
+.tk .meta{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;align-items:center}
+.pill{border-radius:99px;padding:3px 10px;font-size:12px;font-weight:700;background:var(--grey);color:var(--greyink)}
+.pill.wait{background:#f0b84a33;color:var(--pend)}
+.pill.ok{background:var(--accent-soft);color:var(--paid)}
+.pill.done{background:var(--grey);color:var(--muted)}
+</style>
+<div class="page-head"><h2>Support</h2></div>
+<div class="tabs">
+{% for k, lbl, n in [('open','Open',cnt.open),('closed','Closed',cnt.closed),('all','All',cnt.all)] %}<a href="{{ url_for('tickets', status=k) }}" class="{{ 'on' if st == k }}">{{ lbl }}<b>{{ n }}</b></a>{% endfor %}
+</div>
+{% if cnt.waiting %}<div class="msg"><b>{{ cnt.waiting }}</b> customer{{ ' is' if cnt.waiting == 1 else 's are' }} waiting for your reply. They are listed first.</div>{% endif %}
+<form method="get" class="pbar"><input type="hidden" name="status" value="{{ st }}">
+<input name="q" value="{{ q }}" type="search" placeholder="Search @username, Telegram ID or ticket number">
+<button type="submit" class="sm">Search</button></form>
+{% for t in rows %}
+<a class="tk {{ 'wait' if t.status == 'open' and t.last_sender == 'user' }}" href="{{ url_for('ticket', tid=t.id) }}">
+<div class="top"><div class="who">{{ ('@' ~ t.username) if t.username else t.user_id }}<span>#{{ t.id }} · {{ t.kind or 'Question' }}</span></div>
+<span class="muted">{{ (t.last_at or t.created_at or '')[5:16].replace('T',' ') }}</span></div>
+<div class="prev">{{ 'You: ' if t.last_sender == 'admin' else '' }}{{ t.last_text or ('Photo' if t.n_photos else '') }}</div>
+<div class="meta">
+{% if t.status == 'closed' %}<span class="pill done">Closed</span>{% elif t.last_sender == 'user' %}<span class="pill wait">Needs reply</span>{% else %}<span class="pill ok">You replied</span>{% endif %}
+<span class="pill">{{ t.n_msgs }} message{{ '' if t.n_msgs == 1 else 's' }}</span>
+{% if t.n_photos %}<span class="pill">{{ t.n_photos }} photo{{ '' if t.n_photos == 1 else 's' }}</span>{% endif %}
+</div></a>
+{% else %}<div class="card">{{ 'No tickets found.' if q else 'No tickets here. All caught up!' }}</div>{% endfor %}
+{% endblock %}""",
+    "ticket.html": """{% extends 'base.html' %}{% block body %}
+<style>
+.thead{display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
+.thead h2{margin:0}
+.thead .sub{color:var(--muted);font-size:13.5px;margin-top:2px}
+.pill{border-radius:99px;padding:3px 10px;font-size:12px;font-weight:700;background:var(--grey);color:var(--greyink);vertical-align:2px;margin-left:6px}
+.pill.ok{background:var(--accent-soft);color:var(--paid)}
+.chat{display:flex;flex-direction:column;gap:10px;margin-bottom:16px}
+.bub{max-width:min(560px,88%);padding:10px 14px;border-radius:16px;overflow-wrap:anywhere;white-space:pre-wrap;line-height:1.5}
+.bub small{display:block;font-size:11.5px;font-weight:600;opacity:.7;margin-bottom:3px;white-space:normal}
+.bub.u{align-self:flex-start;background:var(--surface);border:1px solid var(--line);border-bottom-left-radius:4px}
+.bub.a{align-self:flex-end;background:var(--accent);color:#fff;border-bottom-right-radius:4px}
+.bub img{max-width:100%;max-height:360px;border-radius:10px;margin-top:8px;display:block}
+.qr{display:flex;gap:6px;flex-wrap:wrap;margin:2px 0 8px}
+.chip{width:auto;margin:0;padding:6px 12px;font-size:13px;border-radius:99px;background:var(--grey);border-color:var(--grey);color:var(--greyink);text-align:left}
+.chip:hover{background:var(--line2);border-color:var(--line2)}
+.btns{display:flex;gap:8px;flex-wrap:wrap}.btns button{flex:1;min-width:130px;margin:0}
+</style>
+<p style="margin:0 0 10px"><a href="{{ url_for('tickets') }}">&larr; All tickets</a></p>
+<div class="thead"><div>
+<h2>{{ ('@' ~ t.username) if t.username else t.user_id }} <span class="pill {{ 'ok' if t.status == 'open' else '' }}">{{ 'Open' if t.status == 'open' else 'Closed' }}</span></h2>
+<div class="sub">Ticket #{{ t.id }} · {{ t.kind or 'Question' }} · ID {{ t.user_id }} · <a href="{{ url_for('users', q=t.user_id) }}">Open customer</a></div></div>
+<form method="post" action="{{ url_for('ticket_status', tid=t.id) }}" style="margin:0">
+<input type="hidden" name="status" value="{{ 'closed' if t.status == 'open' else 'open' }}">
+<button class="grey sm" type="submit">{{ 'Close ticket' if t.status == 'open' else 'Reopen ticket' }}</button></form></div>
+<div class="chat">
+{% for m in msgs %}<div class="bub {{ 'a' if m.sender == 'admin' else 'u' }}"><small>{{ 'You' if m.sender == 'admin' else 'Customer' }} · {{ (m.created_at or '')[5:16].replace('T',' ') }}</small>{{ m.text or '' }}{% if m.photo_id %}<a href="{{ url_for('ticket_photo', mid=m.id) }}" target="_blank"><img src="{{ url_for('ticket_photo', mid=m.id) }}" alt="photo" loading="lazy"></a>{% endif %}</div>{% endfor %}
+</div>
+<div class="card" id="reply">
+<form method="post" action="{{ url_for('ticket_reply', tid=t.id) }}">
+{% if quick %}<div class="qr">{% for r in quick %}<button type="button" class="chip" data-r="{{ r }}" onclick="var a=document.getElementById('rt');a.value=this.dataset.r;a.focus();">{{ r[:38] }}{{ '…' if r|length > 38 }}</button>{% endfor %}</div>{% endif %}
+<textarea id="rt" name="text" rows="4" placeholder="Your reply (the customer gets it in the bot)" required></textarea>
+<div class="btns"><button type="submit">Send reply</button>
+{% if t.status == 'open' %}<button type="submit" name="close" value="1" class="green">Send and close</button>{% endif %}</div>
+</form></div>
+<script>var c=document.querySelector('.chat');if(c&&c.lastElementChild){c.lastElementChild.scrollIntoView({block:'nearest'});}</script>
+{% endblock %}""",
+    "settings.html": """{% extends 'base.html' %}{% block body %}
+<style>
+.sg{margin-bottom:16px}
+.sg h3{margin:0 0 2px}
+.sg>p{margin:0 0 6px}
+.def{color:var(--muted);font-size:12.5px;font-weight:500}
+.sw{display:flex;align-items:center;gap:12px;padding:12px 14px;border:1px solid var(--line2);border-radius:10px;cursor:pointer;margin-top:8px;color:var(--ink);font-size:14.5px;font-weight:600}
+.sw input{width:20px;height:20px;margin:0;accent-color:var(--accent);flex:none}
+.themes{display:flex;gap:8px;margin-top:8px}
+.themes button{flex:1;background:var(--grey);border-color:var(--grey);color:var(--greyink);margin:0}
+.themes button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+.savebar{position:sticky;bottom:0;background:var(--bg);padding:12px 0;display:flex;gap:8px;border-top:1px solid var(--line)}
+.savebar button{margin:0}
+</style>
+<h2>Settings</h2>
+<div class="card sg"><h3>Appearance</h3><p class="muted">Only for this admin site, on this device.</p>
+<div class="themes"><button type="button" data-t="auto" onclick="setTheme('auto')">Auto</button><button type="button" data-t="light" onclick="setTheme('light')">Light</button><button type="button" data-t="dark" onclick="setTheme('dark')">Dark</button></div></div>
+
+<div class="card sg"><h3>Shop status</h3>
+<p class="muted">{% if s.shop_open %}The shop is <b>OPEN</b>.{% else %}The shop is <b>CLOSED</b>. Customers only see your closed message.{% endif %} You and your bot admins can still use the bot while it is closed. Money already being paid is still received.</p>
+<form method="post" action="{{ url_for('shop_toggle') }}" style="margin:0"><input type="hidden" name="state" value="{{ 'close' if s.shop_open else 'open' }}">
+<button type="submit" class="{{ 'red' if s.shop_open else 'green' }}">{{ 'Close the shop' if s.shop_open else 'Open the shop' }}</button></form></div>
+
+<form method="post" action="{{ url_for('save_settings') }}">
+<div class="card sg"><h3>Messages</h3>
+<p class="muted">Plain text. Use {shop} for your shop name. Leave empty to use the built-in message.</p>
+<label>Welcome message <span class="def">shown after /start, under the bottom menu</span></label>
+<textarea name="welcome_text" rows="5" maxlength="1500" placeholder="Welcome to {shop}! Premium subscriptions at the best price.">{{ s.welcome_text }}</textarea>
+<label>Warranty text <span class="def">shown when a customer taps Warranty in the bot</span></label>
+<textarea name="warranty_text" rows="4" maxlength="1500" placeholder="Replacement within 7 days if the account stops working. Send your order number to Support.">{{ s.warranty_text }}</textarea>
+<label>Shop closed message <span class="def">shown to customers while the shop is closed</span></label>
+<textarea name="closed_message" rows="3" maxlength="600" placeholder="We are closed for maintenance. Back in 1 hour.">{{ s.closed_message }}</textarea></div>
+
+<div class="card sg"><h3>Wallet top-ups</h3>
+<p class="muted">Limits and time windows for customers adding funds. Changes apply to the next top-up, no restart needed.</p>
+<div class="two">
+<div><label>Smallest top-up (USDT) <span class="def">default {{ '%g' % d.min_deposit }}</span></label><input name="min_deposit" type="number" step="0.01" min="0.01" value="{{ '%g' % s.min_deposit }}" required></div>
+<div><label>Largest top-up (USDT) <span class="def">default {{ '%g' % d.max_deposit }}</span></label><input name="max_deposit" type="number" step="0.01" min="0.01" value="{{ '%g' % s.max_deposit }}" required></div>
+</div>
+<div class="two">
+<div><label>Crypto / Binance payment window (minutes) <span class="def">default {{ d.deposit_timeout_minutes }}</span></label><input name="deposit_timeout_minutes" type="number" step="1" min="1" max="1440" value="{{ s.deposit_timeout_minutes }}" required></div>
+<div><label>UPI payment window (minutes) <span class="def">default {{ d.upi_timeout_minutes }}</span></label><input name="upi_timeout_minutes" type="number" step="1" min="1" max="1440" value="{{ s.upi_timeout_minutes }}" required></div>
+</div></div>
+
+<div class="card sg"><h3>Referral commission</h3>
+<p class="muted">Percent of everything a referred customer buys that the person who invited them earns (added to their wallet). Applies to purchases from now on.</p>
+<label>Commission (%) <span class="def">default {{ '%g' % d.referral_percent }}</span></label>
+<input name="referral_percent" type="number" step="0.1" min="0" max="100" value="{{ '%g' % s.referral_percent }}" required></div>
+
+<div class="card sg"><h3>Alerts</h3>
+<label class="sw"><input type="checkbox" name="manual_alerts" value="1" {{ 'checked' if s.manual_alerts }}> Message me in Telegram about new made-to-order orders</label></div>
+
+<div class="card sg"><h3>Quick replies for support</h3>
+<p class="muted">One reply per line. They show as buttons on every ticket, tap one and edit it before sending.</p>
+<textarea name="quick_replies" rows="5">{{ s.quick_replies }}</textarea></div>
+
+<div class="savebar"><button type="submit">Save settings</button></div>
+</form>
+<form method="post" action="{{ url_for('reset_settings') }}" onsubmit="return confirm('Put every setting back to its default value?')">
+<button type="submit" class="grey">Reset all to defaults</button></form>
+<script>
+function setTheme(t){
+  try{if(t==='auto'){localStorage.removeItem('theme');}else{localStorage.setItem('theme',t);}}catch(e){}
+  if(t==='auto'){document.documentElement.removeAttribute('data-theme');}else{document.documentElement.setAttribute('data-theme',t);}
+  mark();
+}
+function mark(){
+  var t='auto';try{t=localStorage.getItem('theme')||'auto';}catch(e){}
+  document.querySelectorAll('.themes button').forEach(function(b){b.classList.toggle('on',b.dataset.t===t);});
+}
+mark();
+</script>
+{% endblock %}""",
+    "emojis.html": """{% extends 'base.html' %}{% block body %}
+<h2>Premium emojis</h2>
+<div class="card"><h3>How it works</h3>
+<p class="muted">When a product or category <b>name contains the keyword</b>, the bot shows that premium emoji in front of it (buttons, product cards, promo posts). Your rules are checked first, then the built-in ones. Changes are live in the bot immediately, no restart.</p>
+<p class="muted"><b>Get an emoji ID:</b> in Telegram send the premium emoji to <b>@RawDataBot</b> (or @getidsbot). Copy the number called <code>custom_emoji_id</code>.</p>
+<p class="muted">Buttons only show premium icons when the bot owner has Telegram Premium. If Telegram refuses an emoji, the bot falls back to a normal button.</p></div>
+
+<div class="card"><h3>Add / update a rule</h3>
+<form method="post" action="{{ url_for('emoji_add') }}">
+<div class="two">
+<div><label>Keyword <span class="muted">(part of the product / category name)</span></label><input name="keyword" maxlength="40" placeholder="disney" required></div>
+<div><label>Emoji ID</label><input name="emoji_id" inputmode="numeric" pattern="[0-9]{5,30}" maxlength="30" placeholder="5069081919279334693" required></div>
+</div>
+<button type="submit">Save rule</button></form></div>
+
+<div class="card"><h3>Your rules ({{ rules|length }})</h3>
+{% if rules %}<div class="scroll"><table><tr><th>Keyword</th><th>Emoji ID</th><th></th></tr>
+{% for r in rules %}<tr><td><b>{{ r.k }}</b></td><td><code>{{ r.id }}</code></td>
+<td><form method="post" action="{{ url_for('emoji_delete') }}" style="margin:0" onsubmit="return confirm('Delete this rule?')"><input type="hidden" name="keyword" value="{{ r.k }}"><button type="submit" class="red sm">Delete</button></form></td></tr>{% endfor %}
+</table></div>{% else %}<p class="muted">No rules yet. Add one above.</p>{% endif %}</div>
+
+<div class="card"><h3>Built-in emojis</h3>
+<p class="muted">Already configured in the bot. To override one, add a rule with the same keyword.</p>
+<div class="scroll"><table><tr><th>Keywords</th><th>Emoji ID</th></tr>
+{% for terms, eid in builtin %}<tr><td>{{ terms }}</td><td>{% if eid %}<code>{{ eid }}</code>{% else %}<span class="muted">not set</span>{% endif %}</td></tr>{% endfor %}
+</table></div></div>
+{% endblock %}""",
+    "upi.html": """{% extends 'base.html' %}{% block body %}
+<h2>UPI setup</h2>
+<div class="card"><h3>Rate (INR per 1 USDT)</h3>
+<p class="muted">Shown next to every USDT price in the bot. Applies to new requests; open ones keep the rate they were created with.</p>
+<form method="post" action="{{ url_for('upi_rate') }}"><div class="inline">
+<input name="rate" type="number" step="0.01" min="1" value="{{ rate }}" required>
+<button type="submit">Save</button></div></form></div>
+<div class="card"><h3>Add a UPI account</h3>
+<p class="muted">The bot uses your active accounts one after another (rotation). The QR image is optional (PNG or JPG, up to 2 MB).</p>
+<form method="post" action="{{ url_for('upi_add') }}" enctype="multipart/form-data">
+<label>Name / label (only you see it)</label><input name="label" placeholder="e.g. PhonePe - Rahul">
+<label>UPI ID</label><input name="upi_id" placeholder="name@bank" required>
+<label>QR image</label><input name="qr" type="file" accept="image/png,image/jpeg">
+<button type="submit">Add UPI</button></form></div>
+{% for a in rows %}
+<div class="card">
+<b>{{ a.label or 'UPI' }}</b> <span class="{{ 'paid' if a.active else 'failed' }}">· {{ 'ON' if a.active else 'OFF' }}</span><br>
+<span class="mono">{{ a.upi_id }}</span>
+{% if a.has_qr %}<div style="margin:10px 0"><img src="{{ url_for('upi_qr', aid=a.id) }}" alt="QR" style="max-width:180px;border-radius:8px;background:#fff"></div>{% endif %}
+<form method="post" enctype="multipart/form-data" action="{{ url_for('upi_qr_set', aid=a.id) }}">
+<input name="qr" type="file" accept="image/png,image/jpeg" required>
+<div class="row"><button class="grey" type="submit">{{ 'Replace QR' if a.has_qr else 'Upload QR' }}</button>
+<button class="grey" formaction="{{ url_for('upi_toggle', aid=a.id) }}" formnovalidate>{{ 'Turn OFF' if a.active else 'Turn ON' }}</button>
+<button class="red" formaction="{{ url_for('upi_delete', aid=a.id) }}" formnovalidate onclick="return confirm('Delete this UPI account?')">Delete</button></div>
+</form></div>
+{% else %}<div class="card">No UPI account yet. Add one above - the UPI button appears in the bot as soon as one is ON.</div>{% endfor %}{% endblock %}""",
+    "upipay.html": """{% extends 'base.html' %}{% block body %}
+<h2>UPI payments</h2>
+<div class="card"><form method="get"><div class="inline">
+<input name="q" value="{{ q }}" placeholder="Find by UTR, request ID, user ID or @username">
+<button type="submit">Find</button></div></form>
+<p class="muted">The bot only alerts you about new payments. Check the UTR in your bank app, then approve or reject here.</p>
+<p class="muted" style="margin-bottom:0">{% if q %}Search results (all statuses). <a href="{{ url_for('upipay') }}">Back to waiting</a>{% elif view == 'all' %}Latest 100. <a href="{{ url_for('upipay') }}">Only waiting</a>{% else %}Waiting for you to verify. <a href="{{ url_for('upipay', view='all') }}">Show all</a>{% endif %}</p></div>
+{% for d in rows %}
+<div class="card">
+<b>₹{{ '%.2f'|format(d.inr_amount or 0) }}</b> → <b>${{ '%.2f'|format(d.amount) }}</b>
+<span class="{{ 'paid' if d.status == 'paid' else ('failed' if d.status in ('rejected','failed') else 'pending') }}">· {{ {'upi_review':'waiting for you','upi_open':'no UTR yet','paid':'approved','rejected':'rejected','failed':'expired/cancelled'}.get(d.status, d.status) }}</span><br>
+<span class="muted">{{ d.id }} · {{ (d.created_at or '')[:16].replace('T',' ') }} UTC · rate ₹{{ d.rate }} · UPI {{ d.upi_id }}</span><br>
+<span class="muted">Customer: {{ ('@' ~ d.username) if d.username else d.user_id }} ({{ d.user_id }})</span>
+<div class="row" style="margin-top:8px;align-items:center"><span class="mono" style="flex:1">UTR: {{ d.utr or '-' }}</span></div>
+{% if d.status != 'paid' %}
+<form method="post">
+<div class="row">
+<button class="green" formaction="{{ url_for('upipay_approve', did=d.id) }}" onclick="return confirm('Add ${{ '%.2f'|format(d.amount) }} to the customer wallet?')">Approve & add ${{ '%.2f'|format(d.amount) }}</button>
+{% if d.status in ('upi_review','upi_open') %}<button class="red" formaction="{{ url_for('upipay_reject', did=d.id) }}" onclick="return confirm('Reject this payment?')">Reject</button>{% endif %}
+</div></form>{% endif %}</div>
+{% else %}<div class="card">Nothing here.</div>{% endfor %}{% endblock %}""",
+}
+TEMPLATES.update(sellers_web.TEMPLATES)
+app.jinja_loader = DictLoader(TEMPLATES)
 
 
-def _dig(obj, path):
-    if path in (None, ""):
-        return obj
-    for part in str(path).split("."):
-        if isinstance(obj, list):
-            try:
-                obj = obj[int(part)]
-            except (ValueError, IndexError):
-                return None
-        elif isinstance(obj, dict):
-            obj = obj.get(part)
-        else:
-            return None
-    return obj
+def _ctx(kw):
+    """Values every page needs: the shop name and, for a logged-in person, the menu counters."""
+    t = tenancy.current_or_none()
+    kw.setdefault("shop", t.name if t else tenancy.PLATFORM_NAME)
+    kw.setdefault("signup", tenancy.signup_mode())
+    if t and session.get("ok"):
+        kw.setdefault("pending_count", len(db.pending_manual()) + len(_reseller_pending() or []))
+        kw.setdefault("open_tickets", len(db.all_tickets("open")))
+        kw.setdefault("upi_pending", db.upi_review_count())
+        kw.setdefault("shop_closed", not db.get_setting("shop_open", 1))
+        kw.setdefault("is_main", t.is_main)
+        kw.setdefault("tstatus", t.status)
+        kw.setdefault("bot_ready", t.can_run_bot or t.is_main)
+        if t.is_main:
+            kw.setdefault("pending_sellers", sum(1 for r in tenancy.all_rows() if r["status"] == "pending"))
+    return kw
 
 
-def _gcfg(s):
-    cfg = {k: (dict(v) if isinstance(v, dict) else v) for k, v in GENERIC_DEFAULT.items()}
-    for k, v in (s.get("cfg") or {}).items():
-        if isinstance(v, dict) and isinstance(cfg.get(k), dict):
-            cfg[k].update(v)
-        else:
-            cfg[k] = v
-    return cfg
+def render_str(source, **kw):
+    return render_template_string(source, **_ctx(kw))
 
 
-def _g_req(s, section, params=None, body=None, idem=None, path=None):
-    cfg = _gcfg(s)
-    sec = cfg[section]
-    params = {**(sec.get("params") or {}), **(params or {})}     # fixed query params from the config
-    headers = {cfg["auth_header"]: f"{cfg['auth_prefix']}{s['key']}"}
-    if idem and sec.get("idem_header"):
-        headers[sec["idem_header"]] = idem
-    use_path = sec["path"] if path is None else path
-    url = s["base_url"].rstrip("/") + (("/" + str(use_path).lstrip("/")) if str(use_path) else "")
-    kw = {"headers": headers, "timeout": 20}
-    send = sec.get("send", "json")
-    if body is not None:
-        if send == "form":
-            kw["data"] = body
-        elif send == "query":
-            params = {**(params or {}), **body}
-        else:
-            kw["json"] = body
-    if params:
-        kw["params"] = params
-    r = requests.request(sec.get("method", "GET"), url, **kw)
-    try:
-        data = r.json()
-    except ValueError:
-        raise ProviderError(r.status_code, "bad_response", rejected=False)
-    if r.status_code >= 400:
-        msg = _dig(data, "error") or _dig(data, "message") or "error"
-        raise ProviderError(r.status_code, str(msg)[:80])
-    if isinstance(data, dict) and (data.get("ok") is False or data.get("success") is False):
-        raise ProviderError(r.status_code, str(data.get("error") or data.get("message") or "rejected")[:80])
-    return data
+def render(name, **kw):
+    return render_template(name, **_ctx(kw))
 
 
-def _g_catalog(s):
-    sec = _gcfg(s)["products"]
-    data = _g_req(s, "products")
-    lst = _dig(data, sec.get("list"))
-    if not isinstance(lst, list):
-        raise ProviderError(200, "products_list_not_found_check_config", rejected=False)
-    out = []
-    for p in lst:
-        key = _dig(p, sec["key"])
-        if key is None:
-            continue
+# ------------------------------------------------------------------- auth
+_attempts = {}
+
+
+def _blocked(ip):
+    now = time.time()
+    _attempts[ip] = [t for t in _attempts.get(ip, []) if now - t < 300]
+    return len(_attempts[ip]) >= 5
+
+
+PUBLIC_ENDPOINTS = ("login", "static", "register_seller")
+
+
+@app.before_request
+def guard():
+    """Decides who is logged in and points `db` / `binance` at THEIR shop for this request."""
+    if request.path.startswith("/api"):
+        return None                       # the API picks the shop from the API key
+    if request.endpoint in PUBLIC_ENDPOINTS:
+        return None
+    tid = session.get("tid")
+    if not session.get("ok") or not tid:
+        session.clear()
+        return redirect(url_for("login"))
+    t = tenancy.get_tenant(tid)
+    if t is None or t.status == "suspended":
+        session.clear()
+        flash("This account is not available. Contact the platform owner.", "err")
+        return redirect(url_for("login"))
+    ep = request.endpoint or ""
+    if not t.is_main and ep.startswith("sellers_admin."):
+        return redirect(url_for("dashboard"))
+    g._tenant_tok = tenancy.set_current(t)
+    return None
+
+
+@app.teardown_request
+def release_shop(exc):
+    tok = g.pop("_tenant_tok", None)
+    if tok is not None:
         try:
-            cost = float(_dig(p, sec["cost"]) or 0)
-            stock = int(float(_dig(p, sec["stock"]) or 0))
-        except (TypeError, ValueError):
-            continue
-        desc = _dig(p, sec.get("description")) if sec.get("description") else None
-        cat = _dig(p, sec.get("category")) if sec.get("category") else None
-        out.append({"key": str(key), "name": str(_dig(p, sec["name"]) or key), "cost": cost, "stock": stock,
-                    "description": str(desc).strip() if isinstance(desc, (str, int, float)) else "",
-                    "category": str(cat).strip() if isinstance(cat, (str, int, float)) else ""})
-    return out
+            tenancy.reset_current(tok)
+        except ValueError:
+            pass
 
 
-_BALANCE_GUESSES = ("balance", "balance_usdt", "balance_usd", "wallet", "wallet_balance", "available_balance",
-                    "credit", "credits", "funds", "amount", "data.balance", "data.wallet", "data.credits",
-                    "data.amount", "data.available_balance", "result.balance", "user.balance",
-                    "account.balance", "profile.balance", "data.user.balance", "data.0.balance")
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        ip = request.headers.get("X-Forwarded-For", request.remote_addr or "").split(",")[0].strip()
+        email = (request.form.get("email") or "").strip()
+        password = request.form.get("password", "")
+        if _blocked(ip):
+            flash("Too many attempts. Try again in 5 minutes.", "err")
+            return render("login.html")
+        tid, err = None, None
+        if email:                                   # a seller
+            tid = tenancy.authenticate(email, password)
+        elif not ADMIN_PASSWORD:                    # the platform owner
+            err = "ADMIN_PASSWORD is not set on the server."
+        elif hmac.compare_digest(password, ADMIN_PASSWORD):
+            tid = tenancy.MAIN_ID
+        if tid:
+            t = tenancy.get_tenant(tid)
+            if t and t.status == "suspended":
+                err = "This account is suspended. Contact the platform owner."
+            elif t:
+                session.clear()
+                session["ok"] = True
+                session["tid"] = tid
+                ready = tid == tenancy.MAIN_ID or t.can_run_bot
+                return redirect(url_for("dashboard") if ready else url_for("connect"))
+        elif err is None:
+            _attempts.setdefault(ip, []).append(time.time())
+            err = "Wrong e-mail or password."
+        flash(err or "Could not log in.", "err")
+    return render("login.html")
 
 
-def _to_number(v):
-    """float from 1.5 / "1.5" / "$1,234.50" / {"balance": 1.5}; None when it is not a number."""
-    if isinstance(v, bool) or v is None:
-        return None
-    if isinstance(v, dict):
-        for k in ("balance", "amount", "usdt", "usd", "value", "available"):
-            n = _to_number(v.get(k))
-            if n is not None:
-                return n
-        return None
-    if isinstance(v, (int, float)):
-        return float(v)
-    t = "".join(ch for ch in str(v) if ch.isdigit() or ch in ".-")
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
+sellers_web.register(app, render, render_str)
+
+
+# ------------------------------------------------------------------ pages
+ORDER_SQL = """SELECT o.*, p.name AS product, u.username AS username
+FROM orders o
+LEFT JOIN products p ON p.id = o.product_id
+LEFT JOIN users u ON u.user_id = o.user_id
+ORDER BY o.created_at DESC"""
+
+
+def fetch_orders(limit, start=None, end=None):
+    sql, args = ORDER_SQL, ()
+    if start or end:
+        import profit
+        cond, args = profit.where_ts("o.created_at", start, end)
+        sql = ORDER_SQL.replace("ORDER BY", "WHERE " + cond + " ORDER BY", 1)
+    c = db.conn()
+    rows = c.execute(sql + " LIMIT ?", args + (limit,)).fetchall()
+    c.close()
+    return rows
+
+
+RANGES = [("today", "Today"), ("yesterday", "Yesterday"), ("day_before", "2 days ago"),
+          ("7d", "7 days"), ("30d", "30 days"), ("all", "All time")]
+
+# paid sales from the bot and from the reseller API, with the cost per item
+# (product cost price, else the provider cost for API-linked products)
+_SALES = """WITH s AS (
+SELECT product_id, quantity q, amount a, COALESCE(paid_at, created_at) ts, 'bot' src, unit_cost uc FROM orders WHERE status='paid'
+UNION ALL
+SELECT product_id, quantity, amount, created_at, 'api', unit_cost FROM api_reseller_orders WHERE status='paid'
+), x AS (
+SELECT s.*, p.name pname, s.uc ucost FROM s
+LEFT JOIN products p ON p.id = s.product_id
+) """
+
+
+def _since(rng):
+    now = datetime.now(timezone.utc)
+    if rng == "today":
+        return now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    if rng == "7d":
+        return (now - timedelta(days=7)).isoformat()
+    if rng == "30d":
+        return (now - timedelta(days=30)).isoformat()
+    return None
+
+
+def dashboard_data(rng, dfrom=None, dto=None):
+    import profit
+    start, end, period, rng = profit.window(rng, dfrom, dto)
+    since = bool(start or end)
+    cc, a = profit.where_ts("ts", start, end)
+    w = (" WHERE " + cc) if cc else ""
+    now = datetime.now(timezone.utc)
+    c = db.conn()
     try:
-        return float(t) if t not in ("", ".", "-") else None
-    except ValueError:
-        return None
+        d = {}
+        src = {r["src"]: dict(r) for r in c.execute(
+            _SALES + "SELECT src, COUNT(*) n, COALESCE(SUM(q),0) units, COALESCE(SUM(a),0) rev, "
+            "COALESCE(SUM(q*COALESCE(ucost,0)),0) cost, "
+            "COALESCE(SUM(CASE WHEN ucost IS NULL THEN 1 ELSE 0 END),0) nocost FROM x" + w + " GROUP BY src", a)}
+        for k in ("bot", "api"):
+            r = src.get(k) or dict(n=0, units=0, rev=0.0, cost=0.0, nocost=0)
+            r["profit"] = r["rev"] - r["cost"]
+            d[k] = r
+        d["n"] = d["bot"]["n"] + d["api"]["n"]
+        d["units"] = d["bot"]["units"] + d["api"]["units"]
+        d["rev"] = d["bot"]["rev"] + d["api"]["rev"]
+        d["cost"] = d["bot"]["cost"] + d["api"]["cost"]
+        d["nocost"] = d["bot"]["nocost"] + d["api"]["nocost"]
+        d["profit"] = d["rev"] - d["cost"]
+        d["margin"] = (d["profit"] / d["rev"] * 100) if d["rev"] else 0.0
 
+        d["top"] = [dict(r) for r in c.execute(
+            _SALES + "SELECT product_id, COALESCE(MAX(pname), 'Deleted product') name, COALESCE(SUM(q),0) units, "
+            "SUM(a) rev, SUM(a - q*COALESCE(ucost,0)) profit FROM x" + w +
+            " GROUP BY product_id ORDER BY rev DESC LIMIT 5", a)]
 
-def _g_balance(s):
-    sec = _gcfg(s)["balance"]
-    # 1) as configured, 2) same URL with ?action=balance, 3) the base URL itself with ?action=balance
-    # (some suppliers answer every path with the product list unless action=balance is sent)
-    attempts = [(None, None), (None, {"action": "balance"}), ("", {"action": "balance"})]
-    first_keys, last_err = None, None
-    for path, params in attempts:
-        try:
-            data = _g_req(s, "balance", params=params, path=path)
-        except (ProviderError, requests.RequestException) as e:
-            last_err = e
-            continue
-        if first_keys is None:
-            first_keys = ", ".join(list(data.keys())[:8]) if isinstance(data, dict) else type(data).__name__
-        for fld in [sec.get("field"), *_BALANCE_GUESSES]:
-            if fld in (None, ""):
-                continue
-            n = _to_number(_dig(data, fld))
-            if n is not None:
-                return n
-    if first_keys is None and last_err is not None:
-        raise last_err
-    raise ProviderError(200, f"no balance field found. Response keys: {first_keys}", rejected=False)
+        # chart window: ends on the last day of the chosen period (today for the quick ranges)
+        if rng in ("yesterday", "day_before", "custom"):
+            last = datetime.fromisoformat(end) - timedelta(days=1)
+            span = (last - datetime.fromisoformat(start)).days + 1
+            ndays = max(7, min(span, 90))
+        else:
+            last = now
+            ndays = 7 if rng in ("today", "7d") else 30
+        cstart = (last - timedelta(days=ndays - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        cend = (cstart + timedelta(days=ndays)).isoformat()
+        start_c = cstart.isoformat()
+        got = {r["d"]: r for r in c.execute(
+            _SALES + "SELECT substr(ts,1,10) d, SUM(a) rev, SUM(a - q*COALESCE(ucost,0)) profit FROM x "
+            "WHERE ts >= ? AND ts < ? GROUP BY d", (start_c, cend))}
+        days = []
+        for i in range(ndays):
+            day = cstart + timedelta(days=i)
+            r = got.get(day.strftime("%Y-%m-%d"))
+            days.append(dict(label=day.strftime("%d %b"), rev=(r["rev"] if r else 0.0),
+                             profit=(r["profit"] if r else 0.0)))
+        mx = max([x["rev"] for x in days] + [0.01])
+        for x in days:
+            x["h"] = round(x["rev"] / mx * 100, 1)
+            x["ph"] = round(max(0.0, min(100.0, x["profit"] / x["rev"] * 100)), 1) if x["rev"] > 0 else 0
+        d["days"] = days
 
+        o = c.execute("SELECT COALESCE(SUM(status='pending'),0) pending, COALESCE(SUM(status='processing'),0) processing FROM orders").fetchone()
+        d["pending"], d["processing"] = o["pending"], o["processing"]
+        fc, fa = profit.where_ts("created_at", start, end)
+        f = "SELECT COUNT(*) n FROM orders WHERE status='failed'" + (" AND " + fc if fc else "")
+        d["failed"] = c.execute(f, fa).fetchone()["n"]
 
-def _g_purchase(s, key, qty, idem):
-    sec = _gcfg(s)["purchase"]
-    data = _g_req(s, "purchase", body={sec["product_param"]: key, sec["qty_param"]: qty}, idem=idem)
-    raw = _dig(data, sec.get("items"))
-    if isinstance(raw, str):
-        items = [x.strip() for x in raw.splitlines() if x.strip()]
-    elif isinstance(raw, list):
-        items = []
-        for x in raw:
-            if isinstance(x, dict):
-                v = _dig(x, sec.get("item_field")) if sec.get("item_field") else json.dumps(x, ensure_ascii=False)
-                items.append(str(v))
-            else:
-                items.append(str(x))
-    else:
-        items = []
-    try:
-        total = float(_dig(data, sec.get("total")) or 0)
-    except (TypeError, ValueError):
-        total = 0.0
-    left = _dig(data, sec.get("stock_left"))
-    try:
-        left = int(float(left)) if left is not None else None
-    except (TypeError, ValueError):
-        left = None
-    return {"order_id": str(_dig(data, sec.get("order_id")) or idem), "items": items,
-            "total": total, "stock_left": left}
+        u = c.execute("SELECT COUNT(*) n, COALESCE(SUM(balance),0) bal, COALESCE(SUM(ref_earned),0) ref FROM users").fetchone()
+        d["users"], d["wallets"], d["ref"] = u["n"], u["bal"], u["ref"]
+        nu = "SELECT COUNT(*) n FROM users" + (" WHERE " + fc if fc else "")
+        d["new_users"] = c.execute(nu, fa).fetchone()["n"]
 
+        cu = {r["d"]: r["n"] for r in c.execute(
+            "SELECT substr(created_at,1,10) d, COUNT(*) n FROM users WHERE created_at >= ? AND created_at < ? GROUP BY d", (start_c, cend))}
+        mxc = max(list(cu.values()) + [1])
+        d["cust_days"] = [dict(label=x["label"], n=cu.get((cstart + timedelta(days=i)).strftime("%Y-%m-%d"), 0)) for i, x in enumerate(days)]
+        for x in d["cust_days"]:
+            x["h"] = round(x["n"] / mxc * 100, 1)
+        d["cust_total"] = sum(x["n"] for x in d["cust_days"])
+        cols = ["#5b6cf0", "#f0457a", "#2fc9b0", "#f7a928", "#8a63f0", "#3aa0f0"]
+        pr_ = [dict(r) for r in c.execute(_SALES + "SELECT COALESCE(MAX(pname), 'Deleted product') name, COALESCE(SUM(q),0) units FROM x" + w + " GROUP BY product_id ORDER BY units DESC LIMIT 6", a)]
+        tot = sum(x["units"] for x in pr_) or 1
+        acc, parts = 0.0, []
+        for i, x in enumerate(pr_):
+            x["color"] = cols[i]; x["pct"] = round(x["units"] / tot * 100, 1)
+            parts.append("%s %s%% %s%%" % (cols[i], round(acc, 2), round(acc + x["pct"], 2))); acc += x["pct"]
+        d["prod"] = pr_
+        d["prod_max"] = max([x["units"] for x in pr_] + [1])
+        d["prod_grad"] = ", ".join(parts) if parts else "var(--line) 0% 100%"
 
-ADAPTERS = {
-    "cupponhub": (_ch_catalog, _ch_balance, _ch_purchase),
-    "generic": (_g_catalog, _g_balance, _g_purchase),
-}
-FORMATS = {
-    "cupponhub": "CupponHub style (?action=products / balance / purchase)",
-    "generic": "Generic JSON API (map the fields in the config)",
-}
-
-
-def _adapter(s):
-    a = ADAPTERS.get(s.get("fmt"))
-    if not a:
-        raise ProviderError(0, f"unknown_format_{s.get('fmt')}")
-    if not s.get("key") or not s.get("base_url"):
-        raise ProviderError(0, "supplier_not_configured")
-    return a
-
-
-def catalog_for(s, max_age=0):
-    """Normalized product list of one supplier: [{key, name, cost, stock}]."""
-    hit = _cat_cache.get(_ck(s))
-    if max_age and hit and time.time() - hit[0] < max_age:
-        return hit[1]
-    data = _adapter(s)[0](s)
-    _cat_cache[_ck(s)] = (time.time(), data)
-    return data
-
-
-def balance_for(s):
-    return _adapter(s)[1](s)
-
-
-def _supplier(r):
-    d = dict(r)
-    if d.get("from_env"):
-        d["base_url"], d["key"] = ENV_BASE, ENV_KEY
-    else:
-        d["key"] = decrypt(d.get("key_enc"))
-    try:
-        d["cfg"] = json.loads(d.get("cfg") or "{}")
-    except ValueError:
-        d["cfg"] = {}
-    d["key_hint"] = ("••••" + d["key"][-4:]) if d["key"] else ""
+        dc, da = profit.where_ts("COALESCE(paid_at, created_at)", start, end)
+        dep = ("SELECT COALESCE(SUM(amount),0) amt FROM deposits WHERE status='paid' AND COALESCE(method,'') != 'admin'"
+               + (" AND " + dc if dc else ""))
+        d["dep_amt"] = c.execute(dep, da).fetchone()["amt"]
+    finally:
+        c.close()
+    W, H = 600, 190
+    def _pts(vals, mx):
+        n = max(len(vals) - 1, 1)
+        return " L".join("%s,%s" % (round(i * W / n, 1), round(H - 10 - max(v, 0) / mx * (H - 30), 1)) for i, v in enumerate(vals))
+    mxr = max([x["rev"] for x in d["days"]] + [0.01])
+    d["rev_line"] = "M" + _pts([x["rev"] for x in d["days"]], mxr)
+    d["rev_area"] = d["rev_line"] + " L%s,%s L0,%s Z" % (W, H, H)
+    d["prof_line"] = "M" + _pts([x["profit"] for x in d["days"]], mxr)
+    d["net"] = (d["profit"] - d["ref"]) if rng == "all" else None
+    d["period"], d["rng"], d["start"], d["end"] = period, rng, start, end
+    d["today"] = now.strftime("%Y-%m-%d")
+    d["low"] = [dict(name=p["name"], stock=int(p["stock"] or 0)) for p in db.list_products()
+                if p["kind"] != "manual" and int(p["stock"] or 0) <= 3][:8]
     return d
 
 
-class ShopDB(Database):
-    """Database + supplier-linked products. Drop-in replacement for Database."""
+@app.route("/")
+def dashboard():
+    rng = request.args.get("range", "30d")
+    if rng not in dict(RANGES):
+        rng = "30d"
+    dfrom = request.args.get("from", "").strip()
+    dto = request.args.get("to", "").strip()
+    d = dashboard_data(rng, dfrom, dto)
+    rng = d["rng"]
+    rows = fetch_orders(10, d["start"], d["end"])
+    return render("dashboard.html", d=d, rng=rng, ranges=RANGES, rows=rows,
+                  dfrom=dfrom if rng == "custom" else "", dto=dto if rng == "custom" else "")
 
-    def __init__(self, path, main=None):
-        # The main shop is the one living in DB_PATH. Only it may use the owner's CUPPON_API_KEY.
-        if main is None:
-            main = os.path.abspath(path) == os.path.abspath(os.getenv("DB_PATH", "shop.db"))
-        self.is_main = bool(main)
-        super().__init__(path)
-        try:
-            self._ensure_tables()
-        except Exception:
-            log.exception("could not create supplier tables yet (init() will retry)")
 
-    def init(self):
-        super().init()
-        self._ensure_tables()
-        c = self.conn()
-        try:
-            import profit
-            profit.ensure_profit_tracking(c)
-        except Exception:
-            log.exception("profit tracking setup failed")
-        finally:
-            c.close()
+@app.route("/orders")
+def orders():
+    return render("orders.html", rows=fetch_orders(200))
 
-    # ------------------------------------------------------------ schema + migration
-    def _ensure_tables(self):
-        c = self.conn()
-        try:
-            c.executescript("""
-            CREATE TABLE IF NOT EXISTS suppliers(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                fmt TEXT NOT NULL DEFAULT 'cupponhub',
-                base_url TEXT,
-                key_enc TEXT,
-                cfg TEXT,
-                from_env INTEGER NOT NULL DEFAULT 0,
-                enabled INTEGER NOT NULL DEFAULT 1,
-                created TEXT);
-            CREATE TABLE IF NOT EXISTS product_sources(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                product_id INTEGER NOT NULL,
-                supplier_id INTEGER NOT NULL,
-                provider_key TEXT NOT NULL,
-                cost REAL NOT NULL DEFAULT 0,
-                stock INTEGER NOT NULL DEFAULT 0,
-                last_sync TEXT,
-                UNIQUE(product_id, supplier_id),
-                UNIQUE(supplier_id, provider_key));
-            CREATE TABLE IF NOT EXISTS source_settings(
-                product_id INTEGER PRIMARY KEY,
-                mode TEXT NOT NULL DEFAULT 'manual',     -- manual / cheapest
-                chosen INTEGER,                          -- supplier tried first in manual mode
-                fallback INTEGER NOT NULL DEFAULT 1);
-            CREATE TABLE IF NOT EXISTS provider_orders(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                idem TEXT UNIQUE,
-                product_id INTEGER,
-                qty INTEGER,
-                status TEXT,              -- pending / received / stocked / failed / partial / unknown
-                provider_order_id TEXT,
-                total_cost REAL,
-                items TEXT,               -- delivered values, kept for recovery
-                error TEXT,
-                created TEXT);
-            """)
-            po = [r[1] for r in c.execute("PRAGMA table_info(provider_orders)").fetchall()]
-            if "supplier_id" not in po:
-                c.execute("ALTER TABLE provider_orders ADD COLUMN supplier_id INTEGER")
-                c.commit()
 
-            cols = [r[1] for r in c.execute("PRAGMA table_info(provider_map)").fetchall()]
-            if not cols:                                         # fresh install
-                c.execute(self._MAP_SQL)
-                c.commit()
-            elif "supplier_id" not in cols:                      # old single-provider install
-                self._migrate_old_map(c)
-            self._ensure_env_supplier(c)
-            c.commit()
-        finally:
-            c.close()
+def _csv_safe(v):
+    v = "" if v is None else str(v)
+    return "'" + v if v[:1] in ("=", "+", "-", "@", "\t", "\r") else v
 
-    _MAP_SQL = """CREATE TABLE IF NOT EXISTS provider_map(
-        product_id INTEGER PRIMARY KEY,
-        supplier_id INTEGER,
-        provider_key TEXT NOT NULL,
-        cost REAL NOT NULL DEFAULT 0,
-        provider_stock INTEGER NOT NULL DEFAULT 0,
-        last_sync TEXT)"""
 
-    def _ensure_env_supplier(self, c, force=False):
-        """CUPPON_API_KEY from the environment becomes a supplier called CupponHub."""
-        r = c.execute("SELECT id FROM suppliers WHERE from_env=1").fetchone()
-        if r:
-            return r["id"]
-        if not self.is_main:
-            # A seller's shop never gets the owner's supplier (CupponHub / coupon API).
-            if not force:
-                return None
-            cur = c.execute("INSERT INTO suppliers(name,fmt,from_env,enabled,created) VALUES(?,?,?,?,?)",
-                            ("Supplier", "cupponhub", 0, 0, _now()))
-            return cur.lastrowid
-        if not ENV_KEY and not force:
-            return None
-        cur = c.execute("INSERT INTO suppliers(name,fmt,from_env,enabled,created) VALUES(?,?,?,?,?)",
-                        ("CupponHub", "cupponhub", 1, 1 if ENV_KEY else 0, _now()))
-        return cur.lastrowid
+@app.route("/orders/export.csv")
+def orders_export():
+    rows = fetch_orders(100000)
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["order", "user", "product", "quantity", "amount", "status", "reason", "created"])
+    for o in rows:
+        w.writerow([_csv_safe(x) for x in (
+            o["id"], ("@" + o["username"]) if o["username"] else o["user_id"],
+            o["product"] or o["product_id"], o["quantity"], "%.2f" % (o["amount"] or 0),
+            o["status"], o["failure_reason"] if "failure_reason" in o.keys() else "",
+            (o["created_at"] or "")[:19].replace("T", " "))])
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    return Response(buf.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=orders-%s.csv" % stamp})
 
-    def _migrate_old_map(self, c):
-        """provider_map used to be one row per product with UNIQUE(provider_key). Rebuild it."""
-        c.execute("BEGIN IMMEDIATE")
-        sid = self._ensure_env_supplier(c, force=True)
-        c.execute("ALTER TABLE provider_map RENAME TO provider_map_old")
-        c.execute(self._MAP_SQL)
-        c.execute("INSERT INTO provider_map(product_id,supplier_id,provider_key,cost,provider_stock,last_sync) "
-                  "SELECT product_id,?,provider_key,cost,provider_stock,last_sync FROM provider_map_old", (sid,))
-        c.execute("INSERT OR IGNORE INTO product_sources(product_id,supplier_id,provider_key,cost,stock,last_sync) "
-                  "SELECT product_id,?,provider_key,cost,provider_stock,last_sync FROM provider_map_old", (sid,))
-        c.execute("INSERT OR IGNORE INTO source_settings(product_id,mode,chosen,fallback) "
-                  "SELECT product_id,'manual',?,1 FROM provider_map_old", (sid,))
-        c.execute("DROP TABLE provider_map_old")
-        c.commit()
-        log.info("migrated provider_map to multi-supplier schema")
-
-    # ------------------------------------------------------------ suppliers CRUD
-    def list_suppliers(self, enabled_only=False):
-        c = self.conn()
-        rows = c.execute("SELECT * FROM suppliers" + (" WHERE enabled=1" if enabled_only else "")
-                         + " ORDER BY id").fetchall()
+@app.route("/profit")
+def profit_centre():
+    import profit
+    rng = request.args.get("range", "30d")
+    if rng not in dict(RANGES):
+        rng = "30d"
+    pid = request.args.get("product", type=int)
+    dfrom = request.args.get("from", "").strip()
+    dto = request.args.get("to", "").strip()
+    c = db.conn()
+    try:
+        profit.ensure_profit_tracking(c)
+        d = profit.profit_data(c, rng, pid, dfrom=dfrom, dto=dto)
+        prods = c.execute("SELECT id, name FROM products ORDER BY name").fetchall()
+    finally:
         c.close()
-        return [_supplier(r) for r in rows]
+    _s, _e, period, rng = profit.window(rng, dfrom, dto)
+    return render("profit.html", d=d, rng=rng, ranges=RANGES, pid=pid, prods=prods, period=period,
+                  dfrom=dfrom if rng == "custom" else "", dto=dto if rng == "custom" else "")
 
-    def get_supplier(self, sid):
-        c = self.conn()
-        r = c.execute("SELECT * FROM suppliers WHERE id=?", (sid,)).fetchone()
+
+@app.route("/profit/fill", methods=["POST"])
+def profit_fill():
+    import profit
+    c = db.conn()
+    try:
+        n = profit.fill_missing_costs(c)
+    finally:
         c.close()
-        return _supplier(r) if r else None
+    flash(f"Cost filled on {n} sale{'' if n == 1 else 's'} (using each product's current cost)." if n
+          else "Nothing to fill. Set a cost price on the product first.")
+    return redirect(url_for("profit_centre"))
 
-    @staticmethod
-    def _clean_cfg(fmt, cfg_text):
-        if fmt != "generic":
-            return None
-        cfg_text = (cfg_text or "").strip()
-        if not cfg_text:
-            return json.dumps({})
-        try:
-            cfg = json.loads(cfg_text)
-        except ValueError as e:
-            raise ValueError(f"Config is not valid JSON: {e}")
-        if not isinstance(cfg, dict):
-            raise ValueError("Config must be a JSON object { ... }.")
-        return json.dumps(cfg)
 
-    @staticmethod
-    def _clean_url(url):
-        url = (url or "").strip()
-        if not (url.startswith("https://") or url.startswith("http://")):
-            raise ValueError("Base URL must start with https://")
-        return url
-
-    def add_supplier(self, name, fmt, base_url, key, cfg_text=""):
-        name = (name or "").strip()[:60]
-        if not name:
-            raise ValueError("Supplier name is required.")
-        if fmt not in ADAPTERS:
-            raise ValueError("Unknown API format.")
-        key = (key or "").strip()
-        if not key:
-            raise ValueError("API key is required.")
-        url, cfg = self._clean_url(base_url), self._clean_cfg(fmt, cfg_text)
-        enc = encrypt(key)
-        c = self.conn()
-        cur = c.execute("INSERT INTO suppliers(name,fmt,base_url,key_enc,cfg,enabled,created) VALUES(?,?,?,?,?,1,?)",
-                        (name, fmt, url, enc, cfg, _now()))
-        c.commit()
-        sid = cur.lastrowid
+@app.route("/profit/export.csv")
+def profit_export():
+    import profit
+    rng = request.args.get("range", "30d")
+    if rng not in dict(RANGES):
+        rng = "30d"
+    pid = request.args.get("product", type=int)
+    c = db.conn()
+    try:
+        d = profit.profit_data(c, rng, pid, ledger_limit=100000,
+                               dfrom=request.args.get("from", ""), dto=request.args.get("to", ""))
+    finally:
         c.close()
-        return sid
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["date", "source", "order", "product", "qty", "sale_price_each", "cost_each_at_sale", "revenue", "profit"])
+    for r in d["ledger"]:
+        w.writerow([_csv_safe(x) for x in (
+            (r["ts"] or "")[:16].replace("T", " "), r["src"], r["oid"], r["name"], r["q"],
+            "%.3f" % (r["unit_price"] or 0), "" if r["uc"] is None else "%.3f" % r["uc"],
+            "%.2f" % (r["a"] or 0), "%.2f" % (r["profit"] or 0))])
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    return Response(buf.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=profit-%s.csv" % stamp})
 
-    def update_supplier(self, sid, name=None, base_url=None, key=None, cfg_text=None):
-        s = self.get_supplier(sid)
-        if not s:
-            raise ValueError("Supplier not found.")
-        sets, vals = [], []
-        if name is not None and name.strip():
-            sets.append("name=?"); vals.append(name.strip()[:60])
-        if not s["from_env"]:
-            if base_url is not None and base_url.strip():
-                sets.append("base_url=?"); vals.append(self._clean_url(base_url))
-            if key is not None and key.strip():
-                sets.append("key_enc=?"); vals.append(encrypt(key.strip()))
-        if cfg_text is not None and s["fmt"] == "generic":
-            sets.append("cfg=?"); vals.append(self._clean_cfg("generic", cfg_text))
-        if sets:
-            c = self.conn()
-            c.execute(f"UPDATE suppliers SET {', '.join(sets)} WHERE id=?", (*vals, sid))
-            c.commit()
-            c.close()
-            _cache_drop(sid)
 
-    def set_supplier_enabled(self, sid, on):
-        c = self.conn()
-        c.execute("UPDATE suppliers SET enabled=? WHERE id=?", (1 if on else 0, sid))
-        c.commit()
-        c.close()
-        self.refresh_all_maps()
+@app.route("/products")
+def products():
+    cat, errs = db.catalog_options(max_age=60)
+    for e in errs:
+        flash(e, "err")
+    prods = db.list_products()
+    items = {p["id"]: db.stock_items(p["id"], 50) for p in prods if p["kind"] != "manual"}
+    return render("products.html", products=prods, items=items, suppliers_cat=cat,
+                  sources=db.sources_by_product(), open_id=request.args.get("open", type=int))
 
-    def delete_supplier(self, sid):
-        s = self.get_supplier(sid)
-        if not s:
-            return
-        if s["from_env"]:
-            raise ValueError("This supplier comes from the CUPPON_API_KEY variable. Disable it instead of deleting.")
-        c = self.conn()
-        c.execute("DELETE FROM product_sources WHERE supplier_id=?", (sid,))
-        c.execute("DELETE FROM suppliers WHERE id=?", (sid,))
-        c.commit()
-        c.close()
-        _cache_drop(sid)
-        self.refresh_all_maps()
 
-    def test_supplier(self, sid):
-        """Returns a short human text. Raises on failure."""
-        s = self.get_supplier(sid)
-        if not s:
-            raise ValueError("Supplier not found.")
-        items = catalog_for(s)
-        msg = f"{s['name']}: OK, {len(items)} products"
-        try:
-            msg += f", wallet {balance_for(s):.4f}"
-        except Exception as e:
-            msg += f" (balance not available: {str(e)[:200]})"
-        return msg
+@app.route("/products/<int:pid>/sources", methods=["POST"])
+def source_edit(pid):
+    act = request.form.get("action", "")
+    try:
+        if act == "add":
+            sid, _, key = request.form.get("offer", "").partition("|")
+            db.add_source(pid, int(sid), key)
+            flash("Supplier product added.")
+        elif act == "remove":
+            db.remove_source(pid, int(request.form.get("source_id", "0")))
+            flash("Supplier product removed.")
+        elif act == "mode":
+            ch = request.form.get("chosen", "")
+            db.set_source_mode(pid, request.form.get("mode", "manual"), int(ch) if ch.isdigit() else None,
+                               bool(request.form.get("fallback")))
+            flash("Supplier choice saved.")
+    except Exception as e:
+        flash(str(e)[:200], "err")
+    return redirect(url_for("products", open=pid))
 
-    def supplier_link_counts(self):
-        c = self.conn()
-        rows = c.execute("SELECT supplier_id, COUNT(*) n FROM product_sources GROUP BY supplier_id").fetchall()
-        c.close()
-        return {r["supplier_id"]: r["n"] for r in rows}
 
-    # ------------------------------------------------------------ source selection
-    def _candidates(self, c, pid):
-        """Suppliers to try for a product, best first. Each: dict with supplier_id, provider_key, cost, stock."""
-        rows = [dict(r) for r in c.execute(
-            "SELECT ps.*, s.name AS sname FROM product_sources ps JOIN suppliers s ON s.id=ps.supplier_id "
-            "WHERE ps.product_id=? AND s.enabled=1", (pid,)).fetchall()]
-        if not rows:
-            return []
-        st = c.execute("SELECT * FROM source_settings WHERE product_id=?", (pid,)).fetchone()
-        mode = st["mode"] if st else "manual"
-        chosen = st["chosen"] if st else None
-        fb = bool(st["fallback"]) if st else True
-        by_cost = sorted(rows, key=lambda r: (r["cost"], r["supplier_id"]))
-        if mode == "cheapest":
-            return sorted(rows, key=lambda r: (r["stock"] <= 0, r["cost"], r["supplier_id"]))
-        first = [r for r in rows if r["supplier_id"] == chosen]
-        if not first:
-            return by_cost if fb else by_cost[:1]
-        return first + ([r for r in by_cost if r["supplier_id"] != chosen] if fb else [])
+@app.route("/products/add", methods=["POST"])
+def add_stock():
+    name = request.form.get("name", "").strip()
+    links = [x.strip() for x in request.form.get("links", "").splitlines() if x.strip()]
+    try:
+        price = float(request.form.get("price", ""))
+    except ValueError:
+        price = -1
+    if not name or not links or price < 0:
+        flash("Name, valid price and at least one item are required.", "err")
+        return redirect(url_for("products"))
+    for link in links:
+        db.add_product_link(name, price, link, 0)
+    flash(f"Added {len(links)} item(s) to {name}.")
+    return redirect(url_for("products"))
 
-    def _refresh_map(self, c, pid):
-        """provider_map = what the rest of the app sees for a product (active cost + best stock)."""
-        cands = self._candidates(c, pid)
-        if not cands:
-            c.execute("DELETE FROM provider_map WHERE product_id=?", (pid,))
-            return
-        active = next((r for r in cands if r["stock"] > 0), cands[0])
-        best_stock = max(int(r["stock"] or 0) for r in cands)     # one order is filled by one supplier
-        c.execute("""INSERT INTO provider_map(product_id,supplier_id,provider_key,cost,provider_stock,last_sync)
-                     VALUES(?,?,?,?,?,?)
-                     ON CONFLICT(product_id) DO UPDATE SET supplier_id=excluded.supplier_id,
-                       provider_key=excluded.provider_key, cost=excluded.cost,
-                       provider_stock=excluded.provider_stock, last_sync=excluded.last_sync""",
-                  (pid, active["supplier_id"], active["provider_key"], active["cost"], best_stock, _now()))
 
-    def refresh_all_maps(self):
-        c = self.conn()
-        pids = {r["product_id"] for r in c.execute("SELECT product_id FROM product_sources").fetchall()}
-        pids |= {r["product_id"] for r in c.execute("SELECT product_id FROM provider_map").fetchall()}
-        for pid in pids:
-            self._refresh_map(c, pid)
-        c.commit()
-        c.close()
+@app.route("/products/<int:pid>/price", methods=["POST"])
+def set_price(pid):
+    try:
+        price = float(request.form.get("price", ""))
+        if price < 0:
+            raise ValueError
+    except ValueError:
+        flash("Invalid price.", "err")
+        return redirect(url_for("products"))
+    db.set_product_price(pid, price)
+    flash("Price updated.")
+    return redirect(url_for("products"))
 
-    # ------------------------------------------------------------ linking products to suppliers
-    def add_source(self, pid, supplier_id, provider_key):
-        s = self.get_supplier(supplier_id)
-        if not s:
-            raise ValueError("Supplier not found.")
-        prods = {p["key"]: p for p in catalog_for(s, max_age=60)}
-        if provider_key not in prods:
-            raise ValueError("Unknown supplier product key. Use /apiproducts to see valid keys.")
-        p = prods[provider_key]
-        c = self.conn()
-        try:
-            other = c.execute("SELECT product_id FROM product_sources WHERE supplier_id=? AND provider_key=? "
-                              "AND product_id!=?", (supplier_id, provider_key, pid)).fetchone()
-            if other:
-                raise ValueError(f"That supplier product is already linked to product #{other['product_id']}.")
-            c.execute("""INSERT INTO product_sources(product_id,supplier_id,provider_key,cost,stock,last_sync)
-                         VALUES(?,?,?,?,?,?)
-                         ON CONFLICT(product_id,supplier_id) DO UPDATE SET provider_key=excluded.provider_key,
-                           cost=excluded.cost, stock=excluded.stock, last_sync=excluded.last_sync""",
-                      (pid, supplier_id, provider_key, p["cost"], p["stock"], _now()))
-            c.execute("INSERT OR IGNORE INTO source_settings(product_id,mode,chosen,fallback) VALUES(?,'manual',?,1)",
-                      (pid, supplier_id))
-            self._refresh_map(c, pid)
-            c.commit()
-        finally:
-            c.close()
 
-    def remove_source(self, pid, source_id):
-        c = self.conn()
-        try:
-            r = c.execute("SELECT supplier_id FROM product_sources WHERE id=? AND product_id=?",
-                          (source_id, pid)).fetchone()
-            if not r:
-                return
-            c.execute("DELETE FROM product_sources WHERE id=?", (source_id,))
-            left = c.execute("SELECT COUNT(*) n FROM product_sources WHERE product_id=?", (pid,)).fetchone()["n"]
-            if not left:
-                c.execute("DELETE FROM source_settings WHERE product_id=?", (pid,))
-            else:
-                c.execute("UPDATE source_settings SET chosen=NULL WHERE product_id=? AND chosen=?",
-                          (pid, r["supplier_id"]))
-            self._refresh_map(c, pid)
-            c.commit()
-        finally:
-            c.close()
+@app.route("/admins")
+def admins():
+    c = db.conn()
+    rows = c.execute("SELECT * FROM admins ORDER BY added_at DESC").fetchall()
+    c.close()
+    return render("admins.html", rows=rows)
 
-    def set_source_mode(self, pid, mode, chosen, fallback):
-        if mode not in ("manual", "cheapest"):
-            raise ValueError("Unknown mode.")
-        c = self.conn()
-        try:
-            if not c.execute("SELECT 1 FROM product_sources WHERE product_id=?", (pid,)).fetchone():
-                raise ValueError("Link a supplier product first.")
-            c.execute("""INSERT INTO source_settings(product_id,mode,chosen,fallback) VALUES(?,?,?,?)
-                         ON CONFLICT(product_id) DO UPDATE SET mode=excluded.mode, chosen=excluded.chosen,
-                           fallback=excluded.fallback""", (pid, mode, chosen, 1 if fallback else 0))
-            self._refresh_map(c, pid)
-            c.commit()
-        finally:
-            c.close()
 
-    # legacy helpers (bot commands /linkapi /unlinkapi and old callers)
-    def link_api(self, pid, provider_key, supplier_id=None):
-        if supplier_id is None:
-            sups = self.list_suppliers(enabled_only=True)
-            hit = [s for s in sups if provider_key in {p["key"] for p in catalog_for(s, max_age=60)}]
-            if not hit:
-                raise ValueError("Unknown supplier product key. Use /apiproducts to see valid keys.")
-            supplier_id = hit[0]["id"]
-        self.add_source(pid, int(supplier_id), provider_key)
+@app.route("/admins/add", methods=["POST"])
+def add_admin():
+    try:
+        uid = int(request.form.get("uid", ""))
+    except ValueError:
+        flash("Invalid Telegram ID.", "err")
+        return redirect(url_for("admins"))
+    db.add_admin(uid, 0)
+    flash(f"Admin {uid} added.")
+    return redirect(url_for("admins"))
 
-    def unlink_api(self, pid, supplier_id=None):
-        c = self.conn()
-        if supplier_id is None:
-            c.execute("DELETE FROM product_sources WHERE product_id=?", (pid,))
-        else:
-            c.execute("DELETE FROM product_sources WHERE product_id=? AND supplier_id=?", (pid, supplier_id))
-        if not c.execute("SELECT 1 FROM product_sources WHERE product_id=?", (pid,)).fetchone():
-            c.execute("DELETE FROM source_settings WHERE product_id=?", (pid,))
-        self._refresh_map(c, pid)
-        c.commit()
-        c.close()
 
-    def sources_by_product(self):
-        """{product_id: {mode, chosen, fallback, offers:[{id,supplier_id,sname,provider_key,cost,stock}]}}"""
-        c = self.conn()
-        rows = c.execute("SELECT ps.*, s.name AS sname FROM product_sources ps JOIN suppliers s ON s.id=ps.supplier_id "
-                         "ORDER BY ps.product_id, ps.cost").fetchall()
-        sets = {r["product_id"]: r for r in c.execute("SELECT * FROM source_settings").fetchall()}
-        c.close()
-        out = {}
-        for r in rows:
-            out.setdefault(r["product_id"], {"offers": []})["offers"].append(dict(r))
-        for pid, d in out.items():
-            st = sets.get(pid)
-            d["mode"] = st["mode"] if st else "manual"
-            d["chosen"] = (st["chosen"] if st else None) or d["offers"][0]["supplier_id"]
-            d["fallback"] = bool(st["fallback"]) if st else True
-        return out
+@app.route("/admins/<int:uid>/remove", methods=["POST"])
+def remove_admin(uid):
+    db.remove_admin(uid)
+    flash(f"Admin {uid} removed.")
+    return redirect(url_for("admins"))
 
-    def catalog_options(self, max_age=60):
-        """For the products page: ([{id, name, items:[{key,name,cost,stock}]}], [error texts])."""
-        sups = [s for s in self.list_suppliers(enabled_only=True) if s["key"]]
-        out, errs = [], []
-        if not sups:
-            return out, errs
 
-        def one(s):
-            try:
-                return s, catalog_for(s, max_age=max_age), None
-            except Exception as e:
-                stale = _cat_cache.get(_ck(s))
-                return s, (stale[1] if stale else []), str(e)[:150]
+@app.route("/userprices")
+def userprices():
+    c = db.conn()
+    rows = c.execute(
+        """SELECT up.username, up.product_id, up.price, p.name AS product
+        FROM user_prices up LEFT JOIN products p ON p.id = up.product_id
+        ORDER BY up.username"""
+    ).fetchall()
+    c.close()
+    return render("userprices.html", rows=rows, products=db.list_products())
 
-        with ThreadPoolExecutor(max_workers=min(8, len(sups))) as ex:
-            for s, items, err in ex.map(one, sups):
-                out.append({"id": s["id"], "name": s["name"], "items": items})
-                if err:
-                    errs.append(f"Supplier {s['name']}: {err}")
-        return out, errs
 
-    # ------------------------------------------------------------ merged stock for display
-    def _links(self):
-        try:
-            c = self.conn()
-            rows = c.execute("SELECT * FROM provider_map").fetchall()
-            c.close()
-        except Exception:
-            return {}
-        return {r["product_id"]: r for r in rows}
+@app.route("/userprices/set", methods=["POST"])
+def set_user_price():
+    username = request.form.get("username", "").strip().lstrip("@")
+    try:
+        pid = int(request.form.get("pid", ""))
+        price = float(request.form.get("price", ""))
+        if price < 0 or not username:
+            raise ValueError
+    except ValueError:
+        flash("Valid username, product and price required.", "err")
+        return redirect(url_for("userprices"))
+    db.set_user_price(username, pid, price)
+    flash(f"Price set for @{username}.")
+    return redirect(url_for("userprices"))
 
-    def _link(self, pid):
-        return self._links().get(pid)
 
-    def _merge(self, row, links):
-        if row is None:
-            return None
-        d = dict(row)
-        m = links.get(d["id"])
+@app.route("/userprices/delete", methods=["POST"])
+def delete_user_price():
+    c = db.conn()
+    c.execute(
+        "DELETE FROM user_prices WHERE username=? AND product_id=?",
+        (request.form.get("username", ""), request.form.get("pid", 0)),
+    )
+    c.commit()
+    c.close()
+    flash("User price deleted.")
+    return redirect(url_for("userprices"))
+
+
+# ------------------------------------------------- product editing
+def _num(value, allow_empty=False):
+    value = (value or "").strip()
+    if not value and allow_empty:
+        return None
+    number = float(value)
+    if number < 0:
+        raise ValueError
+    return number
+
+
+@app.route("/products/new", methods=["POST"])
+def add_product():
+    name = request.form.get("name", "").strip()
+    kind = request.form.get("kind", "auto")
+    try:
+        price = _num(request.form.get("price"))
+    except ValueError:
+        price = None
+    if not name or price is None or kind not in ("auto", "manual"):
+        flash("Name and a valid price are required.", "err")
+        return redirect(url_for("products"))
+    db.add_product(name, price, kind)
+    flash(f"Product '{name}' added." + (" Now add stock below." if kind == "auto" else ""))
+    return redirect(url_for("products"))
+
+
+@app.route("/products/<int:pid>/edit", methods=["POST"])
+def edit_product(pid):
+    f = request.form
+    try:
+        fields = dict(
+            name=f.get("name", "").strip(),
+            price=_num(f.get("price")),
+            old_price=_num(f.get("old_price"), allow_empty=True),
+            cost=_num(f.get("cost"), allow_empty=True),
+            category=(f.get("category", "").strip() or None),
+            kind=f.get("kind", "auto"),
+            delivery=(f.get("delivery", "").strip() or None),
+            warranty=(f.get("warranty", "").strip() or None),
+            prompt=(f.get("prompt", "").strip() or None),
+            description=(f.get("description", "").strip() or None),
+        )
+        if not fields["name"] or fields["kind"] not in ("auto", "manual"):
+            raise ValueError
+    except ValueError:
+        flash("Check the name, price and old price.", "err")
+        return redirect(url_for("products"))
+    db.update_product(pid, **fields)
+    flash("Product saved.")
+    return redirect(url_for("products"))
+
+
+def _profit_text(price, cost):
+    d = price - cost
+    if d < -0.004:
+        return f"LOSS of ${-d:.2f} per item (selling below cost!)"
+    return f"profit ${d:.2f} per item"
+
+
+def _back(pid=None):
+    if pid:
+        return redirect(url_for("products", open=pid) + f"#p{pid}")
+    return redirect(url_for("products"))
+
+
+def _lines(text):
+    return [x.strip() for x in (text or "").splitlines() if x.strip()]
+
+
+_ACC_HDR = re.compile(r"^\s*(?:account|acc)\s*#?\s*\d+\b(.*)$", re.I)
+_SEP = re.compile(r"^[\s=\-_*#~+.]{3,}$")
+
+
+def _items(text):
+    """Split pasted/uploaded text into stock items.
+    A line starting with 'Account 1', 'ACCOUNT 2: mail@x.com (US)' ... starts ONE new item; everything
+    up to the next such line belongs to it. Blank lines and ==== / ---- separator lines are ignored.
+    If the header line carries data after the number (e.g. the e-mail) it is kept as the item's first
+    line; a bare 'Account 1' header is dropped. Text before the first header is ignored.
+    Without any such headers: one item per line, as before."""
+    raw = (text or "").splitlines()
+    if not any(_ACC_HDR.match(x) for x in raw):
+        return _lines(text)
+    items, cur = [], None
+    for x in raw:
+        m = _ACC_HDR.match(x)
         if m:
-            d["stock"] = int(d.get("stock") or 0) + int(m["provider_stock"] or 0)
-            d["api_key"] = m["provider_key"]
-            d["api_cost"] = m["cost"]
-            d["api_stock"] = int(m["provider_stock"] or 0)
-        return d
+            if cur:
+                items.append("\n".join(cur))
+            cur = []
+            if re.sub(r"[\s:.\-)(]", "", m.group(1)):
+                cur.append(x.strip())
+        elif cur is not None and x.strip() and not _SEP.match(x):
+            cur.append(x.strip())
+    if cur:
+        items.append("\n".join(cur))
+    return items
 
-    def list_products(self, *a, **k):
-        links = self._links()
-        return [self._merge(r, links) for r in super().list_products(*a, **k)]
 
-    def get_product(self, pid, *a, **k):
-        return self._merge(super().get_product(pid, *a, **k), self._links())
+def _file_lines(field="stockfile"):
+    """Lines from uploaded .txt file(s) (one stock item per line). Returns [] if no file."""
+    out = []
+    for fl in request.files.getlist(field):
+        if not fl or not fl.filename:
+            continue
+        raw = fl.read(5 * 1024 * 1024 + 1)[:5 * 1024 * 1024]
+        txt = None
+        for enc in ("utf-8-sig", "utf-16", "cp1252", "latin-1"):
+            try:
+                txt = raw.decode(enc)
+                break
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+        out += _items(txt or "")
+    return out
 
-    def get_product_any(self, pid, *a, **k):
-        return self._merge(super().get_product_any(pid, *a, **k), self._links())
 
-    def search_products(self, *a, **k):
-        links = self._links()
-        return [self._merge(r, links) for r in super().search_products(*a, **k)]
+def _all_lines(text):
+    """Pasted text + uploaded txt file(s) together."""
+    return _items(text) + _file_lines()
 
-    # ------------------------------------------------------------ periodic sync
-    def sync(self):
-        """Refresh stock/cost of every linked supplier product. Returns alert lines for admins."""
-        sups = [s for s in self.list_suppliers(enabled_only=True) if s["key"]]
-        alerts, results = [], {}
-        if sups:
-            def one(s):
-                try:
-                    return s, {p["key"]: p for p in catalog_for(s)}, None
-                except Exception as e:
-                    return s, None, e
 
-            with ThreadPoolExecutor(max_workers=min(8, len(sups))) as ex:
-                for s, cat, err in ex.map(one, sups):
-                    if err is not None:
-                        log.warning("supplier %s sync failed: %s", s["name"], err)
-                        alerts.append(f"⚠️ Supplier {s['name']} is not reachable - its stock was not refreshed.")
-                    else:
-                        results[s["id"]] = cat
-        c = self.conn()
+@app.route("/products/create", methods=["POST"])
+def create_product():
+    """One step: product + cost + price + (optional) stock."""
+    f = request.form
+    name = f.get("name", "").strip()
+    kind = f.get("kind", "auto")
+    try:
+        price = _num(f.get("price"))
+        cost = _num(f.get("cost"))
+    except ValueError:
+        flash("Enter a valid cost and selling price.", "err")
+        return _back()
+    if not name or kind not in ("auto", "manual"):
+        flash("Product name is required.", "err")
+        return _back()
+    existed = any(p["name"] == name for p in db.list_products())
+    pid = db.add_product(name, price, kind)
+    if existed:
+        msg = f"'{name}' already exists, so its price and cost were not changed."
+    else:
+        db.update_product(pid, cost=cost, category=(f.get("category", "").strip() or None))
+        msg = f"'{name}' added. Cost ${cost:.2f}, price ${price:.2f}, {_profit_text(price, cost)}."
+    lines = _all_lines(f.get("links")) if kind == "auto" else []
+    if lines:
+        n_added = db.add_stock_lines(pid, lines)
+        msg += f" {n_added} stock item(s) added."
+        if getattr(db, "last_stock_skipped", 0):
+            msg += f" {db.last_stock_skipped} duplicate profile(s) skipped."
+    elif kind == "auto":
+        msg += " No stock yet - open the product and use Add stock."
+    flash(msg)
+    return _back(pid)
+
+
+@app.route("/products/<int:pid>/quick", methods=["POST"])
+def quick_product(pid):
+    f = request.form
+    try:
+        price = _num(f.get("price"))
+        cost = _num(f.get("cost"), allow_empty=True)
+    except ValueError:
+        flash("Enter a valid cost and selling price.", "err")
+        return _back(pid)
+    db.update_product(pid, price=price, cost=cost)
+    if cost is None:
+        flash(f"Price saved: ${price:.2f}. No cost set, so profit is not tracked for this product.")
+    else:
+        flash(f"Saved. Price ${price:.2f}, cost ${cost:.2f}, {_profit_text(price, cost)}.")
+    return _back(pid)
+
+
+@app.route("/products/<int:pid>/stock/add", methods=["POST"])
+def stock_add(pid):
+    lines = _all_lines(request.form.get("links"))
+    if not lines:
+        flash("Paste at least one item or upload a .txt file.", "err")
+    else:
+        n_added = db.add_stock_lines(pid, lines)
+        flash(f"{n_added} item(s) added to stock." + (f" {db.last_stock_skipped} duplicate profile(s) skipped." if getattr(db, "last_stock_skipped", 0) else ""))
+    return _back(pid)
+
+
+@app.route("/products/<int:pid>/stock/<int:sid>/edit", methods=["POST"])
+def stock_edit(pid, sid):
+    link = (request.form.get("link") or "").strip()
+    if not link:
+        flash("Stock item cannot be empty.", "err")
+    else:
+        flash("Stock item updated." if db.edit_stock_item(pid, sid, link) else "That item was already sold or removed.", "")
+    return _back(pid)
+
+
+@app.route("/products/<int:pid>/stock/<int:sid>/delete", methods=["POST"])
+def stock_delete(pid, sid):
+    flash("Stock item removed." if db.delete_stock_item(pid, sid) else "That item was already sold or removed.", "")
+    return _back(pid)
+
+
+@app.route("/products/<int:pid>/stock/clear", methods=["POST"])
+def stock_clear(pid):
+    n = db.clear_stock(pid)
+    flash(f"Removed {n} unsold item(s).")
+    return _back(pid)
+
+
+@app.route("/products/<int:pid>/delete", methods=["POST"])
+def delete_product(pid):
+    result = db.delete_product(pid)
+    if result == "ok":
+        flash("Product deleted (hidden from the shop).")
+    elif result == "waiting":
+        flash("This product still has made-to-order orders waiting. Finish or refund them on the Pending orders page first.", "err")
+    else:
+        flash("Product not found.", "err")
+    return redirect(url_for("products"))
+
+
+# ------------------------------------------------- messages to customers (sent once by the bot)
+def _note(note):
+    return f"\n\n💬 {htmllib.escape(note)}" if note else ""
+
+
+def _msg(uid, en, zh):
+    db.queue_message(uid, zh if db.get_user_language(uid) == "zh" else en)
+
+
+# ------------------------------------------------- made-to-order orders
+def _reseller_pending():
+    """Made-to-order orders placed through the reseller API that still have to be delivered."""
+    try:
+        import reseller_api
+        c = reseller_api.connect()
         try:
-            names = {s["id"]: s["name"] for s in self.list_suppliers()}
-            rows = c.execute("SELECT * FROM product_sources").fetchall()
-            for r in rows:
-                cat = results.get(r["supplier_id"])
-                if cat is None:
-                    continue
-                p = cat.get(r["provider_key"])
-                if p is None:
-                    c.execute("UPDATE product_sources SET stock=0, last_sync=? WHERE id=?", (_now(), r["id"]))
-                    alerts.append(f"⚠️ {names.get(r['supplier_id'], '?')}: product <code>{r['provider_key']}</code> "
-                                  f"(#{r['product_id']}) is no longer listed. Stock set to 0.")
-                else:
-                    c.execute("UPDATE product_sources SET cost=?, stock=?, last_sync=? WHERE id=?",
-                              (p["cost"], p["stock"], _now(), r["id"]))
-                    # fill an empty category / description from the supplier (never overwrites what you set)
-                    if p.get("category"):
-                        c.execute("UPDATE products SET category=? WHERE id=? AND (category IS NULL OR TRIM(category)='')",
-                                  (str(p["category"])[:60], r["product_id"]))
-                    if p.get("description"):
-                        c.execute("UPDATE products SET description=? WHERE id=? AND (description IS NULL OR TRIM(description)='')",
-                                  (str(p["description"])[:1000], r["product_id"]))
-            for pid in {r["product_id"] for r in rows}:
-                self._refresh_map(c, pid)
-                prod = Database.get_product(self, pid)
-                if not prod:
-                    continue
-                for m in self._candidates(c, pid):
-                    if int(m["stock"] or 0) > 0 and float(prod["price"]) <= float(m["cost"]):
-                        alerts.append(f"⚠️ LOSS RISK: #{prod['id']} {prod['name']} sells at ${prod['price']:.2f} "
-                                      f"but {m['sname']} cost is ${m['cost']:.2f}. Sales via that supplier are "
-                                      f"blocked until you raise the price.")
-            c.commit()
+            return c.execute("""SELECT o.*, p.name AS product, r.name AS reseller_name FROM api_reseller_orders o
+                LEFT JOIN products p ON p.id=o.product_id LEFT JOIN api_resellers r ON r.id=o.reseller_id
+                WHERE o.status IN ('processing','otp_requested','otp_ready') ORDER BY o.created_at""").fetchall()
         finally:
             c.close()
-        return alerts
+    except Exception:
+        logging.getLogger("web").exception("could not load reseller API orders")
+        return None          # None = the query FAILED (an empty list means "no orders")
 
-    # ------------------------------------------------------------ buying
-    def _needs_topup(self, m, need):
-        """True when this supplier has top-up configured and its API balance is below the cost."""
-        if not supplier_topup or not supplier_topup.has_config(m["sname"], m["supplier_id"], self):
-            return False
-        try:
-            s = self.get_supplier(m["supplier_id"])
-            return balance_for(s) + 1e-9 < float(m["cost"]) * need
-        except Exception:
-            log.exception("balance check failed for %s (using normal purchase path)", m["sname"])
-            return False
 
-    def fetch_stock(self, pid, need, unit=None):
-        """Buy `need` items for product `pid` from the best supplier and put them in our stock.
-        Suppliers whose API balance covers the cost are used first (direct API). A supplier with
-        too little balance is topped up last: bot withdraws from Binance, Telethon sends the hash
-        to that supplier's bot, then the API purchase runs.
-        Returns 'ok' / 'stock' (no supplier could supply it) / 'error' (supplier failed)."""
-        with _buy_lock:
-            prod = Database.get_product(self, pid)
-            if not prod or need > MAX_QTY:
-                return "stock"
-            c = self.conn()
-            cands = self._candidates(c, pid)
-            c.close()
-            had_error = False
+@app.route("/manual")
+def manual():
+    rr = _reseller_pending()
+    if rr is None:
+        flash("Reseller API orders could not be loaded - check the server logs.", "err")
+        rr = []
+    return render("manual.html", rows=db.pending_manual(), rrows=rr)
 
-            def attempt(m, topup):
-                nonlocal had_error
-                try:
-                    if topup:
-                        s = self.get_supplier(m["supplier_id"])
-                        supplier_topup.ensure_funds(self, s, float(m["cost"]) * need, balance_for)
-                    self._fetch_from_provider(prod, m, need)
-                    return "ok"
-                except Exception as e:
-                    had_error = True
-                    if supplier_topup and isinstance(e, supplier_topup.TopupError):
-                        log.error("top-up failed for %s: %s", m["sname"], e)
-                        return "next"                  # nothing bought from the supplier: next one is safe
-                    log.exception("purchase failed: product %s via %s", pid, m["sname"])
-                    return "next" if _clean_failure(e) else "stop"   # money may be spent: never try another
 
-            later = []
-            for m in cands:
-                if int(m["stock"] or 0) < need:
-                    continue
-                if unit is not None and unit <= float(m["cost"]):
-                    log.warning("blocked sale below cost: product %s unit %s cost %s (%s)",
-                                pid, unit, m["cost"], m["sname"])
-                    continue
-                if self._needs_topup(m, need):
-                    later.append(m)                    # short balance: only if no funded supplier works
-                    continue
-                r = attempt(m, False)
-                if r == "ok":
-                    return "ok"
-                if r == "stop":
-                    return "error"
-            for m in later:
-                r = attempt(m, True)
-                if r == "ok":
-                    return "ok"
-                if r == "stop":
-                    return "error"
-            return "error" if had_error else "stock"
-
-    def buy_with_balance(self, uid, pid, qty, unit):
-        if not self._link(pid):
-            return super().buy_with_balance(uid, pid, qty, unit)
-        with _buy_lock:
-            prod = Database.get_product(self, pid)          # raw row: local stock only
-            if not prod:
-                return "stock"
-            need = max(0, qty - int(prod["stock"] or 0))
-            if need:
-                bal = float(self.get_account(uid)["balance"] or 0)
-                if bal + 1e-9 < round(unit * qty, 2):
-                    return "balance"                         # never spend supplier money for a broke buyer
-                if self.fetch_stock(pid, need, unit) != "ok":
-                    return "stock"
-            return super().buy_with_balance(uid, pid, qty, unit)
-
-    def _fetch_from_provider(self, prod, m, need):
-        s = self.get_supplier(m["supplier_id"])
-        if not s:
-            raise ProviderError(0, "supplier_missing")
-        adapter = _adapter(s)
-        idem = f"shop-{prod['id']}-{uuid.uuid4().hex[:16]}"
-        c = self.conn()
-        c.execute("INSERT INTO provider_orders(idem,product_id,qty,status,created,supplier_id) VALUES(?,?,?,?,?,?)",
-                  (idem, prod["id"], need, "pending", _now(), s["id"]))
+@app.route("/manual/reseller/<oid>/done", methods=["POST"])
+def manual_reseller_done(oid):
+    import json, reseller_api
+    items = [ln.strip() for ln in request.form.get("details", "").strip()[:5000].splitlines() if ln.strip()]
+    if not items:
+        flash("Write the delivery details first.", "err")
+        return redirect(url_for("manual"))
+    c = reseller_api.connect()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        cur = c.execute("UPDATE api_reseller_orders SET items_json=?, status='completed' "
+                        "WHERE id=? AND status IN ('processing','otp_requested','otp_ready')", (json.dumps(items), oid))
         c.commit()
+    finally:
         c.close()
+    if cur.rowcount:
+        flash(f"Order {oid} done - the reseller bot will pick it up and send it to its customer.")
+    else:
+        flash("That order is not waiting any more.", "err")
+    return redirect(url_for("manual"))
 
-        res, last, maybe_sent = None, None, False
-        for attempt in range(2):                             # same idem key => retry can never double-debit
-            try:
-                res = adapter[2](s, m["provider_key"], need, idem)
-                break
-            except requests.RequestException as e:
-                last = e
-                if not isinstance(e, requests.ConnectionError):
-                    maybe_sent = True                        # e.g. read timeout: the order may have gone through
-            except ProviderError as e:
-                if e.status == 503 and attempt == 0:
-                    last = e
-                    time.sleep(1.5)
-                    continue
-                self._mark(idem, "failed" if e.rejected else "unknown", error=str(e))
-                raise
-        if res is None:
-            self._mark(idem, "unknown" if maybe_sent else "failed", error=str(last))
-            raise Unreachable(f"supplier unreachable: {last}", clean=not maybe_sent)
 
-        items = [str(x) for x in res["items"]]
-        # keep the delivered values in our own log BEFORE touching stock (crash-safe recovery)
-        self._mark(idem, "received", provider_order_id=res["order_id"],
-                   total_cost=float(res["total"]), items="\n".join(items))
-        for it in items:
-            self.add_product_link(prod["name"], prod["price"], it, 0)
-        if len(items) != need:
-            self._mark(idem, "partial", error=f"asked {need}, supplier returned {len(items)}")
-            raise RuntimeError(f"supplier returned {len(items)} of {need} items")
-        self._mark(idem, "stocked")
-        c = self.conn()
-        left = res.get("stock_left")
-        if left is None:
-            c.execute("UPDATE product_sources SET stock=MAX(0, stock-?) WHERE product_id=? AND supplier_id=?",
-                      (need, prod["id"], s["id"]))
+@app.route("/manual/reseller/<oid>/reject", methods=["POST"])
+def manual_reseller_reject(oid):
+    import reseller_api
+    c = reseller_api.connect()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        o = c.execute("SELECT * FROM api_reseller_orders WHERE id=? AND status IN ('processing','otp_requested','otp_ready')", (oid,)).fetchone()
+        if not o:
+            c.rollback()
+            flash("That order is not waiting any more.", "err")
+            return redirect(url_for("manual"))
+        r = c.execute("SELECT user_id FROM api_resellers WHERE id=?", (o["reseller_id"],)).fetchone()
+        if r and r["user_id"]:
+            c.execute("UPDATE users SET balance=ROUND(COALESCE(balance,0)+?,2) WHERE user_id=?", (o["amount"], r["user_id"]))
         else:
-            c.execute("UPDATE product_sources SET stock=? WHERE product_id=? AND supplier_id=?",
-                      (int(left), prod["id"], s["id"]))
-        self._refresh_map(c, prod["id"])
+            c.execute("UPDATE api_resellers SET balance=ROUND(balance+?,2) WHERE id=?", (o["amount"], o["reseller_id"]))
+        c.execute("UPDATE api_reseller_orders SET status='refunded' WHERE id=?", (oid,))
         c.commit()
+    finally:
         c.close()
+    flash(f"Order {oid} refunded to the reseller.")
+    return redirect(url_for("manual"))
 
-    def _mark(self, idem, status, **cols):
-        sets = ["status=?"] + [f"{k}=?" for k in cols]
-        c = self.conn()
-        c.execute(f"UPDATE provider_orders SET {', '.join(sets)} WHERE idem=?", (status, *cols.values(), idem))
-        c.commit()
-        c.close()
 
-    def stuck_provider_orders(self):
-        """Orders where supplier money may have been spent but items never fully reached stock."""
-        c = self.conn()
-        rows = c.execute("SELECT * FROM provider_orders WHERE status IN ('pending','received','partial','unknown') "
-                         "AND created < datetime('now','-5 minutes')").fetchall()
-        c.close()
-        return rows
+@app.route("/manual/<oid>/done", methods=["POST"])
+def manual_done(oid):
+    note = request.form.get("note", "").strip()
+    o = db.complete_manual(oid, note or None)
+    if not o:
+        flash("That order is not waiting any more.", "err")
+        return redirect(url_for("manual"))
+    p = db.get_product_any(o["product_id"])
+    name = htmllib.escape(p["name"]) if p else "your product"
+    _msg(o["user_id"],
+         f"✅ <b>Your order is done</b>\n\n🧾 <code>{o['id']}</code>\n📦 {name}{_note(note)}",
+         f"✅ <b>您的订单已完成</b>\n\n🧾 <code>{o['id']}</code>\n📦 {name}{_note(note)}")
+    flash(f"Order {oid} marked done - the customer is being notified.")
+    return redirect(url_for("manual"))
+
+
+@app.route("/manual/<oid>/reject", methods=["POST"])
+def manual_reject(oid):
+    note = request.form.get("note", "").strip()
+    o = db.reject_manual(oid, note or None)
+    if not o:
+        flash("That order is not waiting any more.", "err")
+        return redirect(url_for("manual"))
+    p = db.get_product_any(o["product_id"])
+    name = htmllib.escape(p["name"]) if p else "your product"
+    _msg(o["user_id"],
+         f"↩️ <b>Order refunded</b>\n\n🧾 <code>{o['id']}</code>\n📦 {name}\n💰 ${o['amount']:.2f} was returned to your balance.{_note(note)}",
+         f"↩️ <b>订单已退款</b>\n\n🧾 <code>{o['id']}</code>\n📦 {name}\n💰 ${o['amount']:.2f} 已退回您的余额。{_note(note)}")
+    flash(f"Order {oid} refunded to the customer's wallet.")
+    return redirect(url_for("manual"))
+
+
+@app.route("/manual/<oid>/note", methods=["POST"])
+def manual_note(oid):
+    note = request.form.get("note", "").strip()
+    o = db.get_order(oid)
+    if not o or not note:
+        flash("Write a note first.", "err")
+        return redirect(url_for("manual"))
+    _msg(o["user_id"],
+         f"💬 <b>Update on your order</b> <code>{o['id']}</code>\n\n{htmllib.escape(note)}",
+         f"💬 <b>订单更新</b> <code>{o['id']}</code>\n\n{htmllib.escape(note)}")
+    flash("Note sent to the customer.")
+    return redirect(url_for("manual"))
+
+
+# ------------------------------------------------- users / wallet
+@app.route("/users")
+def users():
+    q = request.args.get("q", "")
+    sort = request.args.get("sort", "new")
+    return render("users.html", rows=db.users_list(q, sort), q=q, sort=sort, tot=db.user_totals())
+
+
+@app.route("/users/<int:uid>/topup", methods=["POST"])
+def topup(uid):
+    try:
+        amount = round(float(request.form.get("amount", "")), 2)
+        if request.form.get("dir") == "remove":
+            amount = -abs(amount)
+        elif request.form.get("dir") == "add":
+            amount = abs(amount)
+        if amount == 0 or abs(amount) > 100000:
+            raise ValueError
+    except ValueError:
+        flash("Enter a non-zero amount.", "err")
+        return redirect(url_for("users", q=str(uid)))
+    note = request.form.get("note", "").strip()
+    db.admin_topup(uid, amount)
+    if amount > 0:
+        _msg(uid, f"➕ <b>${amount:.2f} added to your balance.</b>{_note(note)}",
+             f"➕ <b>${amount:.2f} 已充值到您的余额。</b>{_note(note)}")
+    else:
+        _msg(uid, f"➖ <b>${-amount:.2f} was removed from your balance.</b>{_note(note)}",
+             f"➖ <b>已从您的余额扣除 ${-amount:.2f}。</b>{_note(note)}")
+    flash(f"Balance changed by {amount:+.2f} for {uid}.")
+    return redirect(url_for("users", q=str(uid)))
+
+
+# ------------------------------------------------- support
+@app.route("/tickets")
+def tickets():
+    st = request.args.get("status", "open")
+    if st not in ("open", "closed", "all"):
+        st = "open"
+    q = request.args.get("q", "").strip()
+    return render("tickets.html", rows=db.tickets_overview(st, q), st=st, q=q, cnt=db.ticket_counts())
+
+
+@app.route("/tickets/<int:tid>")
+def ticket(tid):
+    t = db.get_ticket(tid)
+    if not t:
+        return redirect(url_for("tickets"))
+    c = db.conn()
+    u = c.execute("SELECT username FROM users WHERE user_id=?", (t["user_id"],)).fetchone()
+    c.close()
+    info = dict(t)
+    info["username"] = u["username"] if u else None
+    return render("ticket.html", t=info, msgs=db.ticket_msgs(tid), quick=_quick_replies())
+
+
+@app.route("/tickets/photo/<int:mid>")
+def ticket_photo(mid):
+    """Show a photo the customer attached to a ticket (fetched from Telegram with the bot token)."""
+    c = db.conn()
+    row = c.execute("SELECT photo_id FROM ticket_msgs WHERE id=?", (mid,)).fetchone()
+    c.close()
+    BOT_TOKEN = tenancy.cur().bot_token
+    if not row or not row["photo_id"] or not BOT_TOKEN:
+        return ("", 404)
+    try:
+        info = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile",
+                            params={"file_id": row["photo_id"]}, timeout=10).json()
+        path = info["result"]["file_path"]
+        data = requests.get(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{path}", timeout=20).content
+    except Exception:
+        return ("Could not load the photo from Telegram.", 502)
+    mime = _image_mime(data) or "application/octet-stream"
+    resp = app.response_class(data, mimetype=mime)
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Cache-Control"] = "private, max-age=3600"
+    return resp
+
+
+@app.route("/tickets/<int:tid>/reply", methods=["POST"])
+def ticket_reply(tid):
+    t = db.get_ticket(tid)
+    text = request.form.get("text", "").strip()
+    if not t or not text:
+        flash("Write a reply first.", "err")
+        return redirect(url_for("ticket", tid=tid) if t else url_for("tickets"))
+    db.add_ticket_msg(tid, "admin", text)
+    _msg(t["user_id"],
+         f"💬 <b>Support reply</b> · ticket #{tid}\n\n{htmllib.escape(text)}",
+         f"💬 <b>客服回复</b> · 工单 #{tid}\n\n{htmllib.escape(text)}")
+    if request.form.get("close"):
+        db.set_ticket_status(tid, "closed")
+        flash("Reply sent and ticket closed.")
+        return redirect(url_for("tickets"))
+    flash("Reply sent to the customer.")
+    return redirect(url_for("ticket", tid=tid) + "#reply")
+
+
+@app.route("/tickets/<int:tid>/status", methods=["POST"])
+def ticket_status(tid):
+    status = request.form.get("status", "closed")
+    db.set_ticket_status(tid, "open" if status == "open" else "closed")
+    return redirect(url_for("ticket", tid=tid))
+
+
+# ------------------------------------------------- settings
+DEFAULT_QUICK_REPLIES = """Done ✅ Please check your order and tell me if anything is wrong.
+Please send a screenshot of the problem.
+We are checking this now, please wait a little.
+Your money was refunded to your wallet."""
+
+
+def _quick_replies():
+    raw = db.get_setting("quick_replies", DEFAULT_QUICK_REPLIES)
+    return [x.strip() for x in str(raw).splitlines() if x.strip()][:12]
+
+
+SETTING_DEFAULTS = dict(
+    min_deposit=float(os.getenv("MIN_DEPOSIT", "0.1")),
+    max_deposit=float(os.getenv("MAX_DEPOSIT", "100")),
+    deposit_timeout_minutes=int(os.getenv("DEPOSIT_TIMEOUT_MINUTES", os.getenv("PAYMENT_TIMEOUT_MINUTES", "15"))),
+    upi_timeout_minutes=int(os.getenv("UPI_TIMEOUT_MINUTES", "30")),
+    manual_alerts=0 if os.getenv("MANUAL_ALERTS", "1") == "0" else 1,
+)
+
+
+@app.route("/settings")
+def settings():
+    d = dict(SETTING_DEFAULTS, referral_percent=float(os.getenv("REFERRAL_PERCENT", "3")))
+    s = {k: db.get_setting(k, v) for k, v in SETTING_DEFAULTS.items()}
+    s["referral_percent"] = db.referral_percent()
+    s["shop_open"] = db.get_setting("shop_open", 1)
+    s["welcome_text"] = db.get_setting("welcome_text", "")
+    s["closed_message"] = db.get_setting("closed_message", "")
+    s["warranty_text"] = db.get_setting("warranty_text", "")
+    s["quick_replies"] = "\n".join(_quick_replies())
+    return render("settings.html", s=s, d=d)
+
+
+@app.route("/settings/shop", methods=["POST"])
+def shop_toggle():
+    opening = request.form.get("state") == "open"
+    db.set_setting("shop_open", 1 if opening else 0)
+    flash("Shop is OPEN. Customers can use the bot." if opening else
+          "Shop is CLOSED. Customers see your closed message; you and your admins can still test it.")
+    back = request.form.get("back", "")
+    if not back.startswith("/") or back.startswith("//"):
+        back = url_for("settings")
+    return redirect(back)
+
+
+@app.route("/settings/save", methods=["POST"])
+def save_settings():
+    f = request.form
+    try:
+        vals = dict(
+            min_deposit=float(f.get("min_deposit", SETTING_DEFAULTS["min_deposit"])),
+            max_deposit=float(f.get("max_deposit", SETTING_DEFAULTS["max_deposit"])),
+            deposit_timeout_minutes=int(f.get("deposit_timeout_minutes", SETTING_DEFAULTS["deposit_timeout_minutes"])),
+            upi_timeout_minutes=int(f.get("upi_timeout_minutes", SETTING_DEFAULTS["upi_timeout_minutes"])),
+            referral_percent=float(f.get("referral_percent", db.referral_percent())),
+        )
+    except ValueError:
+        flash("Please enter valid numbers.", "err")
+        return redirect(url_for("settings"))
+    if not (0 < vals["min_deposit"] <= vals["max_deposit"]):
+        flash("Smallest top-up must be above 0 and not bigger than the largest top-up.", "err")
+        return redirect(url_for("settings"))
+    if not (1 <= vals["deposit_timeout_minutes"] <= 1440 and 1 <= vals["upi_timeout_minutes"] <= 1440):
+        flash("Payment windows must be between 1 and 1440 minutes.", "err")
+        return redirect(url_for("settings"))
+    if not (0 <= vals["referral_percent"] <= 100):
+        flash("Enter a referral percentage between 0 and 100.", "err")
+        return redirect(url_for("settings"))
+    for k, v in vals.items():
+        db.set_setting(k, v)
+    db.set_setting("manual_alerts", 1 if f.get("manual_alerts") else 0)
+    if "welcome_text" in f:
+        db.set_setting("welcome_text", f.get("welcome_text", "").strip()[:1500])
+        db.set_setting("closed_message", f.get("closed_message", "").strip()[:600])
+        db.set_setting("warranty_text", f.get("warranty_text", "").strip()[:1500])
+        replies = "\n".join(x.strip() for x in f.get("quick_replies", "").splitlines() if x.strip())
+        db.set_setting("quick_replies", replies[:3000] if replies else DEFAULT_QUICK_REPLIES)
+    flash("Settings saved. They are live in the bot now.")
+    return redirect(url_for("settings"))
+
+
+@app.route("/settings/reset", methods=["POST"])
+def reset_settings():
+    db.del_settings(list(SETTING_DEFAULTS) + ["referral_percent", "welcome_text", "closed_message", "warranty_text", "quick_replies"])
+    flash("All settings are back to their defaults.")
+    return redirect(url_for("settings"))
+
+
+# ------------------------------------------------- premium emojis (keyword -> custom emoji id)
+EMOJI_SETTING = "custom_emojis"
+
+
+def _emoji_rules():
+    import json
+    try:
+        data = json.loads(db.get_setting(EMOJI_SETTING, "[]") or "[]")
+    except Exception:
+        data = []
+    return [r for r in data if isinstance(r, dict) and r.get("k") and str(r.get("id", "")).isdigit()]
+
+
+@app.route("/emojis")
+def emojis():
+    import bot as _bot
+    builtin = [(", ".join(terms), _bot.CUSTOM_EMOJI_IDS.get(key, "")) for terms, key in _bot.EMOJI_ALIASES]
+    return render("emojis.html", rules=_emoji_rules(), builtin=builtin)
+
+
+@app.route("/emojis/add", methods=["POST"])
+def emoji_add():
+    import json
+    k = " ".join((request.form.get("keyword") or "").lower().split())[:40]
+    eid = (request.form.get("emoji_id") or "").strip()
+    if len(k) < 2:
+        flash("Keyword must be at least 2 characters.", "err")
+        return redirect(url_for("emojis"))
+    if not (eid.isdigit() and 5 <= len(eid) <= 30):
+        flash("Emoji ID must be a number (copy custom_emoji_id from @RawDataBot).", "err")
+        return redirect(url_for("emojis"))
+    rules = [r for r in _emoji_rules() if r["k"] != k]
+    if len(rules) >= 100:
+        flash("Maximum 100 rules.", "err")
+        return redirect(url_for("emojis"))
+    rules.append({"k": k, "id": eid})
+    db.set_setting(EMOJI_SETTING, json.dumps(rules))
+    flash(f"Saved: \u201c{k}\u201d now uses emoji {eid}.")
+    return redirect(url_for("emojis"))
+
+
+@app.route("/emojis/delete", methods=["POST"])
+def emoji_delete():
+    import json
+    k = " ".join((request.form.get("keyword") or "").lower().split())
+    db.set_setting(EMOJI_SETTING, json.dumps([r for r in _emoji_rules() if r["k"] != k]))
+    flash("Rule deleted.")
+    return redirect(url_for("emojis"))
+
+
+# ------------------------------------------------- UPI (accounts, QR, rate, payments to verify)
+MAX_QR_BYTES = 2 * 1024 * 1024
+
+
+def _image_mime(data: bytes):
+    """Detect PNG / JPEG from the file itself (never trust the browser's content type)."""
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    return None
+
+
+def _read_qr(field="qr"):
+    """Returns (bytes, mime) of an uploaded QR, (None, None) if nothing was chosen, or raises ValueError."""
+    f = request.files.get(field)
+    if not f or not f.filename:
+        return None, None
+    data = f.read(MAX_QR_BYTES + 1)
+    if len(data) > MAX_QR_BYTES:
+        raise ValueError("The QR image is too big (max 2 MB).")
+    mime = _image_mime(data)
+    if not mime:
+        raise ValueError("The QR must be a PNG or JPG image.")
+    return data, mime
+
+
+@app.route("/upi")
+def upi():
+    return render("upi.html", rows=db.upi_list(), rate=f"{db.inr_rate():g}")
+
+
+@app.route("/upi/rate", methods=["POST"])
+def upi_rate():
+    try:
+        rate = float(request.form.get("rate", "").replace(",", "."))
+        if not (1 <= rate <= 100000):
+            raise ValueError
+    except ValueError:
+        flash("Enter a rate between 1 and 100000.", "err")
+        return redirect(url_for("upi"))
+    db.set_inr_rate(rate)
+    flash(f"Rate saved: 1 USDT = ₹{rate:g}.")
+    return redirect(url_for("upi"))
+
+
+@app.route("/upi/add", methods=["POST"])
+def upi_add():
+    upi_id = request.form.get("upi_id", "").strip()
+    label = request.form.get("label", "").strip()[:60]
+    if not upi_id or len(upi_id) > 100 or " " in upi_id:
+        flash("Enter a valid UPI ID (like name@bank).", "err")
+        return redirect(url_for("upi"))
+    try:
+        qr, mime = _read_qr()
+    except ValueError as e:
+        flash(str(e), "err")
+        return redirect(url_for("upi"))
+    db.upi_add(label or upi_id, upi_id, qr, mime)
+    flash("UPI account added. It is ON now.")
+    return redirect(url_for("upi"))
+
+
+@app.route("/upi/<int:aid>/qr", methods=["GET"])
+def upi_qr(aid):
+    a = db.upi_get(aid)
+    if not a or not a["qr"]:
+        return ("", 404)
+    resp = app.response_class(bytes(a["qr"]), mimetype=a["qr_mime"] or "image/png")
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Cache-Control"] = "private, max-age=300"
+    return resp
+
+
+@app.route("/upi/<int:aid>/qr", methods=["POST"])
+def upi_qr_set(aid):
+    try:
+        qr, mime = _read_qr()
+    except ValueError as e:
+        flash(str(e), "err")
+        return redirect(url_for("upi"))
+    if not qr or not db.upi_get(aid):
+        flash("Choose a QR image first.", "err")
+        return redirect(url_for("upi"))
+    db.upi_set_qr(aid, qr, mime)
+    flash("QR saved.")
+    return redirect(url_for("upi"))
+
+
+@app.route("/upi/<int:aid>/toggle", methods=["POST"])
+def upi_toggle(aid):
+    db.upi_toggle(aid)
+    return redirect(url_for("upi"))
+
+
+@app.route("/upi/<int:aid>/delete", methods=["POST"])
+def upi_delete(aid):
+    db.upi_delete(aid)
+    flash("UPI account deleted.")
+    return redirect(url_for("upi"))
+
+
+@app.route("/upipay")
+def upipay():
+    q = request.args.get("q", "").strip()
+    view = request.args.get("view", "review")
+    if q:
+        rows = db.upi_payments(q)
+    elif view == "all":
+        rows = db.upi_payments()
+    else:
+        rows = db.upi_payments(status="upi_review")
+    return render("upipay.html", rows=rows, q=q, view=view)
+
+
+@app.route("/upipay/<did>/approve", methods=["POST"])
+def upipay_approve(did):
+    d = db.approve_upi(did, "web")
+    if not d:
+        flash("That payment was already handled.", "err")
+        return redirect(url_for("upipay"))
+    bal = db.get_account(d["user_id"])["balance"] or 0
+    _msg(d["user_id"],
+         f"🎉 <b>Deposit received</b>\n\n➕ ${d['amount']:.2f}\n👛 Balance: <b>${bal:.2f}</b>",
+         f"🎉 <b>充值已到账</b>\n\n➕ ${d['amount']:.2f}\n👛 余额：<b>${bal:.2f}</b>")
+    flash(f"Approved - ${d['amount']:.2f} added to {d['user_id']}'s wallet and the customer is being told.")
+    return redirect(request.referrer or url_for("upipay"))
+
+
+@app.route("/upipay/<did>/reject", methods=["POST"])
+def upipay_reject(did):
+    d = db.reject_upi(did, "web")
+    if not d:
+        flash("That payment was already handled.", "err")
+        return redirect(url_for("upipay"))
+    utr = htmllib.escape(d["utr"] or "-")
+    _msg(d["user_id"],
+         f"❌ <b>UPI payment not verified</b>\n\n🧾 <code>{d['id']}</code>\n🔢 UTR: <code>{utr}</code>\n\nIf you did pay, open Support and send a screenshot.",
+         f"❌ <b>UPI 付款未核实</b>\n\n🧾 <code>{d['id']}</code>\n🔢 UTR: <code>{utr}</code>\n\n如果您已付款，请联系客服并发送截图。")
+    flash("Payment rejected and the customer was told.")
+    return redirect(request.referrer or url_for("upipay"))

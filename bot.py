@@ -609,6 +609,25 @@ def norm_cat(c) -> str:
     return CAT_SEP.join(x.strip() for x in (c or "").split(CAT_SEP) if x.strip())
 
 
+def custom_folders():
+    """Folders the admin made with /folders (stored in settings, no code edit needed)."""
+    return [x for x in _jload("shop_folders", []) if isinstance(x, str) and x.strip()]
+
+
+def _sq(t):
+    return re.sub(r"[^a-z0-9]", "", (t or "").casefold())
+
+
+def custom_folder_of(p):
+    """Name of the admin-made folder this product belongs to (its name or category contains the folder name)."""
+    hay = _sq((p["name"] or "") + " " + (p["category"] or ""))
+    for f in custom_folders():
+        k = _sq(f)
+        if k and k in hay:
+            return f
+    return None
+
+
 def cat_paths():
     """Every category path incl. parents: 'OTT / Netflix' also gives 'OTT'."""
     seen = []
@@ -618,7 +637,7 @@ def cat_paths():
             pth = CAT_SEP.join(parts[:i])
             if pth not in seen:
                 seen.append(pth)
-    for f in FOLDER_NAMES:
+    for f in FOLDER_NAMES + custom_folders():
         if f not in seen:
             seen.append(f)
     return seen
@@ -849,6 +868,41 @@ EMOJI_HELP = (
     "• To delete a rule send: <code>👤 -</code> or <code>Binance Pay -</code>\n\n"
     "Premium emojis in buttons show only when the bot owner has Telegram Premium.\n\n"
     "<b>Current rules</b>\n{rules}")
+
+
+async def folders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/folders  |  /folders add Gemini  |  /folders del Gemini"""
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text(tt(lang(uid), "admin_only"))
+        return
+    args = context.args or []
+    cur = custom_folders()
+    if len(args) >= 2 and args[0].lower() in ("add", "del", "remove"):
+        name = " ".join(args[1:]).strip()[:30]
+        if args[0].lower() == "add":
+            if name.casefold() in [c.casefold() for c in cur] or name.casefold() in [f.casefold() for f in FOLDER_NAMES]:
+                await update.message.reply_text("That folder already exists.")
+                return
+            cur.append(name)
+        else:
+            left = [c for c in cur if c.casefold() != name.casefold()]
+            if len(left) == len(cur):
+                await update.message.reply_text("No such folder. Send /folders to see the list.")
+                return
+            cur = left
+        db.set_setting("shop_folders", _json.dumps(cur))
+        await update.message.reply_text(("✅ Folder added: " if args[0].lower() == "add" else "🗑 Folder removed: ") + name)
+        return
+    products = db.list_products()
+    lines = []
+    for f in cur:
+        n = sum(1 for p in products if folder_of(p) is None and custom_folder_of(p) == f)
+        lines.append(f"📂 {f} — {n} products")
+    await update.message.reply_text(
+        "Your folders:\n" + ("\n".join(lines) if lines else "(none yet)") +
+        "\n\nAdd: /folders add Gemini\nRemove: /folders del Gemini\n\n"
+        "Every product whose name or category contains the folder name goes inside it automatically.")
 
 
 async def emoji_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1101,12 +1155,11 @@ def shop_view(uid: int, language: str, category: str = None, page: int = 0):
         if FLAT_GRID:
             # only the brand folders (Netflix, Spotify ...) + a plain grid of every other product
             have = [f for f in FOLDER_NAMES if any(folder_of(p) == f for p in products)]
-            # + folders you create yourself: just type a Category on the product in the web admin
-            have += [c for c in cat_children(None) if c not in FOLDER_NAMES]
+            have += [f for f in custom_folders() if f not in have]       # folders made with /folders
             if page == 0:
                 for i in range(0, len(have), GRID_COLS):
                     rows.append([category_button(c) for c in have[i:i + GRID_COLS]])
-            shown = [p for p in products if folder_of(p) is None and not (p["category"] or "").strip()]
+            shown = [p for p in products if folder_of(p) is None and custom_folder_of(p) is None]
         else:
             cats = cat_children(None)
             if cats and page == 0:        # categories (if the admin uses them) are one row of buttons above the grid
@@ -1118,10 +1171,12 @@ def shop_view(uid: int, language: str, category: str = None, page: int = 0):
         text = tt(language, "cat_head", cat=esc(category.replace(CAT_SEP, " › ")))
         if category in FOLDER_NAMES:
             shown = [p for p in products if folder_of(p) == category]
+        elif category in custom_folders():
+            shown = [p for p in products if folder_of(p) is None and custom_folder_of(p) == category]
         else:
             shown = [p for p in products if norm_cat(p["category"]) == category]
         nav_key = f"cat:{cat_key(category)}~"
-        kids = [] if category in FOLDER_NAMES else cat_children(category)
+        kids = [] if (category in FOLDER_NAMES or category in custom_folders()) else cat_children(category)
         if kids and page == 0:         # brands inside this type: one row of buttons above the products
             for i in range(0, len(kids), GRID_COLS):
                 rows.append([category_button(c) for c in kids[i:i + GRID_COLS]])
@@ -3769,6 +3824,7 @@ def build_application(tenant):
     app.add_handler(CommandHandler("chatid", chatid_cmd))
     app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(CommandHandler("emoji", emoji_cmd))
+    app.add_handler(CommandHandler("folders", folders_cmd))
     app.add_handler(CommandHandler("emojiall", emojiall_cmd))
     app.add_handler(CommandHandler("owner", owner_cmd))
     app.add_handler(CommandHandler("addlink", addlink))
