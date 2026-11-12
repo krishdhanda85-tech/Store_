@@ -16,7 +16,6 @@ import re
 from difflib import SequenceMatcher
 
 import provider
-import smart_match as sm
 from flask import Blueprint, request, redirect, url_for, flash, jsonify
 
 bp = Blueprint("compare_admin", __name__)
@@ -41,7 +40,7 @@ YouTube = youtube premium = you tube = yt premium = yt
 Disney+ = disney plus = disneyplus = disney hotstar = hotstar disney = hotstar
 Spotify = spotify premium
 Gemini = google gemini = gemini ai = gemini advanced
-Perplexity = perplexity ai = perplexity pro
+Perplexity = perplexity ai = perplexity pro = perplexity ai pro
 Midjourney = mid journey
 CapCut = cap cut
 Canva = canva pro
@@ -51,6 +50,9 @@ NordVPN = nord vpn
 ExpressVPN = express vpn
 Crunchyroll = crunchy roll
 Telegram Premium = tg premium = telegram prem
+Netflix Premium = netflix 4k uhd = netflix 4k = netflix uhd = netflix premium uhd
+Gemini Pro = google ai pro = google gemini pro = gemini pro = google one ai premium
+Windows 11 Pro = windows 11 professional = win 11 pro = windows 11 pro key = windows 11 pro license = windows 11 professional key = windows 11 professional license
 """
 
 # words that never change which product it is
@@ -110,12 +112,56 @@ def _norm(name, rules=None):
     """-> (numbers tuple, alpha string): two names with the same value are the same product."""
     s = _apply_aliases(name, rules)
     s = re.sub(r"\(?\b\d+\s*(?:hw|hrs?|hours?)\b\)?", " ", s)          # "(24HW)" warranty hours are not a duration
-    s = re.sub(r"(\d+)\s*(months?|mos?|m)\b", r"\1 month", s)
-    s = re.sub(r"(\d+)\s*(days?|d)\b", r"\1 day", s)
-    s = re.sub(r"(\d+)\s*(years?|yrs?|y)\b", r"\1 year", s)
+    # every duration becomes "N month" (12 months = 1 year = 365 days, 30 days = 1 month), so supplier wording never splits a product
+    s = re.sub(r"\b(?:annual|yearly)\b", " 12 month ", s)
+    s = re.sub(r"(\d+)\s*(?:years?|yrs?|y)\b", lambda m: f" {int(m.group(1)) * 12} month ", s)
+    s = re.sub(r"(\d+)\s*(?:months?|mos?|m)\b", r" \1 month ", s)
+    s = re.sub(r"(\d+)\s*(?:days?|d)\b",
+               lambda m: (f" {int(m.group(1)) // 30} month " if int(m.group(1)) >= 30 and int(m.group(1)) % 30 == 0
+                          else f" {int(m.group(1))} day "), s)
+    s = re.sub(r"\b[248]\s*k\b", " uhd ", s)                      # "4K" is a quality word, not the number 4
     nums = tuple(sorted(re.findall(r"\d+", s)))
     alpha = " ".join(sorted(w for w in re.findall(r"[a-z]+", s) if w not in NOISE))
     return nums, alpha
+
+
+# ---------------------------------------------------------------- manual merges (you confirm "these two are the same")
+MERGE_KEY = "compare_merge"
+
+
+def _merges(db):
+    try:
+        v = json.loads(db.get_setting(MERGE_KEY, "{}") or "{}")
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(v, dict):
+        return {}
+    return {k: m for k, m in v.items() if isinstance(m, dict) and m.get("to")}
+
+
+def _parts(gkey):
+    nums, _, alpha = (gkey or "").partition("|")
+    return nums, set(alpha.split())
+
+
+def similar_groups(g, groups, limit=4):
+    """Products with a different name that are probably the SAME product (same duration numbers, 50%+ same words).
+    A product that one supplier lists next to this one (e.g. Plus and Go) is a different variant, so it is skipped."""
+    nums, toks = _parts(g["gkey"])
+    mine = {o["sid"] for o in g["offers"]}
+    res = []
+    for o in groups:
+        if o["gkey"] == g["gkey"] or o.get("shop") is not None and g.get("shop") is not None:
+            continue
+        n2, t2 = _parts(o["gkey"])
+        if n2 != nums or not toks or not t2 or ({x["sid"] for x in o["offers"]} & mine):
+            continue
+        inter = toks & t2
+        score = len(inter) / len(toks | t2)
+        if inter and score >= 0.5:
+            res.append((score, dict(name=o["name"], gkey=o["gkey"], offers=o["offers"], diff=" ".join(sorted(toks ^ t2)))))
+    res.sort(key=lambda t: -t[0])
+    return [r for _s, r in res[:limit]]
 
 
 def _gkey(n):
@@ -290,64 +336,26 @@ def clean_name(n):
     return n or (n or "")
 
 
-def _skey(sig):
-    """Short clean id for a product signature (safe inside URLs and onclick strings)."""
-    import hashlib
-    return "s" + hashlib.sha1((sig or "").encode("utf-8")).hexdigest()[:14]
-
-
-def _alias_fn(rules):
-    rs = _rules(rules)
-    return lambda t: _apply_aliases(t, rs)
-
-
-def _legacy_key(name, rules):
-    n = _norm(name, rules)
-    return _gkey(n) if n[1] else ""
-
-
-def build_groups(sups, existing_cats, rules=None, db=None):
-    """Group the same product sold by different suppliers (smart_match reads duration, plan, delivery type ...).
-    Offers that look alike but are not certain ('maybe') are settled by the AI once and remembered."""
-    af = _alias_fn(rules)
-    known = sm.known(db)
-    groups, index, pend = [], {}, []
+def build_groups(sups, existing_cats, rules=None, merges=None):
+    groups = []   # [{nums, alpha, offers:[...]}]
     for s in sups:
         for it in s["items"]:
-            p = sm.parse(it["name"], af)
-            if not p["core"] and not p["nums"]:
+            nums, alpha = _norm(it["name"], rules)
+            if not alpha:
                 continue
             offer = {"sid": s["id"], "sname": s["name"], "key": it["key"], "name": it["name"],
                      "cost": float(it["cost"]), "stock": int(it["stock"]),
-                     "description": it.get("description") or "", "category": it.get("category") or "",
-                     "labels": sm.labels(p), "how": "exact", "sig": p["sig"]}
-            bucket = index.setdefault((p["dur"], p["qty"]), [])
-            hit, maybes = None, []
-            for g in bucket:
-                v, _why = sm.compare(g["p"], p)
-                if v == "yes":
+                     "description": it.get("description") or "", "category": it.get("category") or ""}
+            hit = None
+            for g in groups:
+                if g["nums"] != nums:
+                    continue
+                if g["alpha"] == alpha or SequenceMatcher(None, g["alpha"], alpha).ratio() >= 0.9:
                     hit = g
                     break
-                if v == "maybe":
-                    maybes.append(g)
             if hit is None:
-                for g in maybes:           # an earlier AI answer
-                    if known.get(sm.pair_key(g["p"]["name"], p["name"])) is True \
-                            and all(o["sid"] != s["id"] for o in g["offers"]):
-                        hit = g
-                        offer["how"] = "ai"
-                        break
-            elif p["sig"] != hit["p"]["sig"]:
-                offer["how"] = "similar"
-            if hit is None:
-                hit = {"p": p, "offers": [], "keys": set(), "dead": False}
+                hit = {"nums": nums, "alpha": alpha, "offers": []}
                 groups.append(hit)
-                bucket.append(hit)
-                for g in maybes:
-                    k = sm.pair_key(g["p"]["name"], p["name"])
-                    if k not in known:
-                        pend.append((hit, g))
-            hit["keys"].add(p["sig"])
             same = [o for o in hit["offers"] if o["sid"] == s["id"]]
             if same:
                 if offer["cost"] < same[0]["cost"] and offer["stock"] > 0:
@@ -355,45 +363,154 @@ def build_groups(sups, existing_cats, rules=None, db=None):
                     hit["offers"].append(offer)
             else:
                 hit["offers"].append(offer)
-
-    # ask the AI about the pairs that are still open (max 20 per run, answers are remembered)
-    if pend and db is not None:
-        def first_desc(g):
-            return next((o["description"] for o in g["offers"] if o["description"]), "")
-        todo = [(a["p"]["name"], first_desc(a), b["p"]["name"], first_desc(b)) for a, b in pend]
-        got = sm.ai_same(db, todo)
-        known = dict(known, **got)
-    for newer, older in pend:                # merge the newer group into the older one (older keeps its id)
-        if newer["dead"] or older["dead"]:
-            continue
-        if known.get(sm.pair_key(newer["p"]["name"], older["p"]["name"])) is not True:
-            continue
-        if {o["sid"] for o in newer["offers"]} & {o["sid"] for o in older["offers"]}:
-            continue                         # two products of the same supplier are never one product
-        for o in newer["offers"]:
-            o["how"] = "ai"
-        older["offers"].extend(newer["offers"])
-        older["keys"] |= newer["keys"]
-        newer["offers"], newer["dead"] = [], True
+    if merges:
+        by = {_gkey((g["nums"], g["alpha"])): g for g in groups}
+        for src, m in merges.items():
+            a, b = by.get(src), by.get(m["to"])
+            if not a or not b or a is b:
+                continue
+            for o in a["offers"]:
+                same = [x for x in b["offers"] if x["sid"] == o["sid"]]
+                if not same:
+                    b["offers"].append(o)
+                elif o["stock"] > 0 and (same[0]["stock"] <= 0 or o["cost"] < same[0]["cost"]):
+                    b["offers"].remove(same[0])
+                    b["offers"].append(o)
+            groups.remove(a)
+            by.pop(src, None)
     out = []
     for g in groups:
-        if g["dead"] or not g["offers"]:
-            continue
         offs = sorted(g["offers"], key=lambda o: o["cost"])
         instock = [o for o in offs if o["stock"] > 0]
         best = (instock or offs)[0]
         desc = next((o["description"] for o in ([best] + offs) if o["description"]), "")
-        p = g["p"]
         out.append({
-            "gkey": _skey(p["sig"]), "keys": {_skey(k) for k in g["keys"]},
-            "old_keys": {k for k in (_legacy_key(o["name"], rules) for o in offs) if k},
-            "name": clean_name(best["name"]), "offers": offs, "best": best,
+            "gkey": _gkey((g["nums"], g["alpha"])), "name": clean_name(best["name"]), "offers": offs, "best": best,
             "stock": sum(o["stock"] for o in offs), "instock": bool(instock), "description": desc,
-            "p": p, "fam": p["fam"], "labels": sm.labels(p),
             "category": guess_category(best["name"], next((o["category"] for o in offs if o["category"]), ""),
                                        existing_cats, rules),
         })
+    out.sort(key=lambda g: (g["category"].casefold(), g["name"].casefold()))
     return out
+
+
+PAGE = r"""{% extends 'base.html' %}{% block body %}
+<h2>Compare &amp; import</h2>
+<p class="muted">All your suppliers are compared. The cheapest one that has stock is used automatically. Category and description are copied. You only set the price (and add an emoji if you like).</p>
+
+
+<div class="card"><h3>Auto mode <span class="{{ 'paid' if auto.on else 'failed' }}">{{ 'ON' if auto.on else 'OFF' }}</span></h3>
+<p class="muted" style="margin:0 0 8px">When ON, the bot compares all suppliers by itself every 10 minutes and adds every new product with the cheapest supplier, category, description and your markup price. Products you already have, already linked or hidden are never touched. You get a message in the bot when new products are added.</p>
+<form method="post" action="{{ url_for('compare_admin.auto_save') }}">
+<label style="display:flex;gap:8px;align-items:center"><input type="checkbox" name="on" value="1" style="width:auto" {{ 'checked' if auto.on }}> Auto mode ON</label>
+<label>Markup % on the cheapest cost</label><input name="pct" type="number" step="1" min="0" value="{{ auto.pct }}">
+<label>Plus a fixed amount ($)</label><input name="fix" type="number" step="0.05" min="0" value="{{ auto.fix }}">
+<label>Round the price</label>
+<select name="rnd"><option value="five" {{ 'selected' if auto.rnd == 'five' }}>Up to the next 5 cents</option><option value="x99" {{ 'selected' if auto.rnd == 'x99' }}>Ending .99</option><option value="none" {{ 'selected' if auto.rnd == 'none' }}>No rounding</option></select>
+<label style="display:flex;gap:8px;align-items:center"><input type="checkbox" name="instock" value="1" style="width:auto" {{ 'checked' if auto.instock }}> Only add products that are in stock</label>
+<label>ONLY auto-add these brands / words (comma separated, leave empty = all products)</label><input name="only" value="{{ auto.only }}" placeholder="ChatGPT, Gemini, Canva, YouTube">
+<label>Never auto-add these brands (comma separated, you add them by hand)</label><input name="skip" value="{{ auto.skip }}" placeholder="Spotify, Netflix, Crunchyroll, Amazon Prime">
+<div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap"><button type="submit">Save</button></div></form>
+<form method="post" action="{{ url_for('compare_admin.auto_run') }}" style="margin-top:8px"><button type="submit" class="green sm">Run now</button></form></div>
+
+<div class="card"><h3>Price watch <span class="{{ 'paid' if watch.on else 'failed' }}">{{ 'ON' if watch.on else 'OFF' }}</span></h3>
+<p class="muted" style="margin:0 0 8px">Every 5 minutes the bot checks the cheapest supplier cost of every product you sell. If a cost changes, a product runs out or comes back, or you would sell at a loss, you get a message in the bot.</p>
+<form method="post" action="{{ url_for('compare_admin.watch_save') }}">
+<label style="display:flex;gap:8px;align-items:center"><input type="checkbox" name="on" value="1" style="width:auto" {{ 'checked' if watch.on }}> Price watch ON</label>
+<label style="display:flex;gap:8px;align-items:center"><input type="checkbox" name="auto" value="1" style="width:auto" {{ 'checked' if watch.auto }}> Also move my price by the same amount when the cost changes (my profit stays the same, never below cost)</label>
+<button type="submit" class="sm" style="margin-top:8px">Save</button></form></div>
+
+<div class="card"><h3>Categories</h3>
+<p class="muted" style="margin:0 0 8px">Put all your existing products into the new <b>Type / Brand</b> folders (AI Tools, VPN, Music, OTT ...). You see a preview first. Products the bot does not know by name are sorted by Gemini AI (needs GEMINI_API_KEY on Railway).</p>
+<a href="{{ url_for('compare_admin.reorg') }}"><button type="button">Reorganize categories</button></a> <a href="{{ url_for('compare_admin.keep_page') }}"><button type="button" class="grey">Keep only my original products</button></a></div>
+
+<div class="card"><h3>Smart matching</h3>
+<p class="muted" style="margin:0 0 8px">The bot already knows that Prime Video = Amazon Prime, Chat GPT = ChatGPT, 1M = 1 Month, and ignores words like "Buy", "Account" or "(24HW)". If it misses one, add your own line: <b>Name = other name = another name</b> (one per line).</p>
+<form method="post" action="{{ url_for('compare_admin.aliases_save') }}">
+<textarea name="aliases" rows="5" spellcheck="false" placeholder="Amazon Prime = prime video = prime vedio&#10;Gemini = google ai pro" style="width:100%">{{ aliases_text }}</textarea>
+<button type="submit" class="sm" style="margin-top:6px">Save</button></form></div>
+
+{% if not sups %}<div class="card">No supplier connected yet. <a href="{{ url_for('suppliers_admin.suppliers') }}">Add a supplier</a> first.</div>
+{% else %}
+<form method="post" action="{{ url_for('compare_admin.create') }}" id="imp">
+
+<div class="card"><h3>1. Your profit</h3>
+<label>Markup % on the cheapest cost</label><input id="pct" type="number" step="1" min="0" value="40" oninput="recalc()">
+<label>Plus a fixed amount ($)</label><input id="fix" type="number" step="0.05" min="0" value="0" oninput="recalc()">
+<label>Round the price</label>
+<select id="rnd" onchange="recalc()"><option value="five" selected>Up to the next 5 cents (1.23 → 1.25)</option><option value="x99">Ending .99 (1.23 → 1.99)</option><option value="none">No rounding</option></select>
+<p class="muted" style="margin:6px 0 0">Prices you type by hand are kept when you change the markup. "Reset prices" overwrites them.</p>
+<button type="button" class="grey sm" onclick="resetPrices()">Reset prices</button></div>
+
+<div class="card"><h3>2. Choose products</h3>
+<input id="q" placeholder="Search... (e.g. chatgpt)" oninput="filt()" autocomplete="off">
+<label>Category</label>
+<select id="catf" onchange="filt()"><option value="">All categories</option>{% for c in cat_list %}<option value="{{ c|lower }}">{{ c }}</option>{% endfor %}</select>
+<label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="instock" checked style="width:auto" onchange="filt()"> Only in stock</label>
+<label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="multi" style="width:auto" onchange="filt()"> Only products sold by 2+ suppliers</label>
+<div style="display:flex;gap:8px;margin:8px 0;flex-wrap:wrap"><button type="button" class="grey sm" onclick="selShown(true)">Select all shown</button><button type="button" class="grey sm" onclick="selShown(false)">Clear</button>
+<a href="{{ url_for('compare_admin.home', hidden=(0 if show_hidden else 1)) }}" class="muted" style="align-self:center">{{ 'Back to normal list' if show_hidden else 'Show hidden (' ~ hidden_n ~ ')' }}</a></div>
+<datalist id="cats2">{% for c in cat_list %}<option value="{{ c }}">{% endfor %}</datalist>
+<p class="muted" style="margin:0 0 8px">{{ groups|length }} product{{ '' if groups|length == 1 else 's' }} to choose from ({{ skipped }} hidden because you already have them).</p>
+<div id="list">
+{% for g in groups %}
+<div class="sub imp-row" data-name="{{ g.name|lower }}" data-cat="{{ g.category|lower }}" data-stock="{{ g.stock }}" data-cost="{{ '%.4f' % g.best.cost }}" data-n="{{ g.offers|length }}" style="padding:10px;margin:6px 0">
+<label style="display:flex;gap:10px;align-items:flex-start;margin:0"><input type="checkbox" class="pick" name="pick" value="{{ loop.index0 }}" style="width:auto;margin-top:6px" onchange="count()">
+<span style="flex:1"><input name="name_{{ loop.index0 }}" value="{{ g.name }}" maxlength="120" placeholder="Name (you can add an emoji)">
+<span class="muted" style="font-size:13px;display:block;margin-top:4px">
+{% for o in g.offers %}<span {% if o.sid == g.best.sid and o.key == g.best.key %}class="paid"{% endif %}>{{ o.sname }} ${{ '%.2f' % o.cost }}{% if o.stock <= 0 %} (out){% else %} ({{ o.stock }}){% endif %}</span>{% if not loop.last %} · {% endif %}{% endfor %}
+</span></span></label>
+<input type="hidden" name="offers_{{ loop.index0 }}" value="{{ g.offers_json }}">
+<div style="display:flex;gap:8px;align-items:center;margin-top:6px;padding-left:30px;flex-wrap:wrap">
+<span class="muted">Category</span><input name="cat_{{ loop.index0 }}" list="cats2" value="{{ g.category }}" maxlength="60" style="max-width:160px">
+<span class="muted">Sell for $</span><input class="pr" name="price_{{ loop.index0 }}" type="number" step="0.01" min="0.01" style="max-width:100px" oninput="this.dataset.manual=1;prof(this.closest('.imp-row'))"><span class="pf muted"></span>
+<button type="button" class="grey sm" onclick="hideRow(this,'{{ g.gkey }}','{{ 'remove' if show_hidden else 'add' }}')">{{ 'Unhide' if show_hidden else 'Hide' }}</button></div>
+</div>
+{% else %}<p class="muted">Nothing new to import. Every supplier product is already in your shop or hidden.</p>{% endfor %}
+</div></div>
+
+<div style="position:sticky;bottom:0;padding:10px 0;background:var(--bg,#0f1020)">
+<button type="submit" class="green" id="go" disabled>Add 0 products</button></div>
+</form>
+
+<script>
+function rows(){return Array.prototype.slice.call(document.querySelectorAll('.imp-row'));}
+function calc(cost){
+  var p=cost*(1+(parseFloat(document.getElementById('pct').value)||0)/100)+(parseFloat(document.getElementById('fix').value)||0);
+  var m=document.getElementById('rnd').value;
+  if(m==='five')p=Math.ceil(p/0.05-1e-9)*0.05;
+  else if(m==='x99'){var c=Math.ceil(p-1e-9);p=(c-0.01>=p-1e-9)?c-0.01:c+0.99;}
+  return Math.max(p,cost+0.01);
+}
+function prof(r){
+  var c=parseFloat(r.dataset.cost),i=r.querySelector('.pr'),p=parseFloat(i.value),o=r.querySelector('.pf');
+  if(isNaN(p)){o.textContent='';return;}
+  var d=p-c;o.textContent=(d>=0?'profit +$':'loss -$')+Math.abs(d).toFixed(2);o.className='pf '+(d>0?'paid':'failed');
+}
+function recalc(){rows().forEach(function(r){var i=r.querySelector('.pr');if(i.dataset.manual)return;i.value=calc(parseFloat(r.dataset.cost)).toFixed(2);prof(r);});}
+function resetPrices(){rows().forEach(function(r){delete r.querySelector('.pr').dataset.manual;});recalc();}
+function filt(){
+  var q=document.getElementById('q').value.toLowerCase().trim(),st=document.getElementById('instock').checked,
+      mu=document.getElementById('multi').checked,cf=document.getElementById('catf').value;
+  rows().forEach(function(r){
+    r.hidden=(q&&r.dataset.name.indexOf(q)<0)||(st&&+r.dataset.stock<=0)||(mu&&+r.dataset.n<2)||(cf&&r.dataset.cat!==cf);
+  });
+}
+function selShown(on){rows().forEach(function(r){var c=r.querySelector('.pick');if(!r.hidden)c.checked=on;});count();}
+function count(){var n=document.querySelectorAll('.pick:checked').length,b=document.getElementById('go');b.disabled=!n;b.textContent='Add '+n+' product'+(n==1?'':'s');}
+function hideRow(btn,gkey,act){
+  var fd=new FormData();fd.append('gkey',gkey);fd.append('act',act);
+  fetch('{{ url_for("compare_admin.ignore") }}',{method:'POST',body:fd}).then(function(){var r=btn.closest('.imp-row');r.remove();count();});
+}
+recalc();filt();count();
+document.getElementById('imp').addEventListener('submit',function(e){
+  var bad=0;rows().forEach(function(r){var c=r.querySelector('.pick');if(c.checked){var p=parseFloat(r.querySelector('.pr').value);if(!(p>0))bad++;else if(p<=parseFloat(r.dataset.cost))bad+=0.001;}});
+  if(bad>=1){e.preventDefault();alert('Some selected products have no price.');return;}
+  if(bad>0&&!confirm('Some selected products are priced at or below their cost (you would lose money). Add them anyway?'))e.preventDefault();
+});
+</script>
+{% endif %}
+</div>{% endblock %}"""
 
 
 def _ignored(db):
@@ -438,21 +555,23 @@ def pending_groups(db, show_hidden=False, max_age=60):
             linked.add((o["supplier_id"], o["provider_key"]))
     products = db.list_products()
     existing_cats = sorted({(p["category"] or "").strip() for p in products if (p["category"] or "").strip()})
-    have, have_old = set(), set()
-    af = _alias_fn(rules)
+    have = set()
     for p in products:
-        have.add(_skey(sm.parse(p["name"], af)["sig"]))
-        k = _legacy_key(p["name"], rules)
-        if k:
-            have_old.add(k)
+        n = _norm(p["name"], rules)
+        if n[1]:
+            have.add(_gkey(n))
+    merges = _merges(db)
+    for src, m in merges.items():
+        if src in have:
+            have.add(m["to"])
     ignored = _ignored(db)
     groups, skipped, hidden_n = [], 0, 0
-    for g in build_groups(sups, existing_cats, rules, db):
+    for g in build_groups(sups, existing_cats, rules, merges):
         is_linked = any((o["sid"], o["key"]) in linked for o in g["offers"])
-        if is_linked or (g["keys"] & have) or (g["old_keys"] & have_old):
+        if is_linked or g["gkey"] in have:
             skipped += 1
             continue
-        if (g["keys"] | g["old_keys"]) & ignored:
+        if g["gkey"] in ignored:
             hidden_n += 1
             if not show_hidden:
                 continue
@@ -597,7 +716,7 @@ def home():
         flash(e, "err")
     cat_list = sorted({g["category"] for g in groups if g["category"]} | set(existing_cats), key=str.casefold)
     return web.render_str(PAGE, sups=sups, groups=groups, cat_list=cat_list, skipped=skipped,
-                          hidden_n=hidden_n, show_hidden=show_hidden, auto=auto_settings(db),
+                          hidden_n=hidden_n, show_hidden=show_hidden, auto=auto_settings(db), watch=watch_settings(db),
                           aliases_text=db.get_setting("compare_aliases", ""))
 
 
@@ -855,58 +974,27 @@ def keep_run():
 #  /compare/view  -> one product: all suppliers sorted by cost, stock, status, your price + profit,
 #                    previous / next buttons to move through products without going back to the list
 # =====================================================================================================
-def _median(v):
-    v = sorted(v)
-    n = len(v)
-    return 0.0 if not n else (v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2.0)
-
-
-def _hay(g, rules):
-    """Search text of a group: every supplier name + category + brand, written both as typed and with aliases applied."""
-    text = " ".join([o["name"] for o in g["offers"]] + [g["category"] or "", brand_label(g["name"], rules)])
-    canon = _apply_aliases(text, rules)
-    words = set(re.findall(r"[a-z0-9]+", text.casefold())) | set(re.findall(r"[a-z0-9]+", canon))
-    return words, _squash(text) + "|" + _squash(canon)
-
-
-def insights(g):
-    """Plain-language warnings about one group: -> [(level, text)]  level = 'warn' | 'info'"""
-    out = []
-    live = sorted([o for o in g["offers"] if o["stock"] > 0], key=lambda o: o["cost"])
-    if len(live) >= 2:
-        best, rest = live[0], live[1:]
-        med = _median([o["cost"] for o in rest])
-        if med > 0 and best["cost"] < 0.5 * med:
-            out.append(("warn", f"{best['sname']} is {int(round((1 - best['cost'] / med) * 100))}% cheaper than the "
-                                f"others. Check it is really the same plan and delivery type before relying on it."))
-        elif best["stock"] <= 3:
-            nxt = live[1]
-            out.append(("warn", f"Only {best['stock']} left at {best['sname']}. If it runs out the bot switches to "
-                                f"{nxt['sname']} at ${nxt['cost']:.2f} (+${nxt['cost'] - best['cost']:.2f})."))
-    elif len(live) == 1:
-        out.append(("info", f"Only {live[0]['sname']} has this in stock, so there is no fallback."))
-    if any(o["how"] == "ai" for o in g["offers"]):
-        out.append(("info", "Some offers were matched by the AI (names differ). Tap a supplier name to double check."))
-    elif any(o["how"] == "similar" for o in g["offers"]):
-        out.append(("info", "Some supplier names are written a little differently. They were judged the same product."))
-    return out
-
-
 def cmp_groups(db, max_age=60):
     """-> (groups, errs, n_suppliers). Every product that any supplier sells, offers sorted by cost."""
     sups, errs = db.catalog_options(max_age=max_age)
     rules = make_rules(db.get_setting("compare_aliases", ""))
-    af = _alias_fn(rules)
     products = db.list_products()
     cats = sorted({(p["category"] or "").strip() for p in products if (p["category"] or "").strip()})
-    shop, shop_old = {}, {}
+    shop = {}
     for p in products:
-        shop.setdefault(_skey(sm.parse(p["name"], af)["sig"]), p)
-        k = _legacy_key(p["name"], rules)
-        if k:
-            shop_old.setdefault(k, p)
+        n = _norm(p["name"], rules)
+        if n[1]:
+            shop.setdefault(_gkey(n), p)
+    merges = _merges(db)
+    for src, m in merges.items():
+        if src in shop:
+            shop.setdefault(m["to"], shop[src])
+    try:
+        srcs = db.sources_by_product()
+    except Exception:
+        srcs = {}
     out = []
-    for g in build_groups(sups, cats, rules, db):
+    for g in build_groups(sups, cats, rules, merges):
         offs = g["offers"]
         live = [o for o in offs if o["stock"] > 0]
         g["n_sup"] = len(offs)
@@ -914,43 +1002,27 @@ def cmp_groups(db, max_age=60):
         g["units"] = sum(o["stock"] for o in offs)
         g["low"] = g["best"]["cost"]
         g["save"] = (max(o["cost"] for o in live) - g["best"]["cost"]) if live else 0.0
-        g["shop"] = next((shop[k] for k in g["keys"] if k in shop), None) \
-            or next((shop_old[k] for k in g["old_keys"] if k in shop_old), None)
-        g["hay_words"], g["hay"] = _hay(g, rules)
-        g["insights"] = insights(g)
-        d = g["p"]["dur"]
-        g["pm"] = (g["low"] / (d / 30.0)) if (g["instock"] and isinstance(d, int) and d >= 28) else None
+        g["shop"] = shop.get(g["gkey"])
+        sp = g["shop"]
+        d = srcs.get(sp["id"]) if sp is not None else None
+        g["mode"] = d["mode"] if d else None
+        g["linked_n"] = len(d["offers"]) if d else 0
+        g["loss"] = bool(sp is not None and g["instock"] and float(sp["price"] or 0) <= g["low"])
+        g["todo"] = bool(sp is not None and not (d and d["mode"] == "cheapest" and g["linked_n"] >= g["n_sup"]))
         out.append(g)
     out.sort(key=lambda g: (-g["n_sup"], g["name"].casefold()))
     return out, errs, len(sups)
 
 
-def _search_ok(g, q, rules):
-    """Typo- and alias-tolerant search: 'chat gpt', 'yt premium', 'netfilx', 'prime' all find their product."""
+def _cmp_filter(groups, q, cat, multi=False):
     q = (q or "").strip().casefold()
-    if not q:
-        return True
-    sq, sc = _squash(q), _squash(_apply_aliases(q, rules))
-    if sq in g["hay"] or (sc and sc in g["hay"]):
-        return True
-    for tok in re.findall(r"[a-z0-9]+", q):
-        if tok in g["hay"]:
-            continue
-        if len(tok) >= 4 and any(SequenceMatcher(None, tok, w).ratio() >= 0.8 for w in g["hay_words"]):
-            continue
-        return False
-    return True
-
-
-def _cmp_filter(groups, q, cat, multi=False, rules=None):
-    rules = _rules(rules)
     res = []
     for g in groups:
         if cat and (g["category"] or "").split(" / ")[0] != cat:
             continue
         if multi and g["n_sup"] < 2:
             continue
-        if not _search_ok(g, q, rules):
+        if q and q not in g["name"].casefold() and not any(q in o["name"].casefold() for o in g["offers"]):
             continue
         res.append(g)
     return res
@@ -967,10 +1039,12 @@ def pick():
     from flask import session
     q, cat, m = _cmp_args()
     groups, errs, n_sup = cmp_groups(web.db)
-    rules = make_rules(web.db.get_setting("compare_aliases", ""))
     for e in errs:
         flash(e, "err")
-    multi = not m and not q
+    flt = (request.args.get("f") or "")[:8]
+    n_loss = sum(1 for g in groups if g["loss"])
+    n_todo = sum(1 for g in groups if g["todo"])
+    multi = not m and not q and not flt
     n_multi = sum(1 for g in groups if g["n_sup"] >= 2)
     base = [g for g in groups if g["n_sup"] >= 2] if multi else groups
     cats = {}
@@ -979,7 +1053,12 @@ def pick():
         cats[top] = cats.get(top, 0) + 1
     by = {g["gkey"]: g for g in groups}
     recent = [by[k] for k in (session.get("cmp_recent") or []) if k in by] if not q and not cat else []
-    return web.render_str(PICK_PAGE, groups=_cmp_filter(groups, q, cat, multi=multi, rules=rules), total=len(groups), n_multi=n_multi,
+    shown = _cmp_filter(groups, q, cat, multi=multi)
+    if flt == "loss":
+        shown = [g for g in shown if g["loss"]]
+    elif flt == "todo":
+        shown = [g for g in shown if g["todo"]]
+    return web.render_str(PICK_PAGE, groups=shown, flt=flt, n_loss=n_loss, n_todo=n_todo, total=len(groups), n_multi=n_multi,
                           n_base=len(base), m=m, mm=("all" if m else None), n_sup=n_sup,
                           cats=sorted(cats.items(), key=lambda kv: kv[0].casefold()), q=q, cat=cat, recent=recent)
 
@@ -988,14 +1067,12 @@ def pick():
 def view():
     import web
     from flask import session
-    db = web.db
     q, cat, m = _cmp_args()
     key = (request.args.get("g") or "")[:300]
-    groups, errs, n_sup = cmp_groups(db, max_age=0 if request.args.get("refresh") == "1" else 60)
-    rules = make_rules(db.get_setting("compare_aliases", ""))
+    groups, errs, n_sup = cmp_groups(web.db, max_age=0 if request.args.get("refresh") == "1" else 60)
     for e in errs:
         flash(e, "err")
-    seq = _cmp_filter(groups, q, cat, multi=(not m and not q), rules=rules)
+    seq = _cmp_filter(groups, q, cat, multi=(not m and not q))
     if not any(g["gkey"] == key for g in seq):
         seq, q, cat = groups, "", ""
     idx = next((i for i, g in enumerate(seq) if g["gkey"] == key), None)
@@ -1018,38 +1095,186 @@ def view():
     sp = g["shop"]
     your_price = float(sp["price"]) if sp is not None else None
     profit = (your_price - g["low"]) if (your_price is not None and g["instock"]) else None
-
-    # same plan, other durations: which one is the best value per month?
-    sibs = [x for x in groups if x["fam"] == g["fam"] and x["gkey"] != g["gkey"] and x["instock"]
-            and x["p"]["dur"] != g["p"]["dur"]]
-    if sibs and g["instock"]:
-        sibs.append(g)
-    else:
-        sibs = []
-    sibs.sort(key=lambda x: x["p"]["dur"] if isinstance(x["p"]["dur"], int) else 10 ** 9)
-    best_pm = min((x["pm"] for x in sibs if x["pm"] is not None), default=None)
-    related = [dict(gkey=x["gkey"], label=sm.dur_label(x["p"]["dur"]) or "-", low=x["low"], sname=x["best"]["sname"],
-                    pm=x["pm"], best=(best_pm is not None and x["pm"] is not None and abs(x["pm"] - best_pm) < 1e-9),
-                    me=(x["gkey"] == g["gkey"])) for x in sibs]
-
-    # price advice from your own auto-mode markup
-    st = auto_settings(db)
-    suggest = price_for(g["low"], st["pct"], st["fix"], st["rnd"]) if g["instock"] and g["low"] > 0 else None
-    margin = None
-    if your_price and profit is not None:
-        margin = int(round(profit * 100 / your_price))
-    notes = list(g["insights"])
-    if profit is not None and profit < 0:
-        notes.insert(0, ("warn", f"You sell below the cheapest cost (loss ${-profit:.2f} per sale). Raise the price"
-                                 + (f" to about ${suggest:.2f}." if suggest else ".")))
-    elif margin is not None and margin < 15:
-        notes.insert(0, ("warn", f"Thin margin: only {margin}% profit at the cheapest supplier."
-                                 + (f" Your auto markup would price it at ${suggest:.2f}." if suggest else "")))
-    return web.render_str(VIEW_PAGE, g=g, rows=rows, idx=idx, total=len(seq), q=q, cat=cat, m=m, mm=("all" if m else None),
+    sims = similar_groups(g, groups)
+    merged = [{"src": k, "name": v.get("name") or k} for k, v in _merges(web.db).items() if v["to"] == key]
+    au = auto_settings(web.db)
+    sugg = price_for(g["low"], au["pct"], au["fix"], au["rnd"]) if g["instock"] else 0.0
+    return web.render_str(VIEW_PAGE, g=g, rows=rows, idx=idx, sims=sims, merged=merged, sugg=sugg, auto=au, total=len(seq), q=q, cat=cat, m=m, mm=("all" if m else None),
                           prev_g=seq[idx - 1] if idx > 0 else None,
                           next_g=seq[idx + 1] if idx + 1 < len(seq) else None,
-                          your_price=your_price, profit=profit, n_sup=n_sup, notes=notes, related=related,
-                          suggest=suggest, margin=margin)
+                          your_price=your_price, profit=profit, n_sup=n_sup)
+
+
+@bp.route("/compare/merge", methods=["POST"])
+def merge():
+    import web
+    db = web.db
+    f = request.form
+    src, dst = (f.get("src") or "")[:300], (f.get("dst") or "")[:300]
+    cur = _merges(db)
+    if f.get("act") == "remove":
+        cur.pop(src, None)
+        flash("Unmerged.")
+    elif src and dst and src != dst:
+        for k, m in cur.items():              # no chains: anything that pointed at src now points at dst
+            if m["to"] == src:
+                m["to"] = dst
+        cur[src] = {"to": cur.get(dst, {}).get("to", dst), "name": (f.get("name") or "")[:120]}
+        flash("Merged. Both products now compare together, and the cheapest supplier with stock is used for both.")
+    db.set_setting(MERGE_KEY, json.dumps(cur))
+    return redirect(url_for("compare_admin.view", g=dst) if dst else url_for("compare_admin.pick"))
+
+
+def _group_by_key(db, gkey):
+    groups, _e, _n = cmp_groups(db, max_age=120)
+    return next((g for g in groups if g["gkey"] == gkey), None)
+
+
+@bp.route("/compare/smartlink", methods=["POST"])
+def smartlink():
+    """Link EVERY supplier that sells this product to your shop product and use the cheapest one with stock."""
+    import web
+    db = web.db
+    gkey = (request.form.get("gkey") or "")[:300]
+    g = _group_by_key(db, gkey)
+    if not g or g["shop"] is None:
+        flash("Product not found.", "err")
+        return redirect(url_for("compare_admin.pick"))
+    pid, linked, bad = g["shop"]["id"], 0, []
+    for o in g["offers"]:
+        try:
+            db.add_source(pid, o["sid"], o["key"])
+            linked += 1
+        except Exception as e:
+            bad.append(f"{o['sname']}: {str(e)[:90]}")
+    if linked:
+        try:
+            db.set_source_mode(pid, "cheapest", g["best"]["sid"], True)
+            flash(f"{linked} supplier(s) linked. The bot now buys from the cheapest one with stock.")
+        except Exception as e:
+            flash(str(e)[:120], "err")
+    for b in bad[:4]:
+        flash(b, "err")
+    return redirect(url_for("compare_admin.view", g=gkey))
+
+
+@bp.route("/compare/setprice", methods=["POST"])
+def setprice():
+    import web
+    db = web.db
+    gkey = (request.form.get("gkey") or "")[:300]
+    g = _group_by_key(db, gkey)
+    try:
+        price = round(float(request.form.get("price", "")), 2)
+    except ValueError:
+        price = 0
+    if not g or g["shop"] is None or price <= 0:
+        flash("Enter a valid price.", "err")
+        return redirect(url_for("compare_admin.view", g=gkey))
+    db.update_product(g["shop"]["id"], price=price, cost=round(g["low"], 2))
+    msg = f"Price set to ${price:.2f} (cost ${g['low']:.2f}, profit ${price - g['low']:.2f})."
+    if price <= g["low"]:
+        flash(msg + " That is at or below cost!", "err")
+    else:
+        flash(msg)
+    return redirect(url_for("compare_admin.view", g=gkey))
+
+
+# =====================================================================================================
+#  PRICE WATCH + SCHEDULER (called by the bot every 5 minutes, see compare_job in bot.py)
+#  * runs Auto mode every 10 minutes when it is ON (before, nothing started it by itself)
+#  * remembers the cheapest supplier cost of every product you sell; tells the admins when it changes
+#  * optional: keeps your profit the same by moving your price with the cost (never below cost)
+# =====================================================================================================
+WATCH_KEY = "price_watch_last"
+
+
+def watch_settings(db):
+    return {"on": str(db.get_setting("price_watch_on", "1")) == "1",
+            "auto": str(db.get_setting("price_watch_auto", "0")) == "1"}
+
+
+def watch_prices(db):
+    """-> list of HTML message lines. The first run only learns the current costs."""
+    import html as _h
+    st = watch_settings(db)
+    groups, _e, _n = cmp_groups(db, max_age=60)
+    try:
+        last = json.loads(db.get_setting(WATCH_KEY, "{}") or "{}")
+    except (ValueError, TypeError):
+        last = {}
+    first = not last
+    now, msgs = {}, []
+    for g in groups:
+        sp = g["shop"]
+        if sp is None:
+            continue
+        pid = str(sp["id"])
+        cost, live = round(g["low"], 2), bool(g["instock"])
+        prev = last.get(pid)
+        now[pid] = {"c": cost if live else (prev or {}).get("c", cost), "s": live}
+        if first or prev is None:
+            continue
+        name = _h.escape(sp["name"] or "")
+        price = float(sp["price"] or 0)
+        if prev.get("s") and not live:
+            msgs.append(f"🔴 <b>{name}</b>: no supplier has stock now.")
+        elif live and not prev.get("s"):
+            msgs.append(f"🟢 <b>{name}</b>: back in stock at ${cost:.2f} ({_h.escape(g['best']['sname'])}).")
+        elif live and abs(cost - float(prev.get("c") or 0)) >= 0.01:
+            old = float(prev.get("c") or 0)
+            line = f"{'📈' if cost > old else '📉'} <b>{name}</b>: cost ${old:.2f} → ${cost:.2f} ({_h.escape(g['best']['sname'])})."
+            if st["auto"] and price > 0:
+                new = round(max(price + (cost - old), cost + 0.01), 2)
+                if abs(new - price) >= 0.01 and db.update_product(sp["id"], price=new, cost=cost):
+                    line += f" Your price ${price:.2f} → ${new:.2f}."
+                    price = new
+            if price <= cost:
+                line += f" ⚠ Your price ${price:.2f} is at or below cost!"
+            msgs.append(line)
+    if now:
+        db.set_setting(WATCH_KEY, json.dumps(now))
+    return msgs
+
+
+def scheduled(db):
+    """One tick of the smart job. -> list of HTML lines for the admins (may be empty)."""
+    import html as _h
+    import time as _t
+    msgs = []
+    st = auto_settings(db)
+    if st["on"]:
+        try:
+            last = float(db.get_setting("auto_import_ts", "0") or 0)
+        except ValueError:
+            last = 0
+        if _t.time() - last >= 540:
+            db.set_setting("auto_import_ts", str(_t.time()))
+            r = auto_import(db)
+            if r["added"]:
+                shown = ", ".join(_h.escape(n) for n in r["names"][:6]) + (f" +{len(r['names']) - 6} more" if len(r["names"]) > 6 else "")
+                msgs.append(f"🆕 Auto mode added {r['added']} product(s): {shown}"
+                            + (f" ({r['below_cost']} at or below cost)" if r["below_cost"] else ""))
+    if watch_settings(db)["on"]:
+        w = watch_prices(db)
+        try:
+            import alerts_admin
+            for m in w:
+                alerts_admin.log_event(db, re.sub(r"<[^>]+>", "", m))
+        except Exception:
+            pass
+        msgs += w
+    return msgs
+
+
+@bp.route("/compare/watch", methods=["POST"])
+def watch_save():
+    import web
+    f = request.form
+    web.db.set_setting("price_watch_on", "1" if f.get("on") else "0")
+    web.db.set_setting("price_watch_auto", "1" if f.get("auto") else "0")
+    flash("Price watch saved.")
+    return redirect(url_for("compare_admin.home"))
 
 
 _CMP_CSS = r"""<style>
@@ -1088,15 +1313,6 @@ _CMP_CSS = r"""<style>
 .cp-s i{font-style:normal;font-size:11px;color:var(--fail)}
 .cp-foot{margin-top:8px;font-size:12px}
 .cp-wrap{width:100%;min-width:0;max-width:100%;overflow-x:clip}
-.cp-tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
-.cp-tag{display:inline-block;padding:2px 9px;border-radius:999px;border:1px solid var(--line2);font-size:11px;font-weight:600;color:var(--muted);background:var(--surface)}
-.cp-tag.how{border-color:var(--fail);color:var(--fail)}
-.cp-note{display:flex;gap:10px;align-items:flex-start;font-size:13px}
-.cp-note.warn{border-left:4px solid var(--fail)}
-.cp-note.info{border-left:4px solid var(--line2)}
-.cp-flag{color:var(--fail);font-weight:700;margin-left:6px}
-.cp-rel{display:flex;align-items:center;gap:10px;padding:10px 16px;border-bottom:1px solid var(--line);text-decoration:none;color:var(--ink)}
-.cp-rel.me{background:var(--accent-soft)}
 </style>"""
 
 PICK_PAGE = r"""{% extends 'base.html' %}{% block body %}
@@ -1107,7 +1323,7 @@ PICK_PAGE = r"""{% extends 'base.html' %}{% block body %}
 <form method="get" action="{{ url_for('compare_admin.pick') }}" class="card">
 <input type="search" name="q" value="{{ q }}" placeholder="Search product, e.g. Canva" aria-label="Search product" autofocus>
 {% if cat %}<input type="hidden" name="cat" value="{{ cat }}">{% endif %}
-<div class="cp-chips" style="margin-top:10px"><a class="cp-chip {{ 'on' if not m }}" href="{{ url_for('compare_admin.pick', q=q, cat=cat) }}">2+ suppliers {{ n_multi }}</a><a class="cp-chip {{ 'on' if m }}" href="{{ url_for('compare_admin.pick', q=q, cat=cat, m='all') }}">All products {{ total }}</a></div>
+<div class="cp-chips" style="margin-top:10px">{% if n_loss %}<a class="cp-chip {{ 'on' if flt == 'loss' }}" href="{{ url_for('compare_admin.pick', f='loss') }}">⚠ Losing money {{ n_loss }}</a>{% endif %}{% if n_todo %}<a class="cp-chip {{ 'on' if flt == 'todo' }}" href="{{ url_for('compare_admin.pick', f='todo') }}">Not on cheapest {{ n_todo }}</a>{% endif %}<a class="cp-chip {{ 'on' if not m }}" href="{{ url_for('compare_admin.pick', q=q, cat=cat) }}">2+ suppliers {{ n_multi }}</a><a class="cp-chip {{ 'on' if m }}" href="{{ url_for('compare_admin.pick', q=q, cat=cat, m='all') }}">All products {{ total }}</a></div>
 <div class="cp-chips" style="margin-top:6px">
 <a class="cp-chip {{ 'on' if not cat }}" href="{{ url_for('compare_admin.pick', q=q, m=mm) }}">All {{ n_base }}</a>
 {% for c, n in cats %}<a class="cp-chip {{ 'on' if c == cat }}" href="{{ url_for('compare_admin.pick', cat=c, q=q, m=mm) }}">{{ c }} {{ n }}</a>{% endfor %}
@@ -1115,14 +1331,14 @@ PICK_PAGE = r"""{% extends 'base.html' %}{% block body %}
 
 <div class="cp-lab" style="padding:4px 4px 8px">{{ 'RESULTS' if (q or cat) else 'PRODUCTS' }} · {{ groups|length }} · tap a product for details</div>
 <div class="card cp-list">
-{% for g in groups %}<a class="cp-card" data-n="{{ g.hay }}" href="{{ url_for('compare_admin.view', g=g.gkey, q=q, cat=cat, m=mm) }}">
-<div class="cp-top"><div class="cp-main"><b>{{ g.name }}{% if g.insights and g.insights[0][0] == 'warn' %}<span class="cp-flag" title="{{ g.insights[0][1] }}">&#9888;</span>{% endif %}</b><span class="muted">{{ g.category }}{% if g.labels %} &middot; {{ g.labels|join(' &middot; ') }}{% endif %}</span></div>
+{% for g in groups %}<a class="cp-card" data-n="{{ g.name|lower }}" href="{{ url_for('compare_admin.view', g=g.gkey, q=q, cat=cat, m=mm) }}">
+<div class="cp-top"><div class="cp-main"><b>{{ g.name }}</b><span class="muted">{{ g.category }}</span></div>
 <div class="cp-price">{% if g.instock %}<span class="cp-best">${{ '%.2f'|format(g.low) }}</span><span class="muted">{{ g.best.sname }}</span>{% else %}<span class="failed">No stock</span>{% endif %}</div></div>
 <div class="cp-chipsrow">{% for o in g.offers %}<span class="cp-s {{ 'best' if (g.instock and o is sameas g.best) }} {{ 'out' if o.stock <= 0 }}"><span class="cp-sn">{{ o.sname }}</span><b>${{ '%.2f'|format(o.cost) }}</b>{% if o.stock <= 0 %}<i>out</i>{% else %}<em>{{ o.stock }}</em>{% endif %}</span>{% endfor %}</div>
-{% if g.instock and g.save > 0 %}<div class="muted cp-foot">Cheapest saves ${{ '%.2f'|format(g.save) }} vs the most expensive{% if g.shop %} · your price ${{ '%.2f'|format(g.shop.price|float) }} · profit ${{ '%.2f'|format(g.shop.price|float - g.low) }}{% endif %}</div>{% elif g.shop and g.instock %}<div class="muted cp-foot">Your price ${{ '%.2f'|format(g.shop.price|float) }} · profit ${{ '%.2f'|format(g.shop.price|float - g.low) }}</div>{% endif %}
+{% if g.loss %}<div class="failed cp-foot"><b>Losing money:</b> your price ${{ '%.2f'|format(g.shop.price|float) }} is not above the cheapest cost.</div>{% endif %}{% if g.instock and g.save > 0 %}<div class="muted cp-foot">Cheapest saves ${{ '%.2f'|format(g.save) }} vs the most expensive{% if g.shop %} · your price ${{ '%.2f'|format(g.shop.price|float) }} · profit ${{ '%.2f'|format(g.shop.price|float - g.low) }}{% endif %}</div>{% elif g.shop and g.instock %}<div class="muted cp-foot">Your price ${{ '%.2f'|format(g.shop.price|float) }} · profit ${{ '%.2f'|format(g.shop.price|float - g.low) }}</div>{% endif %}
 </a>
 {% else %}<p class="muted" style="padding:16px">No product found. Try another word or <a href="{{ url_for('compare_admin.pick') }}">clear the search</a>.</p>{% endfor %}</div>
-<script>(function(){var i=document.querySelector('input[name=q]');if(!i)return;i.addEventListener('input',function(){var v=i.value.toLowerCase().replace(/[^a-z0-9]/g,''),r=document.querySelector('.cp-recent');if(r)r.style.display=v?'none':'';document.querySelectorAll('[data-n]').forEach(function(x){x.style.display=x.getAttribute('data-n').indexOf(v)>-1?'':'none'})})})();</script>
+<script>(function(){var i=document.querySelector('input[name=q]');if(!i)return;i.addEventListener('input',function(){var v=i.value.toLowerCase().trim(),r=document.querySelector('.cp-recent');if(r)r.style.display=v?'none':'';document.querySelectorAll('[data-n]').forEach(function(x){x.style.display=x.getAttribute('data-n').indexOf(v)>-1?'':'none'})})})();</script>
 </div>{% endblock %}"""
 
 VIEW_PAGE = r"""{% extends 'base.html' %}{% block body %}
@@ -1131,22 +1347,30 @@ VIEW_PAGE = r"""{% extends 'base.html' %}{% block body %}
 <p><a class="muted" href="{{ url_for('compare_admin.pick', q=q, cat=cat, m=mm) }}">&larr; All products</a></p>
 <div class="card" style="display:flex;align-items:center;gap:10px">
 {% if prev_g %}<a class="cp-nav" aria-label="Previous product" href="{{ url_for('compare_admin.view', g=prev_g.gkey, q=q, cat=cat, m=mm) }}">&lsaquo;</a>{% else %}<span class="cp-nav off" aria-hidden="true">&lsaquo;</span>{% endif %}
-<div style="flex:1;text-align:center"><div class="muted">Product {{ idx + 1 }} of {{ total }}</div><h3 style="margin:2px 0">{{ g.name }}</h3><span class="muted">{{ g.category }} · {{ g.n_sup }} {{ 'supplier' if g.n_sup == 1 else 'suppliers' }} · stock {{ g.units }}</span>{% if g.labels %}<div class="cp-tags" style="justify-content:center">{% for l in g.labels %}<span class="cp-tag">{{ l }}</span>{% endfor %}</div>{% endif %}</div>
+<div style="flex:1;text-align:center"><div class="muted">Product {{ idx + 1 }} of {{ total }}</div><h3 style="margin:2px 0">{{ g.name }}</h3><span class="muted">{{ g.category }} · {{ g.n_sup }} {{ 'supplier' if g.n_sup == 1 else 'suppliers' }} · stock {{ g.units }}</span></div>
 {% if next_g %}<a class="cp-nav" aria-label="Next product" href="{{ url_for('compare_admin.view', g=next_g.gkey, q=q, cat=cat, m=mm) }}">&rsaquo;</a>{% else %}<span class="cp-nav off" aria-hidden="true">&rsaquo;</span>{% endif %}
 </div>
+{% if g.shop is not none %}<div class="card"><div class="muted">YOUR PRODUCT · {{ g.shop.name }}</div>
+<p style="margin:6px 0">Linked suppliers: <b>{{ g.linked_n }} of {{ g.n_sup }}</b> · mode: <b>{{ 'Cheapest + fallback' if g.mode == 'cheapest' else 'Manual' if g.mode else 'Not linked' }}</b></p>
+<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+{% if g.todo %}<form method="post" action="{{ url_for('compare_admin.smartlink') }}"><input type="hidden" name="gkey" value="{{ g.gkey }}"><button type="submit" class="green sm">Link all suppliers + use cheapest</button></form>{% endif %}
+{% if g.instock %}<form method="post" action="{{ url_for('compare_admin.setprice') }}" style="display:flex;gap:6px;align-items:center"><input type="hidden" name="gkey" value="{{ g.gkey }}"><span class="muted">Price $</span><input name="price" type="number" step="0.01" min="0.01" value="{{ '%.2f'|format(sugg) }}" style="max-width:90px"><button type="submit" class="sm">Set price</button></form>{% endif %}</div>
+{% if g.instock %}<p class="muted" style="margin:6px 0 0">Suggested ${{ '%.2f'|format(sugg) }} = cheapest cost + your auto-mode markup ({{ '%.0f'|format(auto.pct) }}%). Profit at that price: ${{ '%.2f'|format(sugg - g.low) }}. Setting the price also saves the cost for your profit report.</p>{% endif %}</div>{% endif %}
 {% if g.instock %}
 <div class="card"><div class="muted">CHEAPEST IN STOCK</div>
 <h2 style="margin:4px 0">${{ '%.2f'|format(g.low) }} <span style="font-size:15px;font-weight:600">{{ g.best.sname }}</span></h2>
-<p class="muted" style="margin:0">Saves ${{ '%.2f'|format(g.save) }} vs the most expensive supplier that has stock.{% if your_price is not none %} Your price ${{ '%.2f'|format(your_price) }} &middot; profit <b class="{{ 'paid' if profit >= 0 else 'failed' }}">${{ '%.2f'|format(profit) }}</b>.{% else %} This product is not in your shop yet.{% endif %}</p>{% if suggest and your_price is none %}<p class="muted" style="margin:8px 0 0">Suggested price with your auto markup: <b>${{ '%.2f'|format(suggest) }}</b></p>{% endif %}</div>
+<p class="muted" style="margin:0">Saves ${{ '%.2f'|format(g.save) }} vs the most expensive supplier that has stock.{% if your_price is not none %} Your price ${{ '%.2f'|format(your_price) }} &middot; profit <b class="{{ 'paid' if profit >= 0 else 'failed' }}">${{ '%.2f'|format(profit) }}</b>.{% else %} This product is not in your shop yet.{% endif %}</p></div>
 {% else %}<div class="card"><b class="failed">No supplier has this product in stock right now.</b></div>{% endif %}
-{% for lv, t in notes %}<div class="card cp-note {{ lv }}"><span>{% if lv == 'warn' %}&#9888;{% else %}&#8505;{% endif %}</span><span>{{ t }}</span></div>{% endfor %}
 <div class="card cp-list"><div class="cp-lab">ALL SUPPLIERS · SORTED BY COST</div>
 {% for o in rows %}<div class="cp-off {{ 'best' if o.status == 'Active' }}"><span class="cp-rank">{{ loop.index }}</span>
-<div style="flex:1;min-width:0"><b>{{ o.sname }}</b><span class="muted" style="display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ o.name }}</span>{% if o.labels or o.how != 'exact' %}<div class="cp-tags">{% for l in o.labels %}<span class="cp-tag">{{ l }}</span>{% endfor %}{% if o.how == 'ai' %}<span class="cp-tag how">AI matched</span>{% elif o.how == 'similar' %}<span class="cp-tag how">similar name</span>{% endif %}</div>{% endif %}<div class="cp-bar"><i style="width:{{ o.w }}%"></i></div></div>
+<div style="flex:1;min-width:0"><b>{{ o.sname }}</b><span class="muted" style="display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ o.name }}</span><div class="cp-bar"><i style="width:{{ o.w }}%"></i></div></div>
 <div style="text-align:right"><b {% if o.stock <= 0 %}style="text-decoration:line-through"{% endif %}>${{ '%.2f'|format(o.cost) }}</b><br>{% if o.stock <= 0 %}<span class="cp-st failed">Out of stock</span>{% else %}<span class="muted">Stock {{ o.stock }}</span>{% endif %}<br><span class="cp-st {{ 'paid' if o.status == 'Active' else 'muted' }}">{{ o.status }}</span></div></div>
 {% endfor %}</div>
-{% if related %}<div class="card cp-list"><div class="cp-lab">SAME PLAN · OTHER DURATIONS · PER MONTH</div>
-{% for r in related %}<a class="cp-rel {{ 'me' if r.me }}" href="{{ url_for('compare_admin.view', g=r.gkey, q=q, cat=cat, m=mm) }}"><div style="flex:1;min-width:0"><b>{{ r.label }}</b><span class="muted" style="display:block">{{ r.sname }}</span></div><div style="text-align:right"><b>${{ '%.2f'|format(r.low) }}</b>{% if r.pm is not none %}<br><span class="{{ 'paid' if r.best else 'muted' }}">${{ '%.2f'|format(r.pm) }}/mo{% if r.best %} &middot; best value{% endif %}</span>{% endif %}</div></a>{% endfor %}</div>{% endif %}
+{% if sims %}<div class="card cp-list"><div class="cp-lab">MAYBE THE SAME PRODUCT? · MERGE TO COMPARE TOGETHER</div>
+{% for s in sims %}<div class="cp-off"><div class="cp-main"><b>{{ s.name }}</b><span class="muted" style="display:block">{% for o in s.offers %}{{ o.sname }} ${{ '%.2f'|format(o.cost) }}{% if not loop.last %} · {% endif %}{% endfor %}</span><span class="muted" style="display:block;font-size:12px">different words: {{ s.diff or '-' }}</span></div>
+<form method="post" action="{{ url_for('compare_admin.merge') }}"><input type="hidden" name="src" value="{{ s.gkey }}"><input type="hidden" name="dst" value="{{ g.gkey }}"><input type="hidden" name="name" value="{{ s.name }}"><button class="sm" type="submit">Merge</button></form></div>{% endfor %}</div>{% endif %}
+{% if merged %}<div class="card cp-list"><div class="cp-lab">MERGED INTO THIS PRODUCT</div>
+{% for m in merged %}<div class="cp-off"><div class="cp-main">{{ m.name }}</div><form method="post" action="{{ url_for('compare_admin.merge') }}"><input type="hidden" name="src" value="{{ m.src }}"><input type="hidden" name="dst" value="{{ g.gkey }}"><input type="hidden" name="act" value="remove"><button class="grey sm" type="submit">Unmerge</button></form></div>{% endfor %}</div>{% endif %}
 <div style="display:flex;gap:10px;flex-wrap:wrap">
 <a href="{{ url_for('compare_admin.view', g=g.gkey, q=q, cat=cat, m=mm, refresh=1) }}"><button type="button" class="grey">Refresh prices</button></a>
 {% if your_price is none %}<a href="{{ url_for('compare_admin.home') }}"><button type="button">Import this product</button></a>{% endif %}

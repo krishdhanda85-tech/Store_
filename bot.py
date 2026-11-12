@@ -2954,6 +2954,18 @@ async def provider_job(context: ContextTypes.DEFAULT_TYPE):
     seen.intersection_update(alerts)     # a fixed problem can alert again if it returns
 
 
+async def compare_job(context: ContextTypes.DEFAULT_TYPE):
+    """Every 5 min: Auto mode (adds new supplier products) + price watch (cost changes, stock, losses)."""
+    try:
+        import compare_admin
+        msgs = await asyncio.to_thread(compare_admin.scheduled, db)
+    except Exception as e:
+        log.warning("compare job failed: %s", e)
+        return
+    if msgs:
+        await notify_admins(context, "\n".join(msgs[:12]) + (f"\n+{len(msgs) - 12} more (see Activity log)" if len(msgs) > 12 else ""))
+
+
 # ---------------------------------------------------------------- one bot per seller
 async def _bind(update, context):
     """Runs first for every update: point `db`, `binance`, owner id... at THIS bot's shop."""
@@ -3793,6 +3805,7 @@ def build_application(tenant):
     app.job_queue.run_repeating(_in_shop(outbox_job), interval=5, first=5)
     app.job_queue.run_repeating(_in_shop(growth_bot.growth_job), interval=120, first=45)
     app.job_queue.run_repeating(_in_shop(provider_job), interval=120, first=15)
+    app.job_queue.run_repeating(_in_shop(compare_job), interval=300, first=90)
     app.job_queue.run_repeating(_in_shop(backup_job), interval=86400, first=600)
     app.job_queue.run_repeating(_in_shop(lowstock_job), interval=1800, first=120)
     app.job_queue.run_repeating(_in_shop(fampay_job), interval=45, first=30)
