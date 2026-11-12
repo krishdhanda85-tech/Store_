@@ -1154,7 +1154,12 @@ def grid_button(uid: int, p, full: bool = False):
     (used inside a category, one button per row, so the plan length e.g. '1 Month' stays visible)."""
     name = (p["name"] or "").strip()
     if full:
-        label = name if len(name) <= 60 else name[:59].rstrip() + "…"
+        try:                                    # inside a category: show the price after the name
+            tail = f" | ${money(db.get_effective_price(uid, p['id'], p['price']))}"
+        except Exception:
+            tail = ""
+        room = 60 - len(tail)
+        label = (name if len(name) <= room else name[:room - 1].rstrip() + "…") + tail
     else:
         label = name if len(name) <= SHORT_NAME else name[:SHORT_NAME - 1].rstrip() + "…"
     icon = product_icon_for(p)
