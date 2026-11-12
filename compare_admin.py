@@ -441,7 +441,7 @@ document.getElementById('imp').addEventListener('submit',function(e){
 });
 </script>
 {% endif %}
-{% endblock %}"""
+</div>{% endblock %}"""
 
 
 def _ignored(db):
@@ -755,7 +755,7 @@ REORG_PAGE = r"""{% extends 'base.html' %}{% block body %}
 {% for r in rows %}<tr><td>{{ r.name }}</td><td class="muted">{{ r.old or '-' }}</td><td><b>{{ r.new }}</b></td></tr>{% endfor %}</table></div>
 {% else %}<div class="card"><p class="muted">All your products already have the right category.</p></div>{% endif %}
 <p><a href="{{ url_for('compare_admin.home') }}" class="muted">Back to Compare</a></p>
-{% endblock %}"""
+</div>{% endblock %}"""
 
 
 def _reorg_rows(db):
@@ -875,7 +875,7 @@ KEEP_PAGE = r"""{% extends 'base.html' %}{% block body %}
 {% if show %}<div class="card"><h3>Will come back</h3><table>{% for p in show %}<tr><td>{{ p.name }}</td></tr>{% endfor %}</table></div>{% endif %}
 {% if create %}<div class="card"><h3>Will be created (link a supplier to them afterwards)</h3><table>{% for p in create %}<tr><td>{{ p.name }}</td><td>${{ p.price }}</td></tr>{% endfor %}</table></div>{% endif %}
 <p><a href="{{ url_for('compare_admin.home') }}" class="muted">Back to Compare</a></p>
-{% endblock %}"""
+</div>{% endblock %}"""
 
 
 @bp.route("/compare/keep")
@@ -918,6 +918,7 @@ def cmp_groups(db, max_age=60):
         live = [o for o in offs if o["stock"] > 0]
         g["n_sup"] = len(offs)
         g["n_live"] = len(live)
+        g["units"] = sum(o["stock"] for o in offs)
         g["low"] = g["best"]["cost"]
         g["save"] = (max(o["cost"] for o in live) - g["best"]["cost"]) if live else 0.0
         g["shop"] = shop.get(g["gkey"])
@@ -926,11 +927,13 @@ def cmp_groups(db, max_age=60):
     return out, errs, len(sups)
 
 
-def _cmp_filter(groups, q, cat):
+def _cmp_filter(groups, q, cat, multi=False):
     q = (q or "").strip().casefold()
     res = []
     for g in groups:
         if cat and (g["category"] or "").split(" / ")[0] != cat:
+            continue
+        if multi and g["n_sup"] < 2:
             continue
         if q and q not in g["name"].casefold() and not any(q in o["name"].casefold() for o in g["offers"]):
             continue
@@ -939,24 +942,29 @@ def _cmp_filter(groups, q, cat):
 
 
 def _cmp_args():
-    return (request.args.get("q") or "").strip()[:80], (request.args.get("cat") or "").strip()[:60]
+    return ((request.args.get("q") or "").strip()[:80], (request.args.get("cat") or "").strip()[:60],
+            request.args.get("m") == "all")
 
 
 @bp.route("/compare/pick")
 def pick():
     import web
     from flask import session
-    q, cat = _cmp_args()
+    q, cat, m = _cmp_args()
     groups, errs, n_sup = cmp_groups(web.db)
     for e in errs:
         flash(e, "err")
+    multi = not m and not q
+    n_multi = sum(1 for g in groups if g["n_sup"] >= 2)
+    base = [g for g in groups if g["n_sup"] >= 2] if multi else groups
     cats = {}
-    for g in groups:
+    for g in base:
         top = (g["category"] or "Other").split(" / ")[0]
         cats[top] = cats.get(top, 0) + 1
     by = {g["gkey"]: g for g in groups}
     recent = [by[k] for k in (session.get("cmp_recent") or []) if k in by] if not q and not cat else []
-    return web.render_str(PICK_PAGE, groups=_cmp_filter(groups, q, cat), total=len(groups), n_sup=n_sup,
+    return web.render_str(PICK_PAGE, groups=_cmp_filter(groups, q, cat, multi=multi), total=len(groups), n_multi=n_multi,
+                          n_base=len(base), m=m, mm=("all" if m else None), n_sup=n_sup,
                           cats=sorted(cats.items(), key=lambda kv: kv[0].casefold()), q=q, cat=cat, recent=recent)
 
 
@@ -964,12 +972,12 @@ def pick():
 def view():
     import web
     from flask import session
-    q, cat = _cmp_args()
+    q, cat, m = _cmp_args()
     key = (request.args.get("g") or "")[:300]
     groups, errs, n_sup = cmp_groups(web.db, max_age=0 if request.args.get("refresh") == "1" else 60)
     for e in errs:
         flash(e, "err")
-    seq = _cmp_filter(groups, q, cat)
+    seq = _cmp_filter(groups, q, cat, multi=(not m and not q))
     if not any(g["gkey"] == key for g in seq):
         seq, q, cat = groups, "", ""
     idx = next((i for i, g in enumerate(seq) if g["gkey"] == key), None)
@@ -992,7 +1000,7 @@ def view():
     sp = g["shop"]
     your_price = float(sp["price"]) if sp is not None else None
     profit = (your_price - g["low"]) if (your_price is not None and g["instock"]) else None
-    return web.render_str(VIEW_PAGE, g=g, rows=rows, idx=idx, total=len(seq), q=q, cat=cat,
+    return web.render_str(VIEW_PAGE, g=g, rows=rows, idx=idx, total=len(seq), q=q, cat=cat, m=m, mm=("all" if m else None),
                           prev_g=seq[idx - 1] if idx > 0 else None,
                           next_g=seq[idx + 1] if idx + 1 < len(seq) else None,
                           your_price=your_price, profit=profit, n_sup=n_sup)
@@ -1017,34 +1025,40 @@ _CMP_CSS = r"""<style>
 .cp-bar i{display:block;height:8px;border-radius:4px;background:var(--bar)}
 .cp-off.best .cp-bar i{background:var(--accent)}
 .cp-st{font-size:12px;font-weight:700}
+.cp-main{flex:1;min-width:0;overflow-wrap:anywhere}
+.cp-price{flex:none;text-align:right}
+.cp-wrap{width:100%;min-width:0;max-width:100%;overflow-x:clip}
 </style>"""
 
 PICK_PAGE = r"""{% extends 'base.html' %}{% block body %}
 """ + _CMP_CSS + r"""
+<div class="cp-wrap">
 <h2>Compare prices</h2>
 <p class="muted">Pick a product to see every supplier's price side by side. Live from your {{ n_sup }} supplier APIs.</p>
 <form method="get" action="{{ url_for('compare_admin.pick') }}" class="card">
 <input type="search" name="q" value="{{ q }}" placeholder="Search product, e.g. Canva" aria-label="Search product" autofocus>
 {% if cat %}<input type="hidden" name="cat" value="{{ cat }}">{% endif %}
-<div class="cp-chips" style="margin-top:10px">
-<a class="cp-chip {{ 'on' if not cat }}" href="{{ url_for('compare_admin.pick', q=q) }}">All {{ total }}</a>
-{% for c, n in cats %}<a class="cp-chip {{ 'on' if c == cat }}" href="{{ url_for('compare_admin.pick', cat=c, q=q) }}">{{ c }} {{ n }}</a>{% endfor %}
+<div class="cp-chips" style="margin-top:10px"><a class="cp-chip {{ 'on' if not m }}" href="{{ url_for('compare_admin.pick', q=q, cat=cat) }}">2+ suppliers {{ n_multi }}</a><a class="cp-chip {{ 'on' if m }}" href="{{ url_for('compare_admin.pick', q=q, cat=cat, m='all') }}">All products {{ total }}</a></div>
+<div class="cp-chips" style="margin-top:6px">
+<a class="cp-chip {{ 'on' if not cat }}" href="{{ url_for('compare_admin.pick', q=q, m=mm) }}">All {{ n_base }}</a>
+{% for c, n in cats %}<a class="cp-chip {{ 'on' if c == cat }}" href="{{ url_for('compare_admin.pick', cat=c, q=q, m=mm) }}">{{ c }} {{ n }}</a>{% endfor %}
 </div></form>
 {% if recent %}<div class="card cp-list cp-recent"><div class="cp-lab">RECENT</div>
-{% for g in recent %}<a class="cp-row" href="{{ url_for('compare_admin.view', g=g.gkey) }}"><span style="flex:1"><b>{{ g.name }}</b><span class="muted">{{ g.n_sup }} {{ 'supplier' if g.n_sup == 1 else 'suppliers' }} · {{ g.n_live }} in stock</span></span><span style="text-align:right"><span class="muted">from</span><br><b>${{ '%.2f'|format(g.low) }}</b></span></a>{% endfor %}</div>{% endif %}
+{% for g in recent %}<a class="cp-row" href="{{ url_for('compare_admin.view', g=g.gkey) }}"><span class="cp-main"><b>{{ g.name }}</b><span class="muted">{{ g.n_sup }} {{ 'supplier' if g.n_sup == 1 else 'suppliers' }} · stock {{ g.units }}</span></span><span class="cp-price"><span class="muted">from</span><br><b>${{ '%.2f'|format(g.low) }}</b></span></a>{% endfor %}</div>{% endif %}
 <div class="card cp-list"><div class="cp-lab">{{ 'RESULTS' if (q or cat) else 'ALL PRODUCTS' }} · {{ groups|length }}</div>
-{% for g in groups %}<a class="cp-row" data-n="{{ g.name|lower }}" href="{{ url_for('compare_admin.view', g=g.gkey, q=q, cat=cat) }}"><span style="flex:1"><b>{{ g.name }}</b><span class="muted">{{ g.n_sup }} {{ 'supplier' if g.n_sup == 1 else 'suppliers' }} · {{ g.n_live }} in stock</span></span><span style="text-align:right"><span class="muted">from</span><br><b>${{ '%.2f'|format(g.low) }}</b></span></a>
+{% for g in groups %}<a class="cp-row" data-n="{{ g.name|lower }}" href="{{ url_for('compare_admin.view', g=g.gkey, q=q, cat=cat, m=mm) }}"><span class="cp-main"><b>{{ g.name }}</b><span class="muted">{{ g.n_sup }} {{ 'supplier' if g.n_sup == 1 else 'suppliers' }} · stock {{ g.units }}</span></span><span class="cp-price"><span class="muted">from</span><br><b>${{ '%.2f'|format(g.low) }}</b></span></a>
 {% else %}<p class="muted" style="padding:16px">No product found. Try another word or <a href="{{ url_for('compare_admin.pick') }}">clear the search</a>.</p>{% endfor %}</div>
 <script>(function(){var i=document.querySelector('input[name=q]');if(!i)return;i.addEventListener('input',function(){var v=i.value.toLowerCase().trim(),r=document.querySelector('.cp-recent');if(r)r.style.display=v?'none':'';document.querySelectorAll('.cp-row[data-n]').forEach(function(x){x.style.display=x.getAttribute('data-n').indexOf(v)>-1?'':'none'})})})();</script>
-{% endblock %}"""
+</div>{% endblock %}"""
 
 VIEW_PAGE = r"""{% extends 'base.html' %}{% block body %}
 """ + _CMP_CSS + r"""
-<p><a class="muted" href="{{ url_for('compare_admin.pick', q=q, cat=cat) }}">&larr; All products</a></p>
+<div class="cp-wrap">
+<p><a class="muted" href="{{ url_for('compare_admin.pick', q=q, cat=cat, m=mm) }}">&larr; All products</a></p>
 <div class="card" style="display:flex;align-items:center;gap:10px">
-{% if prev_g %}<a class="cp-nav" aria-label="Previous product" href="{{ url_for('compare_admin.view', g=prev_g.gkey, q=q, cat=cat) }}">&lsaquo;</a>{% else %}<span class="cp-nav off" aria-hidden="true">&lsaquo;</span>{% endif %}
-<div style="flex:1;text-align:center"><div class="muted">Product {{ idx + 1 }} of {{ total }}</div><h3 style="margin:2px 0">{{ g.name }}</h3><span class="muted">{{ g.category }} · {{ g.n_sup }} {{ 'supplier' if g.n_sup == 1 else 'suppliers' }} · {{ g.n_live }} in stock</span></div>
-{% if next_g %}<a class="cp-nav" aria-label="Next product" href="{{ url_for('compare_admin.view', g=next_g.gkey, q=q, cat=cat) }}">&rsaquo;</a>{% else %}<span class="cp-nav off" aria-hidden="true">&rsaquo;</span>{% endif %}
+{% if prev_g %}<a class="cp-nav" aria-label="Previous product" href="{{ url_for('compare_admin.view', g=prev_g.gkey, q=q, cat=cat, m=mm) }}">&lsaquo;</a>{% else %}<span class="cp-nav off" aria-hidden="true">&lsaquo;</span>{% endif %}
+<div style="flex:1;text-align:center"><div class="muted">Product {{ idx + 1 }} of {{ total }}</div><h3 style="margin:2px 0">{{ g.name }}</h3><span class="muted">{{ g.category }} · {{ g.n_sup }} {{ 'supplier' if g.n_sup == 1 else 'suppliers' }} · stock {{ g.units }}</span></div>
+{% if next_g %}<a class="cp-nav" aria-label="Next product" href="{{ url_for('compare_admin.view', g=next_g.gkey, q=q, cat=cat, m=mm) }}">&rsaquo;</a>{% else %}<span class="cp-nav off" aria-hidden="true">&rsaquo;</span>{% endif %}
 </div>
 {% if g.instock %}
 <div class="card"><div class="muted">CHEAPEST IN STOCK</div>
@@ -1057,10 +1071,10 @@ VIEW_PAGE = r"""{% extends 'base.html' %}{% block body %}
 <div style="text-align:right"><b {% if o.stock <= 0 %}style="text-decoration:line-through"{% endif %}>${{ '%.2f'|format(o.cost) }}</b><br>{% if o.stock <= 0 %}<span class="cp-st failed">Out of stock</span>{% else %}<span class="muted">Stock {{ o.stock }}</span>{% endif %}<br><span class="cp-st {{ 'paid' if o.status == 'Active' else 'muted' }}">{{ o.status }}</span></div></div>
 {% endfor %}</div>
 <div style="display:flex;gap:10px;flex-wrap:wrap">
-<a href="{{ url_for('compare_admin.view', g=g.gkey, q=q, cat=cat, refresh=1) }}"><button type="button" class="grey">Refresh prices</button></a>
+<a href="{{ url_for('compare_admin.view', g=g.gkey, q=q, cat=cat, m=mm, refresh=1) }}"><button type="button" class="grey">Refresh prices</button></a>
 {% if your_price is none %}<a href="{{ url_for('compare_admin.home') }}"><button type="button">Import this product</button></a>{% endif %}
 </div>
-{% endblock %}"""
+</div>{% endblock %}"""
 
 
 def register(app):
