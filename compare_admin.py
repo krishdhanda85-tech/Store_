@@ -770,7 +770,7 @@ def auto_import(db, limit=100):
             continue
         price = sell_price(st, cost, g["name"], g["category"])
         try:
-            ok, bc, pr = import_one(db, g["name"][:120], price, g["category"] or None,
+            ok, bc, pr = import_one(db, g["name"][:120], price, cat or None,
                                     [(o["sid"], o["key"]) for o in g["offers"]], catalogs, names)
         except Exception as e:
             problems.append(f"{g['name']}: {str(e)[:100]}")
@@ -1576,8 +1576,9 @@ SMART_PAGE = r"""{% extends 'base.html' %}{% block body %}
 # =====================================================================================================
 def quick_groups(db):
     """-> (errs, [{name, rows:[group...]}], auto settings). Products not in your shop yet, folded by category."""
-    sups, errs, groups, _skipped, _hidden, _cats = pending_groups(db, max_age=120)
+    sups, errs, groups, _skipped, _hidden, existing = pending_groups(db, max_age=120)
     st = auto_settings(db)
+    st["existing_cats"] = sorted({str(c) for c in (existing or []) if c}, key=str.casefold)
     skip_words = [_squash(w) for w in re.split(r"[,\n]", st["skip"]) if _squash(w)]
     folders = {}
     for g in groups:
@@ -1589,7 +1590,7 @@ def quick_groups(db):
     for name in sorted(folders, key=str.casefold):
         rows = sorted(folders[name], key=lambda g: g["name"].casefold())
         live = [g["best"]["cost"] for g in rows if g["instock"]]
-        cats.append({"name": name, "rows": rows, "from": min(live) if live else 0.0,
+        cats.append({"name": name, "cat_default": name.split(" / ")[-1].strip() or name, "rows": rows, "from": min(live) if live else 0.0,
                      "checked": any(g["checked"] for g in rows)})
     return errs, cats, st
 
@@ -1601,7 +1602,8 @@ def quick():
     errs, cats, st = quick_groups(db)
     for e in errs:
         flash(e, "err")
-    return web.render_str(QUICK_PAGE, cats=cats, auto=st, total=sum(len(c["rows"]) for c in cats))
+    return web.render_str(QUICK_PAGE, cats=cats, auto=st, existing=st["existing_cats"], total=sum(len(c["rows"]) for c in cats),
+                          ready_n=sum(1 for c in cats for g in c["rows"] if g["checked"]))
 
 
 @bp.route("/compare/quick/apply", methods=["POST"])
@@ -1615,10 +1617,13 @@ def quick_apply():
     by = {g["gkey"]: g for c in cats for g in c["rows"]}
     names = {re.sub(r"\s+", " ", p["name"]).strip().casefold(): p["id"] for p in db.list_products()}
     catalogs, ok, below, problems = {}, 0, 0, []
-    for gk in f.getlist("pick")[:400]:
+    everything = re.sub(r"\s+", " ", f.get("all_cat") or "").strip()[:60]
+    for raw in f.getlist("pick")[:400]:
+        idx, _sep, gk = raw.partition("~~")
         g = by.get(gk)
         if not g or g["best"]["cost"] <= 0:
             continue
+        cat = everything or re.sub(r"\s+", " ", f.get(f"cat_{idx}") or "").strip()[:60] or g["category"]
         price = sell_price(st, g["best"]["cost"], g["name"], g["category"])
         try:
             added, bc, pr = import_one(db, g["name"][:120], price, g["category"] or None,
@@ -1658,24 +1663,34 @@ QUICK_PAGE = r"""{% extends 'base.html' %}{% block body %}
 <div class="cp-wrap">
 <p><a class="muted" href="{{ url_for('compare_admin.home') }}">&larr; Compare &amp; import</a></p>
 <h2>⚡ Quick add</h2>
-<p class="muted">{{ total }} product{{ '' if total == 1 else 's' }} from your suppliers are not in your shop yet. Tick the brands (or single products), press the button. Price = cheapest cost + your commission (set it below once), category and description are copied, and the cheapest supplier with stock is used automatically. Out-of-stock and "never auto-add" brands start unticked.</p>
+<div class="card" style="text-align:center"><div style="font-size:24px;font-weight:500">{{ ready_n }} products ready</div>
+<div class="muted" style="margin-top:2px">{{ cats|length }} brand{{ '' if cats|length == 1 else 's' }} · price = cheapest cost + your commission · category = brand name · cheapest supplier with stock</div>
+{% if ready_n %}<button type="button" class="green" style="margin-top:12px;width:100%" onclick="if(confirm('Add {{ ready_n }} products now?'))document.getElementById('qf').submit()">Add all {{ ready_n }} now</button>
+<div class="muted" style="margin-top:6px;font-size:12px">Out of stock and never-add brands are left out. Want to choose? Tick below instead.</div>{% endif %}</div>
 {% if cats %}
-<form method="post" action="{{ url_for('compare_admin.commission_save') }}"><div class="card"><h3>Your commission (profit on every product)</h3>
+<details class="card"><summary style="cursor:pointer"><b>Commission</b> <span class="muted">· profit on every product, tap to change</span></summary><form method="post" action="{{ url_for('compare_admin.commission_save') }}"><div style="margin-top:8px">
 <p class="muted" style="margin:0 0 8px">One rule per line. Left = cheapest supplier cost, right = what you earn in dollars. A brand name line (like Netflix) beats the cost ranges. A % also works (10%).</p>
 <textarea name="rules" rows="6" spellcheck="false" style="width:100%">{{ auto.comm_text }}</textarea>
 <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" name="on" value="1" style="width:auto" {{ 'checked' if auto.comm_on }}> Use these commission rules (OFF = old markup % from Auto mode)</label>
 <label>Round the price</label><select name="rnd"><option value="five" {{ 'selected' if auto.rnd == 'five' }}>Up to the next 5 cents</option><option value="x99" {{ 'selected' if auto.rnd == 'x99' }}>Ending .99</option><option value="none" {{ 'selected' if auto.rnd == 'none' }}>No rounding</option></select>
-<button type="submit" class="sm" style="margin-top:8px">Save and update prices</button></div></form>
+<button type="submit" class="sm" style="margin-top:8px">Save and update prices</button></div></form></details>
 <form method="post" action="{{ url_for('compare_admin.quick_apply') }}" id="qf">
+<details class="card"><summary style="cursor:pointer"><b>Category</b> <span class="muted">· brand name is used automatically, tap to change</span></summary><div style="margin-top:8px">
+<p class="muted" style="margin:0 0 8px">Every brand folder below has its own category box (already filled with the brand name). Or put everything into one category:</p>
+<input name="all_cat" list="cats_list" placeholder="One category for ALL ticked products (optional)" autocomplete="off">
+<button type="button" class="grey sm" style="margin-top:8px" onclick="brandOnly()">Use brand names only (Gemini instead of AI Tools / Gemini)</button></div></details>
+<datalist id="cats_list">{% for c in existing %}<option value="{{ c }}">{% endfor %}{% for c in cats %}<option value="{{ c.name }}">{% endfor %}</datalist>
 <input id="q" placeholder="Search brand or product..." oninput="ft()" autocomplete="off">
 <div style="display:flex;gap:8px;margin:8px 0;flex-wrap:wrap"><button type="button" class="grey sm" onclick="all_(true)">Tick all in stock</button><button type="button" class="green sm" onclick="all_(true);if(confirm('Add ALL in-stock products now?'))document.getElementById('qf').submit()">Add all in stock now</button><button type="button" class="grey sm" onclick="all_(false)">Clear</button></div>
-{% for c in cats %}<details class="card qd" data-n="{{ c.name|lower }}"><summary style="display:flex;gap:10px;align-items:center;cursor:pointer"><input type="checkbox" class="cb" {{ 'checked' if c.checked }} style="width:auto" onclick="event.stopPropagation();tg(this)"><b style="flex:1;min-width:0;overflow-wrap:anywhere">{{ c.name }}</b><span class="muted">{{ c.rows|length }}{% if c.from %} · from ${{ '%.2f'|format(c.from) }}{% endif %}</span></summary>
+{% for c in cats %}{% set ci = loop.index0 %}<details class="card qd" data-n="{{ c.name|lower }}"><summary style="display:flex;gap:10px;align-items:center;cursor:pointer"><input type="checkbox" class="cb" {{ 'checked' if c.checked }} style="width:auto" onclick="event.stopPropagation();tg(this)"><b style="flex:1;min-width:0;overflow-wrap:anywhere">{{ c.name }}</b><span class="muted">{{ c.rows|length }}{% if c.from %} · from ${{ '%.2f'|format(c.from) }}{% endif %}</span></summary>
+<div style="margin-top:8px"><label style="font-size:12px" class="muted">Category for these products</label><input class="cin" name="cat_{{ ci }}" list="cats_list" value="{{ c.cat_default }}" autocomplete="off"></div>
 {% for g in c.rows %}<label class="qr" data-name="{{ g.name|lower }}" data-cost="{{ '%.4f' % g.best.cost }}" style="display:flex;gap:10px;align-items:flex-start;margin:8px 0 0">
-<input type="checkbox" class="pk" name="pick" value="{{ g.gkey }}" {{ 'checked' if g.checked }} data-live="{{ 1 if g.instock else 0 }}" style="width:auto;margin-top:4px" onchange="ct()">
+<input type="checkbox" class="pk" name="pick" value="{{ ci }}~~{{ g.gkey }}" {{ 'checked' if g.checked }} data-live="{{ 1 if g.instock else 0 }}" style="width:auto;margin-top:4px" onchange="ct()">
 <span style="flex:1;min-width:0;overflow-wrap:anywhere">{{ g.name }}<span class="muted" style="display:block;font-size:13px">{{ g.offers|length }} supplier{{ '' if g.offers|length == 1 else 's' }} · cost ${{ '%.2f' % g.best.cost }}{% if not g.instock %} (out of stock){% endif %} → sell <b class="paid">${{ '%.2f' % g.sell }}</b> (profit ${{ '%.2f' % (g.sell - g.best.cost) }})</span></span></label>{% endfor %}</details>{% endfor %}
 <div style="position:sticky;bottom:0;padding:10px 0;background:var(--bg,#0f1020)"><button type="submit" class="green" id="go" disabled>Add 0 products</button></div>
 </form>
 <script>
+function brandOnly(){document.querySelectorAll('.cin').forEach(function(i){var p=i.value.split(' / ');i.value=p[p.length-1].trim();});}
 function ct(){var n=document.querySelectorAll('.pk:checked').length,b=document.getElementById('go');b.disabled=!n;b.textContent='Add '+n+' product'+(n==1?'':'s');
  document.querySelectorAll('.qd').forEach(function(d){var a=d.querySelectorAll('.pk'),k=d.querySelectorAll('.pk:checked');d.querySelector('.cb').checked=k.length>0;});}
 function tg(cb){var d=cb.closest('.qd');d.querySelectorAll('.pk').forEach(function(x){x.checked=cb.checked&&x.dataset.live==='1';});ct();}
