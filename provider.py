@@ -136,11 +136,20 @@ def _ch_call(s, method, action, params=None, body=None, idem=None):
 
 
 def _ch_catalog(s):
-    return [{"key": str(p["key"]), "name": str(p["name"]),
-             "cost": float(p["price_usdt_from"]), "stock": int(p["stock"]),
-             "description": str(p.get("description") or "").strip(),
-             "category": str(p.get("category") or "").strip()}
-            for p in _ch_call(s, "GET", "products")["products"]]
+    out = []
+    for p in _ch_call(s, "GET", "products").get("products") or []:
+        try:
+            key = str(p["key"]).strip()
+            raw = p.get("stock")
+            if raw is None:
+                raw = p.get("available", p.get("quantity", 0))
+            out.append({"key": key, "name": str(p.get("name") or key),
+                        "cost": float(p["price_usdt_from"]), "stock": max(0, int(float(raw or 0))),
+                        "description": str(p.get("description") or "").strip(),
+                        "category": str(p.get("category") or "").strip()})
+        except (KeyError, TypeError, ValueError):
+            log.warning("skipping malformed product from %s: %r", s.get("name"), p)
+    return out
 
 
 def _ch_balance(s):
@@ -826,6 +835,20 @@ class ShopDB(Database):
         links = self._links()
         return [self._merge(r, links) for r in super().search_products(*a, **k)]
 
+    def sync_now(self):
+        """Admin button: drop cached catalogs, refresh every linked product now, return a short report."""
+        for s in self.list_suppliers():
+            _cache_drop(s["id"])
+        alerts = self.sync()
+        c = self.conn()
+        n = c.execute("SELECT COUNT(*) n FROM product_sources").fetchone()["n"]
+        c.close()
+        msg = f"Synced {n} linked product(s)."
+        if alerts:
+            import re as _re
+            msg += " " + " | ".join(_re.sub(r"<[^>]+>", "", a) for a in alerts[:4])
+        return msg
+
     # ------------------------------------------------------------ periodic sync
     def sync(self):
         """Refresh stock/cost of every linked supplier product. Returns alert lines for admins."""
@@ -854,7 +877,14 @@ class ShopDB(Database):
                 if cat is None:
                     continue
                 p = cat.get(r["provider_key"])
+                if p is None:      # key changed in case/spaces? try a forgiving match first
+                    low = {str(k).strip().lower(): v for k, v in cat.items()}
+                    p = low.get(str(r["provider_key"]).strip().lower())
+                    if p is not None:
+                        c.execute("UPDATE product_sources SET provider_key=? WHERE id=?", (p["key"], r["id"]))
                 if p is None:
+                    log.warning("sync: %s has no product with key %r (catalog has %d items) -> stock 0",
+                                names.get(r["supplier_id"]), r["provider_key"], len(cat))
                     c.execute("UPDATE product_sources SET stock=0, last_sync=? WHERE id=?", (_now(), r["id"]))
                     alerts.append(f"⚠️ {names.get(r['supplier_id'], '?')}: product <code>{r['provider_key']}</code> "
                                   f"(#{r['product_id']}) is no longer listed. Stock set to 0.")

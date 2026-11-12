@@ -34,6 +34,7 @@ PAGE = r"""{% extends 'base.html' %}{% block body %}
 {% if s.from_env %}<p class="muted">Comes from the server variables CUPPON_API_KEY / PROVIDER_API_BASE.</p>{% else %}<p class="muted">{{ s.base_url }}</p>{% endif %}
 <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
 <form method="post"><input type="hidden" name="action" value="test"><input type="hidden" name="sid" value="{{ s.id }}"><button type="submit" class="green sm">Test connection</button></form>
+<form method="post"><input type="hidden" name="action" value="syncnow"><button type="submit" class="sm">Sync stock now</button></form>
 <form method="post"><input type="hidden" name="action" value="toggle"><input type="hidden" name="sid" value="{{ s.id }}"><button type="submit" class="grey sm">{{ 'Disable' if s.enabled else 'Enable' }}</button></form>
 {% if not s.from_env %}<form method="post" onsubmit="return confirm('Delete this supplier? Products linked to it lose this source.')"><input type="hidden" name="action" value="delete"><input type="hidden" name="sid" value="{{ s.id }}"><button type="submit" class="red sm">Delete</button></form>{% endif %}
 </div>
@@ -83,6 +84,8 @@ def register(app, db):
                 elif act == "delete":
                     db.delete_supplier(sid)
                     flash("Supplier deleted.")
+                elif act == "syncnow":
+                    flash(db.sync_now())
                 elif act == "test":
                     flash(db.test_supplier(sid))
             except Exception as e:
