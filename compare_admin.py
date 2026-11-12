@@ -268,7 +268,7 @@ def brand_label(name, rules=None):
     found = sorted([r for r in rs if r["canon"] in words], key=lambda r: t.find(r["canon"]))
     if found:
         lab = found[0]["label"][:40]
-        return {"gemini plus": "Gemini"}.get(lab.casefold(), lab)     # keep your existing "AI Tools / Gemini" folder
+        return {"gemini plus": "Gemini", "netflix premium": "Netflix"}.get(lab.casefold(), lab)     # keep your existing "AI Tools / Gemini" folder
     sq = _squash(name)
     for b in BRANDS:
         if _squash(b) in sq:
@@ -450,6 +450,8 @@ PAGE = r"""{% extends 'base.html' %}{% block body %}
 <p class="muted">All your suppliers are compared. The cheapest one that has stock is used automatically. Category and description are copied. You only set the price (and add an emoji if you like).</p>
 
 
+<div class="card"><h3>⚡ Quick add (easiest)</h3><p class="muted" style="margin:0 0 8px">Do not add products one by one. Set your commission once (for example $0.10 to $0.25 per product), tick whole brands and add hundreds of products with one button.</p><a href="{{ url_for('compare_admin.quick') }}"><button type="button" class="green">Open Quick add</button></a></div>
+
 <div class="card"><h3>Auto mode <span class="{{ 'paid' if auto.on else 'failed' }}">{{ 'ON' if auto.on else 'OFF' }}</span></h3>
 <p class="muted" style="margin:0 0 8px">When ON, the bot compares all suppliers by itself every 10 minutes and adds every new product with the cheapest supplier, category, description and your markup price. Products you already have, already linked or hidden are never touched. You get a message in the bot when new products are added.</p>
 <form method="post" action="{{ url_for('compare_admin.auto_save') }}">
@@ -572,18 +574,75 @@ def _ignored(db):
         return set()
 
 
+DEFAULT_COMM = """# cost range = your commission in dollars (first match wins)
+0-1 = 0.10
+1-3 = 0.15
+3+ = 0.25
+# a brand line wins over the cost ranges
+Netflix = 0.40"""
+
+
+def parse_commission(text):
+    """'0-1 = 0.10', '3+ = 0.25', 'Netflix = 0.40', '10%' also works. -> {tiers, brands} or None"""
+    tiers, brands = [], []
+    for ln in (text or "").splitlines():
+        ln = ln.split("#")[0].strip()
+        if "=" not in ln:
+            continue
+        k, v = [x.strip() for x in ln.split("=", 1)]
+        pct = v.endswith("%")
+        try:
+            val = float(v.rstrip("%").strip().lstrip("$"))
+        except ValueError:
+            continue
+        if val < 0:
+            continue
+        m = re.match(r"^\$?(\d+(?:\.\d+)?)\s*-\s*\$?(\d+(?:\.\d+)?)$", k)
+        m2 = re.match(r"^\$?(\d+(?:\.\d+)?)\s*\+$", k)
+        if m:
+            tiers.append((float(m.group(1)), float(m.group(2)), val, pct))
+        elif m2:
+            tiers.append((float(m2.group(1)), 1e12, val, pct))
+        elif _squash(k):
+            brands.append((_squash(k), val, pct))
+    return {"tiers": tiers, "brands": brands} if (tiers or brands) else None
+
+
+def commission_amount(comm, name, category, cost):
+    hay = _squash(name) + "|" + _squash(category or "")
+    for w, val, pct in comm["brands"]:
+        if w in hay:
+            return cost * val / 100.0 if pct else val
+    for lo, hi, val, pct in comm["tiers"]:
+        if lo <= cost < hi:
+            return cost * val / 100.0 if pct else val
+    return None
+
+
+def sell_price(st, cost, name="", category=""):
+    """Your selling price: cheapest cost + your commission rule (or the old markup % when rules are OFF)."""
+    comm = st.get("comm")
+    amt = commission_amount(comm, name, category, cost) if comm else None
+    if amt is None:
+        return price_for(cost, st["pct"], st["fix"], st["rnd"])
+    return price_for(cost, 0.0, amt, st["rnd"])
+
+
 def auto_settings(db):
     def num(k, d):
         try:
             return float(db.get_setting(k, d))
         except (TypeError, ValueError):
             return d
+    comm_on = str(db.get_setting("commission_on", "1")) == "1"
+    comm_text = str(db.get_setting("commission_rules", "") or "") or DEFAULT_COMM
     return {"on": str(db.get_setting("auto_import_on", "0")) == "1",
             "pct": num("auto_import_pct", 40.0), "fix": num("auto_import_fix", 0.0),
             "rnd": str(db.get_setting("auto_import_rnd", "five")),
             "instock": str(db.get_setting("auto_import_instock", "1")) == "1",
             "only": str(db.get_setting("auto_import_only", "") or ""),
-            "skip": str(db.get_setting("auto_import_skip", "Spotify, Netflix, Crunchyroll, Amazon Prime, Prime Video") or "")}
+            "skip": str(db.get_setting("auto_import_skip", "Spotify, Netflix, Crunchyroll, Amazon Prime, Prime Video") or ""),
+            "comm_on": comm_on, "comm_text": comm_text, "comm": parse_commission(comm_text) if comm_on else None}
 
 
 def price_for(cost, pct, fix, rnd):
@@ -709,7 +768,7 @@ def auto_import(db, limit=100):
         cost = g["best"]["cost"]
         if cost <= 0:
             continue
-        price = price_for(cost, st["pct"], st["fix"], st["rnd"])
+        price = sell_price(st, cost, g["name"], g["category"])
         try:
             ok, bc, pr = import_one(db, g["name"][:120], price, g["category"] or None,
                                     [(o["sid"], o["key"]) for o in g["offers"]], catalogs, names)
@@ -1152,7 +1211,7 @@ def view():
     sims = similar_groups(g, groups)
     merged = [{"src": k, "name": v.get("name") or k} for k, v in _merges(web.db).items() if v["to"] == key]
     au = auto_settings(web.db)
-    sugg = price_for(g["low"], au["pct"], au["fix"], au["rnd"]) if g["instock"] else 0.0
+    sugg = sell_price(au, g["low"], g["name"], g["category"]) if g["instock"] else 0.0
     return web.render_str(VIEW_PAGE, g=g, rows=rows, idx=idx, sims=sims, merged=merged, sugg=sugg, auto=au, total=len(seq), q=q, cat=cat, m=m, mm=("all" if m else None),
                           prev_g=seq[idx - 1] if idx > 0 else None,
                           next_g=seq[idx + 1] if idx + 1 < len(seq) else None,
@@ -1512,6 +1571,122 @@ SMART_PAGE = r"""{% extends 'base.html' %}{% block body %}
 </div>{% endblock %}"""
 
 
+# =====================================================================================================
+#  QUICK ADD: tick brands, set the markup ONCE, one button adds everything (no per-product typing)
+# =====================================================================================================
+def quick_groups(db):
+    """-> (errs, [{name, rows:[group...]}], auto settings). Products not in your shop yet, folded by category."""
+    sups, errs, groups, _skipped, _hidden, _cats = pending_groups(db, max_age=120)
+    st = auto_settings(db)
+    skip_words = [_squash(w) for w in re.split(r"[,\n]", st["skip"]) if _squash(w)]
+    folders = {}
+    for g in groups:
+        g["sell"] = sell_price(st, g["best"]["cost"], g["name"], g["category"])
+        g["checked"] = bool(g["instock"]) and g["best"]["cost"] > 0 and not any(
+            w in _squash(g["name"]) + "|" + _squash(g["category"]) for w in skip_words)
+        folders.setdefault(g["category"] or "Uncategorized", []).append(g)
+    cats = []
+    for name in sorted(folders, key=str.casefold):
+        rows = sorted(folders[name], key=lambda g: g["name"].casefold())
+        live = [g["best"]["cost"] for g in rows if g["instock"]]
+        cats.append({"name": name, "rows": rows, "from": min(live) if live else 0.0,
+                     "checked": any(g["checked"] for g in rows)})
+    return errs, cats, st
+
+
+@bp.route("/compare/quick")
+def quick():
+    import web
+    db = web.db
+    errs, cats, st = quick_groups(db)
+    for e in errs:
+        flash(e, "err")
+    return web.render_str(QUICK_PAGE, cats=cats, auto=st, total=sum(len(c["rows"]) for c in cats))
+
+
+@bp.route("/compare/quick/apply", methods=["POST"])
+def quick_apply():
+    import web
+    db = web.db
+    f = request.form
+
+    st = auto_settings(db)
+    _e, cats, st = quick_groups(db)
+    by = {g["gkey"]: g for c in cats for g in c["rows"]}
+    names = {re.sub(r"\s+", " ", p["name"]).strip().casefold(): p["id"] for p in db.list_products()}
+    catalogs, ok, below, problems = {}, 0, 0, []
+    for gk in f.getlist("pick")[:400]:
+        g = by.get(gk)
+        if not g or g["best"]["cost"] <= 0:
+            continue
+        price = sell_price(st, g["best"]["cost"], g["name"], g["category"])
+        try:
+            added, bc, pr = import_one(db, g["name"][:120], price, g["category"] or None,
+                                       [(o["sid"], o["key"]) for o in g["offers"]], catalogs, names)
+        except Exception as e:
+            problems.append(f"{g['name']}: {str(e)[:100]}")
+            continue
+        problems += pr
+        if added:
+            ok += 1
+            below += 1 if bc else 0
+    if ok:
+        flash(f"{ok} product{'s' if ok != 1 else ''} added with your commission rules. The cheapest supplier with stock is used automatically.")
+    for p in problems[:6]:
+        flash(p, "err")
+    return redirect(url_for("products") if ok else url_for("compare_admin.quick"))
+
+
+@bp.route("/compare/commission", methods=["POST"])
+def commission_save():
+    import web
+    db = web.db
+    f = request.form
+    text = (f.get("rules") or "").strip()[:2000]
+    rnd = f.get("rnd") if f.get("rnd") in ("five", "x99", "none") else "five"
+    if f.get("on") and not parse_commission(text):
+        flash("Add at least one rule like  0-1 = 0.10", "err")
+        return redirect(url_for("compare_admin.quick"))
+    db.set_setting("commission_on", "1" if f.get("on") else "0")
+    db.set_setting("commission_rules", text)
+    db.set_setting("auto_import_rnd", rnd)
+    flash("Commission saved. Prices below are updated.")
+    return redirect(url_for("compare_admin.quick"))
+
+
+QUICK_PAGE = r"""{% extends 'base.html' %}{% block body %}
+<div class="cp-wrap">
+<p><a class="muted" href="{{ url_for('compare_admin.home') }}">&larr; Compare &amp; import</a></p>
+<h2>⚡ Quick add</h2>
+<p class="muted">{{ total }} product{{ '' if total == 1 else 's' }} from your suppliers are not in your shop yet. Tick the brands (or single products), press the button. Price = cheapest cost + your commission (set it below once), category and description are copied, and the cheapest supplier with stock is used automatically. Out-of-stock and "never auto-add" brands start unticked.</p>
+{% if cats %}
+<form method="post" action="{{ url_for('compare_admin.commission_save') }}"><div class="card"><h3>Your commission (profit on every product)</h3>
+<p class="muted" style="margin:0 0 8px">One rule per line. Left = cheapest supplier cost, right = what you earn in dollars. A brand name line (like Netflix) beats the cost ranges. A % also works (10%).</p>
+<textarea name="rules" rows="6" spellcheck="false" style="width:100%">{{ auto.comm_text }}</textarea>
+<label style="display:flex;gap:8px;align-items:center"><input type="checkbox" name="on" value="1" style="width:auto" {{ 'checked' if auto.comm_on }}> Use these commission rules (OFF = old markup % from Auto mode)</label>
+<label>Round the price</label><select name="rnd"><option value="five" {{ 'selected' if auto.rnd == 'five' }}>Up to the next 5 cents</option><option value="x99" {{ 'selected' if auto.rnd == 'x99' }}>Ending .99</option><option value="none" {{ 'selected' if auto.rnd == 'none' }}>No rounding</option></select>
+<button type="submit" class="sm" style="margin-top:8px">Save and update prices</button></div></form>
+<form method="post" action="{{ url_for('compare_admin.quick_apply') }}" id="qf">
+<input id="q" placeholder="Search brand or product..." oninput="ft()" autocomplete="off">
+<div style="display:flex;gap:8px;margin:8px 0;flex-wrap:wrap"><button type="button" class="grey sm" onclick="all_(true)">Tick all in stock</button><button type="button" class="green sm" onclick="all_(true);if(confirm('Add ALL in-stock products now?'))document.getElementById('qf').submit()">Add all in stock now</button><button type="button" class="grey sm" onclick="all_(false)">Clear</button></div>
+{% for c in cats %}<details class="card qd" data-n="{{ c.name|lower }}"><summary style="display:flex;gap:10px;align-items:center;cursor:pointer"><input type="checkbox" class="cb" {{ 'checked' if c.checked }} style="width:auto" onclick="event.stopPropagation();tg(this)"><b style="flex:1;min-width:0;overflow-wrap:anywhere">{{ c.name }}</b><span class="muted">{{ c.rows|length }}{% if c.from %} · from ${{ '%.2f'|format(c.from) }}{% endif %}</span></summary>
+{% for g in c.rows %}<label class="qr" data-name="{{ g.name|lower }}" data-cost="{{ '%.4f' % g.best.cost }}" style="display:flex;gap:10px;align-items:flex-start;margin:8px 0 0">
+<input type="checkbox" class="pk" name="pick" value="{{ g.gkey }}" {{ 'checked' if g.checked }} data-live="{{ 1 if g.instock else 0 }}" style="width:auto;margin-top:4px" onchange="ct()">
+<span style="flex:1;min-width:0;overflow-wrap:anywhere">{{ g.name }}<span class="muted" style="display:block;font-size:13px">{{ g.offers|length }} supplier{{ '' if g.offers|length == 1 else 's' }} · cost ${{ '%.2f' % g.best.cost }}{% if not g.instock %} (out of stock){% endif %} → sell <b class="paid">${{ '%.2f' % g.sell }}</b> (profit ${{ '%.2f' % (g.sell - g.best.cost) }})</span></span></label>{% endfor %}</details>{% endfor %}
+<div style="position:sticky;bottom:0;padding:10px 0;background:var(--bg,#0f1020)"><button type="submit" class="green" id="go" disabled>Add 0 products</button></div>
+</form>
+<script>
+function ct(){var n=document.querySelectorAll('.pk:checked').length,b=document.getElementById('go');b.disabled=!n;b.textContent='Add '+n+' product'+(n==1?'':'s');
+ document.querySelectorAll('.qd').forEach(function(d){var a=d.querySelectorAll('.pk'),k=d.querySelectorAll('.pk:checked');d.querySelector('.cb').checked=k.length>0;});}
+function tg(cb){var d=cb.closest('.qd');d.querySelectorAll('.pk').forEach(function(x){x.checked=cb.checked&&x.dataset.live==='1';});ct();}
+function all_(on){document.querySelectorAll('.pk').forEach(function(x){x.checked=on&&x.dataset.live==='1';});ct();}
+function ft(){var q=document.getElementById('q').value.toLowerCase().trim();document.querySelectorAll('.qd').forEach(function(d){var hit=false;d.querySelectorAll('.qr').forEach(function(r){var m=!q||r.dataset.name.indexOf(q)>=0||d.dataset.n.indexOf(q)>=0;r.hidden=!m;if(m)hit=true;});d.hidden=!hit;if(q&&hit)d.open=true;});}
+ct();
+</script>
+{% else %}<div class="card"><p class="muted">Nothing new. Every supplier product is already in your shop or hidden.</p></div>{% endif %}
+</div>{% endblock %}"""
+
+
 _CMP_CSS = r"""<style>
 .cp-chips{display:flex;gap:8px;overflow-x:auto;padding:4px 0 2px}
 .cp-chip{flex:none;display:inline-flex;align-items:center;min-height:44px;padding:0 16px;border-radius:999px;border:1px solid var(--line2);background:var(--surface);color:var(--ink);font-weight:600;font-size:13px;text-decoration:none;white-space:nowrap}
@@ -1558,7 +1733,7 @@ PICK_PAGE = r"""{% extends 'base.html' %}{% block body %}
 <form method="get" action="{{ url_for('compare_admin.pick') }}" class="card">
 <input type="search" name="q" value="{{ q }}" placeholder="Search product, e.g. Canva" aria-label="Search product" autofocus>
 {% if cat %}<input type="hidden" name="cat" value="{{ cat }}">{% endif %}
-<div class="cp-chips" style="margin-top:10px">{% if n_smart %}<a class="cp-chip" href="{{ url_for('compare_admin.smart') }}">🧠 Smart merge {{ n_smart }}</a>{% endif %}{% if n_loss %}<a class="cp-chip {{ 'on' if flt == 'loss' }}" href="{{ url_for('compare_admin.pick', f='loss') }}">⚠ Losing money {{ n_loss }}</a>{% endif %}{% if n_todo %}<a class="cp-chip {{ 'on' if flt == 'todo' }}" href="{{ url_for('compare_admin.pick', f='todo') }}">Not on cheapest {{ n_todo }}</a>{% endif %}<a class="cp-chip {{ 'on' if not m }}" href="{{ url_for('compare_admin.pick', q=q, cat=cat) }}">2+ suppliers {{ n_multi }}</a><a class="cp-chip {{ 'on' if m }}" href="{{ url_for('compare_admin.pick', q=q, cat=cat, m='all') }}">All products {{ total }}</a></div>
+<div class="cp-chips" style="margin-top:10px"><a class="cp-chip" href="{{ url_for('compare_admin.quick') }}">⚡ Quick add</a>{% if n_smart %}<a class="cp-chip" href="{{ url_for('compare_admin.smart') }}">🧠 Smart merge {{ n_smart }}</a>{% endif %}{% if n_loss %}<a class="cp-chip {{ 'on' if flt == 'loss' }}" href="{{ url_for('compare_admin.pick', f='loss') }}">⚠ Losing money {{ n_loss }}</a>{% endif %}{% if n_todo %}<a class="cp-chip {{ 'on' if flt == 'todo' }}" href="{{ url_for('compare_admin.pick', f='todo') }}">Not on cheapest {{ n_todo }}</a>{% endif %}<a class="cp-chip {{ 'on' if not m }}" href="{{ url_for('compare_admin.pick', q=q, cat=cat) }}">2+ suppliers {{ n_multi }}</a><a class="cp-chip {{ 'on' if m }}" href="{{ url_for('compare_admin.pick', q=q, cat=cat, m='all') }}">All products {{ total }}</a></div>
 <div class="cp-chips" style="margin-top:6px">
 <a class="cp-chip {{ 'on' if not cat }}" href="{{ url_for('compare_admin.pick', q=q, m=mm) }}">All {{ n_base }}</a>
 {% for c, n in cats %}<a class="cp-chip {{ 'on' if c == cat }}" href="{{ url_for('compare_admin.pick', cat=c, q=q, m=mm) }}">{{ c }} {{ n }}</a>{% endfor %}
@@ -1590,7 +1765,7 @@ VIEW_PAGE = r"""{% extends 'base.html' %}{% block body %}
 <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
 {% if g.todo %}<form method="post" action="{{ url_for('compare_admin.smartlink') }}"><input type="hidden" name="gkey" value="{{ g.gkey }}"><button type="submit" class="green sm">Link all suppliers + use cheapest</button></form>{% endif %}
 {% if g.instock %}<form method="post" action="{{ url_for('compare_admin.setprice') }}" style="display:flex;gap:6px;align-items:center"><input type="hidden" name="gkey" value="{{ g.gkey }}"><span class="muted">Price $</span><input name="price" type="number" step="0.01" min="0.01" value="{{ '%.2f'|format(sugg) }}" style="max-width:90px"><button type="submit" class="sm">Set price</button></form>{% endif %}</div>
-{% if g.instock %}<p class="muted" style="margin:6px 0 0">Suggested ${{ '%.2f'|format(sugg) }} = cheapest cost + your auto-mode markup ({{ '%.0f'|format(auto.pct) }}%). Profit at that price: ${{ '%.2f'|format(sugg - g.low) }}. Setting the price also saves the cost for your profit report.</p>{% endif %}</div>{% endif %}
+{% if g.instock %}<p class="muted" style="margin:6px 0 0">Suggested ${{ '%.2f'|format(sugg) }} = cheapest cost + your commission rules (Quick add page). Profit at that price: ${{ '%.2f'|format(sugg - g.low) }}. Setting the price also saves the cost for your profit report.</p>{% endif %}</div>{% endif %}
 {% if g.instock %}
 <div class="card"><div class="muted">CHEAPEST IN STOCK</div>
 <h2 style="margin:4px 0">${{ '%.2f'|format(g.low) }} <span style="font-size:15px;font-weight:600">{{ g.best.sname }}</span></h2>
