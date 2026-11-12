@@ -1027,6 +1027,20 @@ _CMP_CSS = r"""<style>
 .cp-st{font-size:12px;font-weight:700}
 .cp-main{flex:1;min-width:0;overflow-wrap:anywhere}
 .cp-price{flex:none;text-align:right}
+.cp-card{display:block;padding:14px 16px;border-bottom:1px solid var(--line);text-decoration:none;color:var(--ink)}
+.cp-card:hover{background:var(--accent-soft)}
+.cp-top{display:flex;gap:12px;align-items:flex-start}
+.cp-top b{display:block;font-size:15px}
+.cp-best{display:block;font-size:20px;font-weight:700;color:var(--paid)}
+.cp-chipsrow{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.cp-s{display:inline-flex;gap:6px;align-items:center;padding:6px 10px;border-radius:999px;border:1px solid var(--line2);font-size:13px;background:var(--surface);color:var(--ink)}
+.cp-sn{color:var(--muted);max-width:110px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cp-s em{font-style:normal;font-size:11px;color:var(--muted)}
+.cp-s.best{background:var(--accent);border-color:var(--accent);color:var(--bg)}
+.cp-s.best .cp-sn,.cp-s.best em{color:var(--bg)}
+.cp-s.out b{text-decoration:line-through;color:var(--muted)}
+.cp-s i{font-style:normal;font-size:11px;color:var(--fail)}
+.cp-foot{margin-top:8px;font-size:12px}
 .cp-wrap{width:100%;min-width:0;max-width:100%;overflow-x:clip}
 </style>"""
 
@@ -1034,7 +1048,7 @@ PICK_PAGE = r"""{% extends 'base.html' %}{% block body %}
 """ + _CMP_CSS + r"""
 <div class="cp-wrap">
 <h2>Compare prices</h2>
-<p class="muted">Pick a product to see every supplier's price side by side. Live from your {{ n_sup }} supplier APIs.</p>
+<p class="muted">Every product with all supplier prices in one place. The green chip is the cheapest supplier that has stock. Live from your {{ n_sup }} supplier APIs.</p>
 <form method="get" action="{{ url_for('compare_admin.pick') }}" class="card">
 <input type="search" name="q" value="{{ q }}" placeholder="Search product, e.g. Canva" aria-label="Search product" autofocus>
 {% if cat %}<input type="hidden" name="cat" value="{{ cat }}">{% endif %}
@@ -1043,12 +1057,17 @@ PICK_PAGE = r"""{% extends 'base.html' %}{% block body %}
 <a class="cp-chip {{ 'on' if not cat }}" href="{{ url_for('compare_admin.pick', q=q, m=mm) }}">All {{ n_base }}</a>
 {% for c, n in cats %}<a class="cp-chip {{ 'on' if c == cat }}" href="{{ url_for('compare_admin.pick', cat=c, q=q, m=mm) }}">{{ c }} {{ n }}</a>{% endfor %}
 </div></form>
-{% if recent %}<div class="card cp-list cp-recent"><div class="cp-lab">RECENT</div>
-{% for g in recent %}<a class="cp-row" href="{{ url_for('compare_admin.view', g=g.gkey) }}"><span class="cp-main"><b>{{ g.name }}</b><span class="muted">{{ g.n_sup }} {{ 'supplier' if g.n_sup == 1 else 'suppliers' }} · stock {{ g.units }}</span></span><span class="cp-price"><span class="muted">from</span><br><b>${{ '%.2f'|format(g.low) }}</b></span></a>{% endfor %}</div>{% endif %}
-<div class="card cp-list"><div class="cp-lab">{{ 'RESULTS' if (q or cat) else 'ALL PRODUCTS' }} · {{ groups|length }}</div>
-{% for g in groups %}<a class="cp-row" data-n="{{ g.name|lower }}" href="{{ url_for('compare_admin.view', g=g.gkey, q=q, cat=cat, m=mm) }}"><span class="cp-main"><b>{{ g.name }}</b><span class="muted">{{ g.n_sup }} {{ 'supplier' if g.n_sup == 1 else 'suppliers' }} · stock {{ g.units }}</span></span><span class="cp-price"><span class="muted">from</span><br><b>${{ '%.2f'|format(g.low) }}</b></span></a>
+
+<div class="cp-lab" style="padding:4px 4px 8px">{{ 'RESULTS' if (q or cat) else 'PRODUCTS' }} · {{ groups|length }} · tap a product for details</div>
+<div class="card cp-list">
+{% for g in groups %}<a class="cp-card" data-n="{{ g.name|lower }}" href="{{ url_for('compare_admin.view', g=g.gkey, q=q, cat=cat, m=mm) }}">
+<div class="cp-top"><div class="cp-main"><b>{{ g.name }}</b><span class="muted">{{ g.category }}</span></div>
+<div class="cp-price">{% if g.instock %}<span class="cp-best">${{ '%.2f'|format(g.low) }}</span><span class="muted">{{ g.best.sname }}</span>{% else %}<span class="failed">No stock</span>{% endif %}</div></div>
+<div class="cp-chipsrow">{% for o in g.offers %}<span class="cp-s {{ 'best' if (g.instock and o is sameas g.best) }} {{ 'out' if o.stock <= 0 }}"><span class="cp-sn">{{ o.sname }}</span><b>${{ '%.2f'|format(o.cost) }}</b>{% if o.stock <= 0 %}<i>out</i>{% else %}<em>{{ o.stock }}</em>{% endif %}</span>{% endfor %}</div>
+{% if g.instock and g.save > 0 %}<div class="muted cp-foot">Cheapest saves ${{ '%.2f'|format(g.save) }} vs the most expensive{% if g.shop %} · your price ${{ '%.2f'|format(g.shop.price|float) }} · profit ${{ '%.2f'|format(g.shop.price|float - g.low) }}{% endif %}</div>{% elif g.shop and g.instock %}<div class="muted cp-foot">Your price ${{ '%.2f'|format(g.shop.price|float) }} · profit ${{ '%.2f'|format(g.shop.price|float - g.low) }}</div>{% endif %}
+</a>
 {% else %}<p class="muted" style="padding:16px">No product found. Try another word or <a href="{{ url_for('compare_admin.pick') }}">clear the search</a>.</p>{% endfor %}</div>
-<script>(function(){var i=document.querySelector('input[name=q]');if(!i)return;i.addEventListener('input',function(){var v=i.value.toLowerCase().trim(),r=document.querySelector('.cp-recent');if(r)r.style.display=v?'none':'';document.querySelectorAll('.cp-row[data-n]').forEach(function(x){x.style.display=x.getAttribute('data-n').indexOf(v)>-1?'':'none'})})})();</script>
+<script>(function(){var i=document.querySelector('input[name=q]');if(!i)return;i.addEventListener('input',function(){var v=i.value.toLowerCase().trim(),r=document.querySelector('.cp-recent');if(r)r.style.display=v?'none':'';document.querySelectorAll('[data-n]').forEach(function(x){x.style.display=x.getAttribute('data-n').indexOf(v)>-1?'':'none'})})})();</script>
 </div>{% endblock %}"""
 
 VIEW_PAGE = r"""{% extends 'base.html' %}{% block body %}
