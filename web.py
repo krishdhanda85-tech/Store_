@@ -622,6 +622,34 @@ d.addEventListener('keydown',function(e){
 {% for p in products %}{% set u0 = p.cost if p.cost is not none else p.api_cost %}{% if u0 is not number %}{% set ns.nc = ns.nc + 1 %}{% endif %}{% if p.kind != 'manual' and p.stock == 0 %}{% set ns.out = ns.out + 1 %}{% endif %}{% endfor %}
 {% set cats = products|map(attribute='category')|select|unique|list %}
 <datalist id="cats">{% for c in cats %}<option value="{{ c }}">{% endfor %}</datalist>
+{% macro catpick(value, cats) %}<div class="catpick" data-cp><input type="hidden" name="category" value="{{ value or '' }}">
+<div class="cpchips"><button type="button" class="cpc{{ ' on' if not value }}" data-v="">No category</button>{% for c in cats %}<button type="button" class="cpc{{ ' on' if c == value }}" data-v="{{ c }}">{{ c }}</button>{% endfor %}{% if value and value not in cats %}<button type="button" class="cpc on" data-v="{{ value }}">{{ value }}</button>{% endif %}<button type="button" class="cpc new" data-new="1">+ New</button></div>
+<div class="cpnew" hidden><input type="text" maxlength="60" placeholder="Type new category name" autocomplete="off"><button type="button" class="sm" data-addnew="1">Add</button></div></div>{% endmacro %}
+<style>
+.catpick{margin:4px 0 12px}
+.cpchips{display:flex;gap:7px;flex-wrap:wrap}
+.cpc{width:auto;margin:0;min-height:0;padding:8px 14px;border-radius:99px;font-size:13px;font-weight:650;background:var(--surface);color:var(--muted);border:1px solid var(--line2);cursor:pointer}
+.cpc.on{background:var(--ink,#111);color:#fff;border-color:var(--ink,#111)}
+.cpc.new{border-style:dashed}
+.cpnew{display:flex;gap:8px;margin-top:8px}.cpnew input{margin:0;flex:1}.cpnew button{margin:0;width:auto}
+</style>
+<script>
+document.addEventListener('click',function(e){
+  var b=e.target.closest('.cpc,[data-addnew]');if(!b)return;
+  var box=b.closest('[data-cp]');if(!box)return;
+  var hid=box.querySelector('input[name=category]'),nw=box.querySelector('.cpnew');
+  if(b.dataset.new){nw.hidden=!nw.hidden;if(!nw.hidden)nw.querySelector('input').focus();return;}
+  if(b.dataset.addnew){
+    var inp=nw.querySelector('input'),v=inp.value.replace(/\\s+/g,' ').trim();if(!v)return;
+    var ex=[].slice.call(box.querySelectorAll('.cpc[data-v]')).filter(function(x){return x.dataset.v.toLowerCase()===v.toLowerCase();})[0];
+    if(!ex){ex=document.createElement('button');ex.type='button';ex.className='cpc';ex.dataset.v=v;ex.textContent=v;box.querySelector('.cpchips').insertBefore(ex,box.querySelector('.cpc.new'));}
+    inp.value='';nw.hidden=true;b=ex;
+  }
+  hid.value=b.dataset.v;
+  [].forEach.call(box.querySelectorAll('.cpc[data-v]'),function(x){x.classList.toggle('on',x===b);});
+});
+document.addEventListener('keydown',function(e){if(e.key==='Enter'&&e.target.closest('.cpnew')){e.preventDefault();e.target.closest('.cpnew').querySelector('[data-addnew]').click();}});
+</script>
 
 <div class="page-head"><h2>Products</h2>
 <div style="display:flex;gap:8px;flex-wrap:wrap"><button class="sm" type="button" onclick="var b=document.getElementById('addbox');b.hidden=!b.hidden;if(!b.hidden){b.scrollIntoView({behavior:'smooth'});}">+ Add product</button>
@@ -653,8 +681,8 @@ d.addEventListener('keydown',function(e){
 <textarea name="links" rows="5" placeholder="email:password&#10;email:password"></textarea>
 <label>Or upload a .txt file <span class="hint">one item per line</span></label>
 <input type="file" name="stockfile" accept=".txt,text/plain" multiple></div>
-<label>Category <span class="hint">optional, same category = one button group in the bot</span></label>
-<input name="category" list="cats" placeholder="e.g. Streaming">
+<label>Category <span class="hint">tap one, or + New. Same category = one button group in the bot</span></label>
+{{ catpick('', cats) }}
 <button type="submit">Add product</button>
 </form></div>
 
@@ -723,8 +751,8 @@ d.addEventListener('keydown',function(e){
 <label>Name</label><input name="name" value="{{ p.name }}" required>
 <label>Old price <span class="hint">optional, shows a % discount in the bot</span></label>
 <input name="old_price" type="number" step="0.01" min="0" value="{{ p.old_price or '' }}">
-<label>Category <span class="hint">same category = grouped under one button, empty = listed directly</span></label>
-<input name="category" list="cats" value="{{ p.category or '' }}">
+<label>Category <span class="hint">same category = grouped under one button, none = listed directly</span></label>
+{{ catpick(p.category or '', cats) }}
 <label>Type</label>
 <select name="kind">
 <option value="auto" {{ 'selected' if p.kind != 'manual' }}>Automatic delivery (from stock)</option>
@@ -1800,6 +1828,8 @@ def create_product():
     elif kind == "auto":
         msg += " No stock yet - open the product and use Add stock."
     flash(msg)
+    if f.get("next") == "catalog":
+        return redirect(url_for("catalog_admin.home"))
     return _back(pid)
 
 

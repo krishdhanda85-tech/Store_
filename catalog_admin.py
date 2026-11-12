@@ -78,6 +78,14 @@ PAGE = r"""{% extends 'base.html' %}{% block body %}
 .cc .sk{font-size:12px;opacity:.92;white-space:nowrap}
 .cc .sp{position:absolute;top:10px;right:10px;background:#00000040;border-radius:999px;padding:2px 9px;font-size:11px;font-weight:700}
 .cc .cost{font-size:11.5px;opacity:.8}
+.cc .ccat{font-size:11px;opacity:.9}
+.cc .ccat:empty{display:none}
+.cg-newcat{display:flex;gap:8px;margin:0 0 10px}.cg-newcat[hidden]{display:none}
+.cg-newcat input{flex:1;margin:0}.cg-newcat button{width:auto;margin:0;background:#2f2560;color:#fff;border:0}
+.cg-hint{font-size:12.5px;color:#a79fd6;margin:-2px 2px 10px}
+.cg-own form{margin-top:10px}.cg-own textarea{background:#221a47;border:1px solid #3a2f6b;color:#fff;border-radius:14px;width:100%}
+.cg-own select{width:100%}
+.cg-own .go{width:100%;background:linear-gradient(120deg,#7c3aed,#ec4899);color:#fff;border:0;border-radius:16px;padding:12px;font-weight:700}
 .cg-bar{position:sticky;bottom:10px;z-index:6;margin-top:14px}
 .cg-bar .in{background:#fff;color:#15102e;border-radius:22px;padding:8px 8px 8px 18px;display:flex;justify-content:space-between;align-items:center;gap:10px;box-shadow:0 16px 34px -10px #000}
 .cg-bar small{display:block;font-size:12px;color:#6b5fa8}
@@ -91,6 +99,18 @@ PAGE = r"""{% extends 'base.html' %}{% block body %}
 <div class="cgx">
 <div class="cg-hero"><small>Supplier catalog</small><b>{{ total }} products</b>
 <div class="pills"><span><span id="stk">0</span> in stock</span><span>{{ sups|length }} supplier{{ '' if sups|length == 1 else 's' }}</span></div></div>
+
+<details class="cg-set cg-own"><summary><span>+ Add my own product (not from a supplier)</span><b>Open</b></summary>
+<form method="post" action="{{ url_for('create_product') }}" id="own" enctype="multipart/form-data">
+<input type="hidden" name="next" value="catalog"><input type="hidden" name="kind" value="auto"><input type="hidden" name="category" id="owncat">
+<label>Product name</label><input name="name" required maxlength="120" placeholder="e.g. Netflix 1 month">
+<div class="cg-2"><div><label>Cost (what you paid)</label><input name="cost" type="number" step="0.01" min="0" inputmode="decimal" required placeholder="0.90"></div>
+<div><label>Selling price</label><input name="price" type="number" step="0.01" min="0" inputmode="decimal" required placeholder="1.10"></div></div>
+<label>Category</label>
+<select id="ownsel"><option value="">No category</option>{% for c in cats %}<option value="{{ c }}">{{ c }}</option>{% endfor %}<option value="__new">+ New category...</option></select>
+<input id="ownnew" placeholder="New category name" maxlength="60" hidden style="margin-top:8px">
+<label>Stock <span class="hint">optional, one item per line</span></label><textarea name="links" rows="3" placeholder="email:password"></textarea>
+<button type="submit" class="go">Add product</button></form></details>
 
 <form method="post" action="{{ url_for('catalog_admin.create') }}" id="imp">
 
@@ -114,14 +134,17 @@ PAGE = r"""{% extends 'base.html' %}{% block body %}
 <button type="button" class="cg-chip on" id="hideadded" onclick="tg(this)">Hide added</button>
 </div>
 
+<div class="cg-lbl">Category for the products you add</div>
+<div class="cg-chips" id="catbar"><button type="button" class="cg-chip on" data-cc="">Supplier's own</button>{% for c in cats %}<button type="button" class="cg-chip" data-cc="{{ c }}">{{ c }}</button>{% endfor %}<button type="button" class="cg-chip" id="newcat" style="border:1px dashed #a79fd6;background:transparent">+ New</button></div>
+<div class="cg-newcat" id="newcatbox" hidden><input id="newcatin" maxlength="60" placeholder="New category name" autocomplete="off"><button type="button" class="sm" id="newcatok">Add</button></div>
+<div class="cg-hint" id="cathint">Tip: pick a category first, then tap tiles. Or tap tiles first, then pick a category.</div>
+
 <details class="cg-set" id="set"><summary><span id="sumtxt">Markup 40% · Round 5c</span><b>Edit</b></summary>
 <div class="cg-setbody">
 <div class="cg-2">
 <div><label>Markup %</label><input id="pct" type="number" step="1" min="0" value="40" oninput="recalc()"></div>
 <div><label>+ Fixed ($)</label><input id="fix" type="number" step="0.05" min="0" value="0" oninput="recalc()"></div></div>
 <label>Round</label><select id="rnd" onchange="recalc()" style="width:100%"><option value="five" selected>Next 5 cents (1.23 → 1.25)</option><option value="x99">Ending .99</option><option value="none">No rounding</option></select>
-<label>Category for all selected <span class="hint">empty = supplier's category</span></label>
-<input name="category" list="cats" placeholder="e.g. AI tools" style="width:100%"><datalist id="cats">{% for c in cats %}<option value="{{ c }}">{% endfor %}</datalist>
 <p class="muted" style="margin:6px 0">Prices you type by hand are kept when you change the markup.</p>
 <button type="button" class="grey sm" onclick="resetPrices()">Reset prices</button>
 </div></details>
@@ -137,10 +160,10 @@ PAGE = r"""{% extends 'base.html' %}{% block body %}
 <input type="checkbox" class="pick" name="pick" value="{{ loop.index0 }}" hidden {{ 'disabled' if r.added }}>
 <span class="wm">{{ (r.name[:1] or '?')|upper }}</span><span class="tick">&#10003;</span><span class="sp">{{ r.sname }}</span>
 <input class="cn" name="name_{{ loop.index0 }}" value="{{ r.name }}" maxlength="120" title="{{ r.name }}" {{ 'disabled' if r.added }}>
-<div class="cost">cost ${{ '%.2f' % r.cost }}</div>
+<div class="cost">cost ${{ '%.2f' % r.cost }} <span class="ccat">{{ r.category }}</span></div>
 <div class="sell">$<input class="pr" name="price_{{ loop.index0 }}" type="number" step="0.01" min="0.01" aria-label="Sell price" {{ 'disabled' if r.added }}></div>
 <div class="low"><span class="pf"></span><span class="sk">{% if r.added %}In shop{% elif r.stock > 0 %}{{ r.stock }} left{% else %}out of stock{% endif %}</span></div>
-<input type="hidden" name="sid_{{ loop.index0 }}" value="{{ r.sid }}"><input type="hidden" name="key_{{ loop.index0 }}" value="{{ r.key }}">
+<input type="hidden" name="cat_{{ loop.index0 }}" value="{{ r.category }}" data-orig="{{ r.category }}"><input type="hidden" name="sid_{{ loop.index0 }}" value="{{ r.sid }}"><input type="hidden" name="key_{{ loop.index0 }}" value="{{ r.key }}">
 </div>
 {% endfor %}
 </div>
@@ -191,7 +214,32 @@ function sortit(){
   });
   a.forEach(function(r){l.appendChild(r);});
 }
-function setSel(r,on){var c=r.querySelector('.pick');if(c.disabled)return;c.checked=on;r.classList.toggle('on',on);}
+var activeCat='';
+function catIn(r){return r.querySelector('input[name^=cat_]');}
+function setCat(r,v){catIn(r).value=v;r.querySelector('.ccat').textContent=v;}
+function setSel(r,on){var c=r.querySelector('.pick');if(c.disabled)return;c.checked=on;r.classList.toggle('on',on);setCat(r,on&&activeCat?activeCat:catIn(r).dataset.orig);}
+function pickCat(b){
+  activeCat=b.dataset.cc;
+  Array.prototype.forEach.call(document.getElementById('catbar').querySelectorAll('.cg-chip[data-cc]'),function(x){x.classList.toggle('on',x===b);});
+  var n=0;rows().forEach(function(r){if(r.querySelector('.pick').checked){setCat(r,activeCat||catIn(r).dataset.orig);n++;}});
+  document.getElementById('cathint').textContent=activeCat?('Selected and next tapped products go to "'+activeCat+'"'+(n?' ('+n+' updated)':'')):'Each product keeps its supplier\'s own category.';
+}
+document.getElementById('catbar').addEventListener('click',function(e){
+  var b=e.target.closest('.cg-chip');if(!b)return;
+  if(b.id==='newcat'){var bx=document.getElementById('newcatbox');bx.hidden=!bx.hidden;if(!bx.hidden)document.getElementById('newcatin').focus();return;}
+  pickCat(b);
+});
+function addNewCat(){
+  var i=document.getElementById('newcatin'),v=i.value.replace(/\s+/g,' ').trim();if(!v)return;
+  var bar=document.getElementById('catbar'),b=Array.prototype.filter.call(bar.querySelectorAll('.cg-chip[data-cc]'),function(x){return x.dataset.cc.toLowerCase()===v.toLowerCase();})[0];
+  if(!b){b=document.createElement('button');b.type='button';b.className='cg-chip';b.dataset.cc=v;b.textContent=v;bar.insertBefore(b,document.getElementById('newcat'));}
+  i.value='';document.getElementById('newcatbox').hidden=true;pickCat(b);
+}
+document.getElementById('newcatok').addEventListener('click',addNewCat);
+document.getElementById('newcatin').addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();addNewCat();}});
+var os=document.getElementById('ownsel'),on_=document.getElementById('ownnew');
+os.addEventListener('change',function(){on_.hidden=os.value!=='__new';if(!on_.hidden)on_.focus();});
+document.getElementById('own').addEventListener('submit',function(){document.getElementById('owncat').value=os.value==='__new'?on_.value.trim():os.value;});
 function selShown(on){rows().forEach(function(r){if(!r.hidden)setSel(r,on);});count();}
 function count(){
   var sel=rows().filter(function(r){return r.querySelector('.pick').checked;}),n=sel.length,b=document.getElementById('go'),t=0;
@@ -289,7 +337,7 @@ def create():
     import web
     db = web.db
     f = request.form
-    category = (f.get("category") or "").strip()[:60] or None
+    bulk_category = (f.get("category") or "").strip()[:60] or None   # old forms
     catalogs = {}
 
     def cat_of(sid):
@@ -306,6 +354,7 @@ def create():
     ok, problems, below_cost = 0, [], 0
     for i in picks:
         name = _norm(f.get(f"name_{i}", ""))[:120]
+        category = (f.get(f"cat_{i}") or "").strip()[:60] or bulk_category
         key = f.get(f"key_{i}", "")
         try:
             sid = int(f.get(f"sid_{i}", "0"))
@@ -349,13 +398,13 @@ def create():
         except Exception as e:
             problems.append(f"{name}: {str(e)[:120]}")
     if ok:
-        flash(f"{ok} product{'s' if ok != 1 else ''} added and linked to the supplier."
+        flash(f"{ok} product{'s' if ok != 1 else ''} added to your shop and linked to the supplier."
               + (f" {below_cost} priced at or below cost, check the prices." if below_cost else ""))
     for p in problems[:8]:
         flash(p, "err")
     if len(problems) > 8:
         flash(f"... and {len(problems) - 8} more problems.", "err")
-    return redirect(url_for("products") if ok else url_for("catalog_admin.home"))
+    return redirect(url_for("catalog_admin.home"))
 
 
 def register(app):
