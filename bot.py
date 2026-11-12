@@ -1101,10 +1101,12 @@ def shop_view(uid: int, language: str, category: str = None, page: int = 0):
         if FLAT_GRID:
             # only the brand folders (Netflix, Spotify ...) + a plain grid of every other product
             have = [f for f in FOLDER_NAMES if any(folder_of(p) == f for p in products)]
+            # + folders you create yourself: just type a Category on the product in the web admin
+            have += [c for c in cat_children(None) if c not in FOLDER_NAMES]
             if page == 0:
                 for i in range(0, len(have), GRID_COLS):
                     rows.append([category_button(c) for c in have[i:i + GRID_COLS]])
-            shown = [p for p in products if folder_of(p) is None]
+            shown = [p for p in products if folder_of(p) is None and not (p["category"] or "").strip()]
         else:
             cats = cat_children(None)
             if cats and page == 0:        # categories (if the admin uses them) are one row of buttons above the grid
