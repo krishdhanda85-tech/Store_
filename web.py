@@ -41,6 +41,8 @@ from smart_admin import register as register_smart_admin
 register_smart_admin(app)
 from catalog_admin import register as register_catalog_admin
 register_catalog_admin(app)
+from compare_admin import register as register_compare_admin
+register_compare_admin(app)
 from alerts_admin import register as register_alerts_admin
 register_alerts_admin(app)
 from netflix_otp import register_admin as register_otp_admin
@@ -291,6 +293,7 @@ a:hover{text-decoration:underline}
 {{ nl('manual','Pending orders','clock',pending_count) }}
 {{ nl('products','Products','box') }}
 {{ nl('catalog_admin.home','Supplier catalog','link') }}
+{{ nl('compare_admin.pick','Compare prices','sliders',0,'compare_admin.view') }}
 {{ nl('alerts_admin.home','Stock alerts','clock') }}
 {{ nl('profit_centre','Profit centre','card') }}
 <div class="grp">Payments</div>

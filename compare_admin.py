@@ -1001,7 +1001,7 @@ def view():
 _CMP_CSS = r"""<style>
 .cp-chips{display:flex;gap:8px;overflow-x:auto;padding:4px 0 2px}
 .cp-chip{flex:none;display:inline-flex;align-items:center;min-height:44px;padding:0 16px;border-radius:999px;border:1px solid var(--line2);background:var(--surface);color:var(--ink);font-weight:600;font-size:13px;text-decoration:none;white-space:nowrap}
-.cp-chip.on{background:var(--accent);border-color:var(--accent);color:var(--surface)}
+.cp-chip.on{background:var(--accent);border-color:var(--accent);color:var(--bg)}
 .cp-list{padding:0;overflow:hidden}
 .cp-lab{padding:14px 16px 6px;font-size:12px;font-weight:600;letter-spacing:.06em;color:var(--muted)}
 .cp-row{display:flex;align-items:center;gap:12px;min-height:60px;padding:8px 16px;border-bottom:1px solid var(--line);text-decoration:none;color:var(--ink)}
@@ -1012,7 +1012,7 @@ _CMP_CSS = r"""<style>
 .cp-off{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line)}
 .cp-off.best{background:var(--accent-soft)}
 .cp-rank{flex:none;width:26px;height:26px;border-radius:13px;background:var(--grey);color:var(--greyink);display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700}
-.cp-off.best .cp-rank{background:var(--accent);color:var(--surface)}
+.cp-off.best .cp-rank{background:var(--accent);color:var(--bg)}
 .cp-bar{height:8px;border-radius:4px;background:var(--grey);margin-top:6px}
 .cp-bar i{display:block;height:8px;border-radius:4px;background:var(--bar)}
 .cp-off.best .cp-bar i{background:var(--accent)}
