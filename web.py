@@ -45,6 +45,8 @@ from compare_admin import register as register_compare_admin
 register_compare_admin(app)
 from alerts_admin import register as register_alerts_admin
 register_alerts_admin(app)
+from folders_admin import register as register_folders_admin
+register_folders_admin(app)
 from netflix_otp import register_admin as register_otp_admin
 register_otp_admin(app)
 from netflix_admin import register_admin as register_netflix_admin
@@ -295,6 +297,7 @@ a:hover{text-decoration:underline}
 {{ nl('catalog_admin.home','Supplier catalog','link') }}
 {{ nl('compare_admin.pick','Compare prices','sliders',0,'compare_admin.view') }}
 {{ nl('alerts_admin.home','Stock alerts','clock') }}
+{{ nl('folders_admin.home','Folders','box') }}
 {{ nl('profit_centre','Profit centre','card') }}
 <div class="grp">Payments</div>
 {{ nl('upipay','UPI payments','card',upi_pending) }}

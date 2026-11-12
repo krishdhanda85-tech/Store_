@@ -618,8 +618,39 @@ def _sq(t):
     return re.sub(r"[^a-z0-9]", "", (t or "").casefold())
 
 
+_FI_CACHE = {"t": 0.0, "map": {}}
+
+
+def explicit_folder_map():
+    """{product id: folder name} for products ticked inside a folder on the admin site (cached 2 s)."""
+    import time as _t
+    if _t.time() - _FI_CACHE["t"] < 2:
+        return _FI_CACHE["map"]
+    names = set(custom_folders())
+    m = {}
+    for f, ids in _jload("shop_folder_items", {}).items():
+        if f in names and isinstance(ids, list):
+            for i in ids:
+                try:
+                    m.setdefault(int(i), f)
+                except (TypeError, ValueError):
+                    pass
+    _FI_CACHE["t"], _FI_CACHE["map"] = _t.time(), m
+    return m
+
+
+def explicit_folder_of(p):
+    return explicit_folder_map().get(p["id"])
+
+
 def custom_folder_of(p):
-    """Name of the admin-made folder this product belongs to (its name or category contains the folder name)."""
+    """Name of the admin-made folder this product belongs to: ticked on the site first,
+    else (old name-only folders) its name or category contains the folder name."""
+    ef = explicit_folder_of(p)
+    if ef:
+        return ef
+    if folder_of(p) is not None:
+        return None
     hay = _sq((p["name"] or "") + " " + (p["category"] or ""))
     for f in custom_folders():
         k = _sq(f)
@@ -1100,6 +1131,8 @@ FOLDER_NAMES = [f[0] for f in FOLDERS]
 
 
 def folder_of(p):
+    if explicit_folder_of(p):
+        return None            # ticked into an admin-made folder -> not in a brand folder
     sq = re.sub(r"[^a-z0-9]", "", ((p["name"] or "") + " " + (p["category"] or "")).casefold())
     for name, words in FOLDERS:
         if any(w in sq for w in words):
