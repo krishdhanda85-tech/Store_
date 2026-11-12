@@ -1215,7 +1215,8 @@ def view():
     return web.render_str(VIEW_PAGE, g=g, rows=rows, idx=idx, sims=sims, merged=merged, sugg=sugg, auto=au, total=len(seq), q=q, cat=cat, m=m, mm=("all" if m else None),
                           prev_g=seq[idx - 1] if idx > 0 else None,
                           next_g=seq[idx + 1] if idx + 1 < len(seq) else None,
-                          your_price=your_price, profit=profit, n_sup=n_sup)
+                          your_price=your_price, profit=profit, n_sup=n_sup,
+                          cats=sorted({(p["category"] or "").strip() for p in web.db.list_products() if (p["category"] or "").strip()}, key=str.casefold))
 
 
 @bp.route("/compare/merge", methods=["POST"])
@@ -1266,6 +1267,37 @@ def smartlink():
             flash(str(e)[:120], "err")
     for b in bad[:4]:
         flash(b, "err")
+    return redirect(url_for("compare_admin.view", g=gkey))
+
+
+@bp.route("/compare/addone", methods=["POST"])
+def addone():
+    """Add ONE compared product straight to the shop (no Compare & import page in between)."""
+    import web
+    db = web.db
+    gkey = (request.form.get("gkey") or "")[:300]
+    g = _group_by_key(db, gkey)
+    try:
+        price = round(float(request.form.get("price", "")), 2)
+    except ValueError:
+        price = 0
+    if not g or price <= 0:
+        flash("Enter a valid price.", "err")
+        return redirect(url_for("compare_admin.view", g=gkey))
+    names = {re.sub(r"\s+", " ", p["name"]).strip().casefold(): p["id"] for p in db.list_products()}
+    name = re.sub(r"\s+", " ", g["name"]).strip()[:120]
+    category = (request.form.get("category") or g.get("category") or "").strip()[:60] or None
+    offers = [(int(o["sid"]), str(o["key"])) for o in g["offers"]]
+    try:
+        added, below, problems = import_one(db, name, price, category, offers, {}, names)
+    except Exception as e:
+        flash(f"{name}: {str(e)[:120]}", "err")
+        return redirect(url_for("compare_admin.view", g=gkey))
+    if added:
+        flash(f"{name} added to your shop at ${price:.2f}. The cheapest supplier with stock is used automatically."
+              + (" Price is at or below cost, check it!" if below else ""))
+    for pr in problems[:4]:
+        flash(pr, "err")
     return redirect(url_for("compare_admin.view", g=gkey))
 
 
@@ -1798,8 +1830,13 @@ VIEW_PAGE = r"""{% extends 'base.html' %}{% block body %}
 {% for m in merged %}<div class="cp-off"><div class="cp-main">{{ m.name }}</div><form method="post" action="{{ url_for('compare_admin.merge') }}"><input type="hidden" name="src" value="{{ m.src }}"><input type="hidden" name="dst" value="{{ g.gkey }}"><input type="hidden" name="act" value="remove"><button class="grey sm" type="submit">Unmerge</button></form></div>{% endfor %}</div>{% endif %}
 <div style="display:flex;gap:10px;flex-wrap:wrap">
 <a href="{{ url_for('compare_admin.view', g=g.gkey, q=q, cat=cat, m=mm, refresh=1) }}"><button type="button" class="grey">Refresh prices</button></a>
-{% if your_price is none %}<a href="{{ url_for('compare_admin.home') }}"><button type="button">Import this product</button></a>{% endif %}
 </div>
+{% if your_price is none %}<form method="post" action="{{ url_for('compare_admin.addone') }}" class="card"><input type="hidden" name="gkey" value="{{ g.gkey }}">
+<div class="muted">ADD TO MY SHOP</div>
+<label>Category <span class="hint">e.g. AI Tools / Claude</span></label><input name="category" list="addcats" value="{{ g.category }}" placeholder="Category" autocomplete="off">
+<datalist id="addcats">{% for c in cats %}<option value="{{ c }}">{% endfor %}</datalist>
+<label>Your price ($)</label><input name="price" type="number" step="0.01" min="0.01" value="{{ '%.2f'|format(sugg) if sugg else '' }}" required>
+<button type="submit" class="green" style="margin-top:10px">Add this product</button></form>{% endif %}
 </div>{% endblock %}"""
 
 
