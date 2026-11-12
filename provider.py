@@ -892,9 +892,7 @@ class ShopDB(Database):
                     c.execute("UPDATE product_sources SET cost=?, stock=?, last_sync=? WHERE id=?",
                               (p["cost"], p["stock"], _now(), r["id"]))
                     # fill an empty category / description from the supplier (never overwrites what you set)
-                    if p.get("category"):
-                        c.execute("UPDATE products SET category=? WHERE id=? AND (category IS NULL OR TRIM(category)='')",
-                                  (str(p["category"])[:60], r["product_id"]))
+                    # (category auto-fill from supplier removed: shop uses no categories)
                     if p.get("description"):
                         c.execute("UPDATE products SET description=? WHERE id=? AND (description IS NULL OR TRIM(description)='')",
                                   (str(p["description"])[:1000], r["product_id"]))
