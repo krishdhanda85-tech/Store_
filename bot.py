@@ -345,6 +345,19 @@ def tt(language: str, key: str, /, **kw) -> str:
     raise KeyError(key)
 
 
+PLAIN_BUTTONS = os.getenv("PLAIN_BUTTONS", "1") != "0"        # 1 = no coloured emojis / logos on buttons (text only)
+_LEAD_EMOJI_RE = re.compile(r"^[\s\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\u2300-\u23FF\uFE0F\u200d]+")
+
+
+def plain_label(text):
+    """Button text without its leading emoji (the text keeps the theme colour, white on a dark theme)."""
+    if not PLAIN_BUTTONS or not isinstance(text, str):
+        return text
+    out = _LEAD_EMOJI_RE.sub("", text).strip()
+    return out or text
+
+
+NEUTRAL_BUTTONS = os.getenv("NEUTRAL_BUTTONS", "1") != "0"   # 1 = plain white/neutral buttons everywhere (0 = coloured)
 BLUE_ONLY = os.getenv("BLUE_ONLY", "1") != "0"           # 1 = all buttons blue (set 0 to get green buttons back)
 # Premium emoji (brand logos) in buttons and texts are ON by default; PREMIUM_EMOJI=0 turns them all off.
 PREMIUM_EMOJI = os.getenv("PREMIUM_EMOJI", "1") != "0"
@@ -361,25 +374,32 @@ def noanim(text):
 BUTTON_ICONS = PREMIUM_EMOJI and os.getenv("BUTTON_ICONS", "1") != "0"   # premium emoji inside buttons (needs Telegram Premium on the bot owner)
 
 
-def Btn(text, callback_data=None, style=None, url=None, icon=None):
+def Btn(text, callback_data=None, style=None, url=None, icon=None, keep=False):
     """Inline button with optional colour ('primary' blue, 'success' green, 'danger' red) and an
     optional premium custom emoji shown before the text (icon = custom emoji ID).
     Colours/icons need a Telegram app released after 9 Feb 2026; older apps show a normal button."""
     kwargs = {"callback_data": callback_data} if url is None else {"url": url}
     extra = {}
-    if style is None and BLUE_ONLY and callback_data != "noop":
+    if NEUTRAL_BUTTONS and style in ("primary", "success", "green"):
+        style = None                         # plain (white/neutral) buttons; only red (sold out / cancel) stays coloured
+    if style is None and BLUE_ONLY and not NEUTRAL_BUTTONS and callback_data != "noop":
         style = "primary"                    # buttons without a colour are blue too
     if style == "success" and BLUE_ONLY:     # every green button becomes blue (red = sold out stays red)
         style = "primary"
     elif style == "green":                   # a button that must stay green (Supply With Us)
         style = "success"
-    if not icon and BUTTON_ICONS:
+    plain = PLAIN_BUTTONS and not keep         # keep=True: product / folder buttons keep their logo emoji
+    if plain:
+        icon = None
+    elif not icon and BUTTON_ICONS:
         try:
             text, icon = ui_button_icon(text)      # rules the admin set with /emoji
         except Exception:
             pass
     if icon and BUTTON_ICONS and str(icon).isdigit():
         extra["icon_custom_emoji_id"] = str(icon)
+    if plain:
+        text = plain_label(text)
     if style:
         try:
             return _Btn(text, style=style, api_kwargs=extra or None, **kwargs)
@@ -423,11 +443,12 @@ def strip_icons(markup):
 
 
 # ---------------------------------------------------------------- small helpers
-MENU = {
+EMOJI_MENU = {
     "shop": "🛍 Products", "funds": "👛 Wallet", "orders": "🧾 Orders", "promo": "🎁 Gift code",
     "profile": "👤 Profile", "api": "🔑 API Key", "support": "🎧 Support", "settings": "🌐 Language",
     "warranty": "🛡 Warranty",
 }
+MENU = dict(EMOJI_MENU)     # bottom keyboard menu keeps its emoji; only the inline buttons are text-only
 # labels of the old bottom menu still open the right screen for customers who did not send /start yet
 LEGACY_MENU = {
     "🛍 Shop": "shop", "💳 Add Funds": "funds", "👤 Profile": "profile", "🧾 My Orders": "orders",
@@ -435,11 +456,14 @@ LEGACY_MENU = {
     "🔑 API": "api",
 }
 MENU_BY_LABEL = {v: k for k, v in MENU.items()}
+MENU_BY_LABEL.update({v: k for k, v in EMOJI_MENU.items()})    # keyboards customers already have keep working
 MENU_BY_LABEL.update(LEGACY_MENU)
 MENU_RE = "^(" + "|".join(re.escape(v) for v in MENU_BY_LABEL) + ")$"
 
 
 def _kb(text, style="primary"):
+    if NEUTRAL_BUTTONS or not style:
+        return KeyboardButton(text)
     return KeyboardButton(text, api_kwargs={"style": style})
 
 
@@ -1239,8 +1263,8 @@ def grid_button(uid: int, p, full: bool = False):
     if p["id"] in growth_bot.live_flash_ids():
         label = "⚡" + label
     if is_available(p):
-        return Btn(label, callback_data=f"prod:{p['id']}", icon=icon)
-    return Btn(label, callback_data=f"prod:{p['id']}", style="danger", icon=icon)
+        return Btn(label, callback_data=f"prod:{p['id']}", icon=icon, keep=True)
+    return Btn(label, callback_data=f"prod:{p['id']}", style="danger", icon=icon, keep=True)
 
 
 def category_button(c: str):
@@ -1250,7 +1274,7 @@ def category_button(c: str):
     icon = product_icon_id(name)
     if not icon:
         label = "📂 " + label          # no premium icon configured for this name -> plain folder emoji
-    return Btn(label, callback_data=f"cat:{cat_key(c)}", icon=icon)
+    return Btn(label, callback_data=f"cat:{cat_key(c)}", icon=icon, keep=True)
 
 
 def shop_view(uid: int, language: str, category: str = None, page: int = 0):
@@ -1435,7 +1459,7 @@ def warranty_view(uid: int, language: str):
     custom = (db.get_setting("warranty_text", "") or "").strip()
     body = esc(custom) if custom else tt(language, "warranty_default")
     return tt(language, "warranty", text=body), Markup(growth_bot.warranty_rows() + [
-        [Btn("🎧 " + MENU["support"].split(" ", 1)[1], callback_data="menu:support", style="primary")],
+        [Btn("🎧 " + MENU["support"].split(" ", 1)[-1], callback_data="menu:support", style="primary")],
         main_menu_row(language)])
 
 
@@ -1792,7 +1816,12 @@ async def menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     db.touch_username(update.effective_user.id, update.effective_user.username)
     db.set_first_name(update.effective_user.id, update.effective_user.first_name)
-    await show_menu(update, context, MENU_BY_LABEL[update.message.text])
+    msg = update.message
+    await show_menu(update, context, MENU_BY_LABEL[msg.text])
+    try:                                   # remove the tapped label ("Products", "Wallet"...) so the chat does not fill up and jump
+        await msg.delete()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------- callbacks
@@ -4119,6 +4148,7 @@ def build_application(tenant):
     netflix_otp.register_bot(app)
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.Regex(MENU_RE), menu_text))
+    app.add_handler(MessageHandler(filters.Regex("^" + re.escape(plain_label(netflix_otp.BTN_LABEL)) + "$"), netflix_otp.otp_msg))
     app.add_handler(MessageHandler(filters.PHOTO, photo_msg))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_msg))
     app.job_queue.run_repeating(_in_shop(expiry_job), interval=20, first=10)
