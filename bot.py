@@ -24,6 +24,7 @@ import binance_withdraw
 import fampay_verify
 import growth_bot
 import netflix_otp
+import orders_plus
 import provider
 import textedit
 import reseller_api
@@ -44,6 +45,7 @@ TIERS_ENV = os.getenv("TIERS", "")                        # e.g. "10:Bronze,50:S
 HTML = ParseMode.HTML
 QTY_PRESETS = (1, 5, 10, 20, 30, 50, 100)
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+MAX_BULK = 50                                              # emails in one made-to-order purchase
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("digital-shop")
@@ -155,7 +157,7 @@ TEXT = {
         "need_more": "\n\n⚠️ Not enough balance — you need <b>${need}</b> more.",
         "bought": "🎉 <b>Order complete!</b>\n\n🧾 Order: <code>{order}</code>\n📦 {name} × {qty}\n\n🔑 <b>Your item(s):</b>\n{items}\n\n👛 Balance: ${bal}",
         "email_prompt_default": "Send the email for this order.",
-        "email_ask": "✏️ <b>{prompt}</b>\n\n<i>Send it in one message.</i>",
+        "email_ask": "✏️ <b>{prompt}</b>\n\n<i>Send it in one message. Need several? Send one email per line - each one becomes its own order (up to 50).</i>",
         "email_invalid": "That doesn't look like an email address. Please send it again.",
         "confirm": "🧾 <b>Confirm order</b>\n\n📦 {name}\n📧 {contact}\n💰 Price: <b>${price}</b>\n⏳ Delivery: {delivery}\n\nThe amount is held from your balance. If we can't complete the order it is refunded.",
         "btn_confirm": "✅ Confirm — ${price}",
@@ -1106,7 +1108,7 @@ def clear_await(context):
 
 
 def main_menu_row(language):
-    return [Btn(tt(language, "main_menu"), callback_data="shop", style="primary")]
+    return [Btn(tt(language, "main_menu"), callback_data="home", style="primary")]
 
 
 # ---------------------------------------------------------------- views
@@ -1141,9 +1143,9 @@ def folder_of(p):
 
 
 FLAT_GRID = os.getenv("FLAT_GRID", "1").strip() != "0"     # 1 = only the 3-column product grid (no category folders)
-GRID_COLS = 3
-GRID_PAGE_SIZE = 30            # 10 rows x 3 columns
-SHORT_NAME = 18
+GRID_COLS = 2
+GRID_PAGE_SIZE = 20            # 10 rows x 2 columns
+SHORT_NAME = 20
 
 
 CAT_PAGE_SIZE = 15             # inside a category: one full-width button per row
@@ -1162,6 +1164,8 @@ def grid_button(uid: int, p, full: bool = False):
         label = (name if len(name) <= room else name[:room - 1].rstrip() + "…") + tail
     else:
         label = name if len(name) <= SHORT_NAME else name[:SHORT_NAME - 1].rstrip() + "…"
+        if is_available(p) and not is_manual(p):
+            label += f" · {p['stock']}"          # how many are left
     icon = product_icon_for(p)
     if p["id"] in growth_bot.live_flash_ids():
         label = "⚡" + label
@@ -1378,7 +1382,90 @@ def profile_view(user, language: str):
 STATUS_ICON = {"paid": "✅", "processing": "⏳", "pending": "⏳", "failed": "❌", "refunded": "↩️"}
 
 
-def orders_view(uid: int, language: str):
+def home_view(uid: int, language: str):
+    """Main menu (Cupon'sHub style): green = buy / orders, blue = account / help, two per row."""
+    text = "🏠 <b>Main menu</b>\n👇 Choose an option:"
+    rows = [
+        [Btn("🛍 Buy products", callback_data="shop", style="success"), Btn("💰 Wallet", callback_data="menu:funds", style="primary")],
+        [Btn("📦 My orders", callback_data="menu:orders", style="success"), Btn("🎧 Support", callback_data="menu:support", style="primary")],
+        [Btn("🔑 API", callback_data="menu:api", style="success"), Btn("🎁 Refer & earn", callback_data="menu:ref", style="primary")],
+        [Btn("🛡 Warranty", callback_data="menu:warranty", style="success"), Btn("🌐 Language", callback_data="menu:settings", style="primary")],
+    ]
+    return text, Markup(rows)
+
+
+ORDERS_PAGE = 8
+
+
+def orders_view(uid: int, language: str, page: int = 0):
+    """My Orders: one button per purchase (a bulk purchase is one line), newest first, with paging."""
+    page = max(int(page or 0), 0)
+    groups, total = db.user_order_groups(uid, ORDERS_PAGE, page * ORDERS_PAGE)
+    if not groups and page == 0:
+        return (tt(language, "no_orders"),
+                Markup([[Btn("🛍 " + tt(language, "browse"), callback_data="shop", style="success")]]))
+    pages = max(1, (total + ORDERS_PAGE - 1) // ORDERS_PAGE)
+    rows = []
+    for g in groups:
+        short = str(g["gid"]).replace("ORD-", "")
+        nm = (g["name"] or "Product")
+        nm = nm if len(nm) <= 16 else nm[:15].rstrip() + "…"
+        qty = f" ×{int(g['qty'])}" if int(g["qty"] or 1) > 1 else ""
+        label = f"{orders_plus.group_icon(g)} {short} · {nm}{qty} · {orders_plus.group_summary(g)}"
+        style = "primary" if int(g["pend"] or 0) else "success"
+        rows.append([Btn(label[:60], callback_data=f"ord:{g['gid']}", style=style)])
+    if pages > 1:
+        rows.append([Btn("‹", callback_data=f"omy:{max(page - 1, 0)}", style="primary"),
+                     Btn(f"{page + 1}/{pages}", callback_data="noop"),
+                     Btn("›", callback_data=f"omy:{min(page + 1, pages - 1)}", style="primary")])
+    try:
+        for o in db.unreviewed_orders(uid, 1):
+            rows.append([Btn(f"⭐ Rate: {(o['name'] or 'Product')[:28]}", callback_data=f"g:rv:{o['id']}:0")])
+    except Exception:
+        pass
+    rows.append(main_menu_row(language))
+    return (f"🧾 <b>My orders</b>\n<i>{total} order(s) · page {page + 1}/{pages}</i>\n"
+            "Tap an order to see it or download the file."), Markup(rows)
+
+
+def order_detail_view(uid: int, gid: str, language: str):
+    rows = db.group_orders(uid, gid)
+    if not rows:
+        return None
+    name = rows[0]["pname"] or "Product"
+    qty = sum(int(r["quantity"] or 0) for r in rows)
+    total = sum(float(r["amount"] or 0) for r in rows)
+    done = sum(1 for r in rows if r["status"] == "paid")
+    pend = sum(1 for r in rows if r["status"] in ("processing", "pending"))
+    bad = sum(1 for r in rows if r["status"] in ("refunded", "failed"))
+    summ = ", ".join(x for x in (f"{done} done" if done else "", f"{pend} pending" if pend else "",
+                                 f"{bad} refunded" if bad else "") if x) or "-"
+    items = db.items_of([r["id"] for r in rows])
+    lines = [f"🧾 <b>Order</b> <code>{esc(gid)}</code>",
+             f"📦 {esc(name)}" + (f" × {qty}" if qty > 1 else "") + f" · ${money(total)}",
+             f"🕒 {esc(orders_plus._date(rows[0]['created_at']))}", f"📊 {esc(summ)}", ""]
+    delivered = [it for r in rows for it in items.get(r["id"], [])]
+    if delivered:
+        if len(delivered) <= 3:
+            lines += [f"<code>{esc(it)}</code>" for it in delivered]
+        else:
+            lines.append(f"📄 {len(delivered)} items delivered - they are in the file.")
+    else:
+        for r in rows[:40]:
+            note = f" - {esc(r['admin_note'])}" if r["admin_note"] else ""
+            lines.append(f"{orders_plus.ICON.get(r['status'], '•')} <code>{esc(r['id'])}</code> {esc(r['contact'] or '')}"
+                         f" · {orders_plus.word(r['status'])}{note}")
+        if len(rows) > 40:
+            lines.append(f"… and {len(rows) - 40} more (see the file)")
+    markup = Markup([
+        [Btn("📄 Download file (TXT)", callback_data=f"otxt:{gid}", style="success")],
+        [Btn("🔁 Reorder", callback_data=f"prod:{rows[0]['product_id']}", style="primary"),
+         Btn("🛡 Warranty", callback_data="menu:warranty", style="primary")],
+        [Btn(tt(language, "back"), callback_data="omy:0", style="primary")]])
+    return "\n".join(lines), markup
+
+
+def _old_orders_view_unused(uid: int, language: str):
     orders = db.user_orders(uid)
     if not orders:
         return (tt(language, "no_orders"),
@@ -1554,7 +1641,7 @@ async def send_start_screen(message, user, context):
         return
     await message.reply_text(welcome_text(language),
                              reply_markup=main_keyboard(), parse_mode=HTML)
-    text, markup = shop_view(user.id, language)
+    text, markup = home_view(user.id, language)
     await message.reply_text(text, reply_markup=markup, parse_mode=HTML)
 
 
@@ -1634,7 +1721,7 @@ async def cb_lang(update, context, arg):
     await q.answer()
     await edit(q, tt(arg, "lang_set"))
     await q.message.reply_text(welcome_text(arg), reply_markup=main_keyboard(), parse_mode=HTML)
-    text, markup = shop_view(q.from_user.id, arg)
+    text, markup = home_view(q.from_user.id, arg)
     await q.message.reply_text(text, reply_markup=markup, parse_mode=HTML)
 
 
@@ -1660,6 +1747,42 @@ async def cb_shop(update, context, arg):
         await edit(q, text, markup)
         return
     await show_menu(update, context, "shop")
+
+
+async def cb_home(update, context, arg):
+    q = update.callback_query
+    await q.answer()
+    clear_await(context)
+    await edit(q, *home_view(q.from_user.id, lang(q.from_user.id)))
+
+
+async def cb_omy(update, context, arg):
+    q = update.callback_query
+    await q.answer()
+    await edit(q, *orders_view(q.from_user.id, lang(q.from_user.id), int(arg) if arg.isdigit() else 0))
+
+
+async def cb_ord(update, context, arg):
+    q = update.callback_query
+    view = order_detail_view(q.from_user.id, arg, lang(q.from_user.id))
+    if not view:
+        await q.answer("Order not found.", show_alert=True)
+        return
+    await q.answer()
+    await edit(q, *view)
+
+
+async def cb_otxt(update, context, arg):
+    """Send the order file again (.txt): delivered items, or the status of every email."""
+    q = update.callback_query
+    rows = db.group_orders(q.from_user.id, arg)
+    if not rows:
+        await q.answer("Order not found.", show_alert=True)
+        return
+    await q.answer()
+    items = db.items_of([r["id"] for r in rows])
+    fname, data = orders_plus.build_txt(arg, rows, items, rows[0]["pname"] or "Product")
+    await q.message.reply_document(document=io.BytesIO(data), filename=fname, caption=f"📄 Order {arg}")
 
 
 async def cb_noop(update, context, arg):
@@ -1776,7 +1899,16 @@ async def cb_bal(update, context, arg):
         log.exception("could not add the Get OTP button")
     rows.append([Btn("🛍 " + tt(language, "browse"), callback_data="shop", style="success")])
     markup = Markup(rows)
-    await edit(q, delivery_text(language, order, items), markup)
+    if len(items) > 3:        # long orders: items go in the file, the chat message stays short
+        await edit(q, delivery_text(language, order, ["file below ⬇️"]), markup)
+    else:
+        await edit(q, delivery_text(language, order, items), markup)
+    try:
+        fname, data = orders_plus.build_txt(order_id, db.group_orders(uid, order_id), db.items_of([order_id]),
+                                            p_sold["name"] if p_sold else "Product")
+        await q.message.reply_document(document=io.BytesIO(data), filename=fname, caption=f"📄 Order {order_id}")
+    except Exception:
+        log.exception("could not send the order file")
 
 
 async def cb_cancel_flow(update, context, arg):
@@ -1801,10 +1933,11 @@ async def cb_manual_ok(update, context, arg):
         return
     info = db.price_info(uid, p["id"], p["price"], 1, True)
     unit = info["unit"]
-    result = db.buy_manual(uid, p["id"], unit, pending["contact"])
+    contacts = pending.get("contacts") or [pending["contact"]]
+    result = db.buy_manual_bulk(uid, p["id"], unit, contacts)
     if result == "balance":
         await q.answer()
-        need = unit - float(db.get_account(uid)["balance"] or 0)
+        need = unit * len(contacts) - float(db.get_account(uid)["balance"] or 0)
         markup = Markup([[Btn(tt(language, "btn_addfunds"), callback_data="fund", style="success")], main_menu_row(language)])
         await edit(q, tt(language, "need_more", need=money(max(need, 0))).strip(), markup)
         return
@@ -1812,17 +1945,20 @@ async def cb_manual_ok(update, context, arg):
     context.user_data.pop("manual", None)
     if info["promo_code"]:
         db.promo_consume(uid)
+    gid, sub_ids = result
+    n = len(contacts)
     delivery = (p["delivery"] or "").strip() or tt(language, "default_manual_delivery")
-    await edit(q, tt(language, "placed", order=esc(result), name=card_name_html(p), contact=esc(pending["contact"]),
-                     delivery=esc(delivery)),
-               Markup([main_menu_row(language)]))
+    placed_contact = "\n".join(f"{sid} · {c}" for sid, c in zip(sub_ids, contacts)) if n > 1 else contacts[0]
+    await edit(q, tt(language, "placed", order=esc(gid), name=card_name_html(p) + (f" × {n}" if n > 1 else ""),
+                     contact=esc(placed_contact), delivery=esc(delivery)),
+               Markup([[Btn("📦 My orders", callback_data="menu:orders", style="success")], main_menu_row(language)]))
     if manual_alerts():
         u = q.from_user
         site = public_url()
         who = f"@{esc(u.username)}" if u.username else esc(u.full_name)
         await notify_admins(context,
-                            f"🆕 <b>New order to deliver</b>\n\n🧾 <code>{esc(result)}</code>\n📦 {esc(p['name'])} · ${money(unit)}\n"
-                            f"📧 <code>{esc(pending['contact'])}</code>\n👤 {who} ({u.id})\n\n"
+                            f"🆕 <b>New order to deliver</b>\n\n🧾 <code>{esc(gid)}</code>{f' ({n} orders)' if n > 1 else ''}\n📦 {esc(p['name'])} · ${money(unit)}{' each' if n > 1 else ''}\n"
+                            f"📧 <code>{esc(chr(10).join(contacts))}</code>\n👤 {who} ({u.id})\n\n"
                             + (f"Open: {esc(site)}/manual" if site else "Open the admin site → Pending orders."))
 
 
@@ -2221,7 +2357,7 @@ CALLBACKS = {
     "cat": cb_cat, "prod": cb_prod, "buy": cb_buy, "qty": cb_qty, "qtyo": cb_qty_other, "bal": cb_bal,
     "cx": cb_cancel_flow, "mok": cb_manual_ok, "search": cb_search, "fm": cb_fund_method,
     "fc": cb_dep_check, "ftx": cb_dep_txhash, "fx": cb_dep_cancel, "sup": cb_support,
-    "fu": cb_upi_paid, "api": cb_api, "noop": cb_noop, "adm": cb_admin,
+    "fu": cb_upi_paid, "api": cb_api, "noop": cb_noop, "home": cb_home, "omy": cb_omy, "ord": cb_ord, "otxt": cb_otxt, "adm": cb_admin,
     "g": growth_bot.cb_growth,
 }
 
@@ -2375,21 +2511,30 @@ async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(view[0], reply_markup=view[1], parse_mode=HTML)
 
     elif kind == "email":
-        if not EMAIL_RE.match(text):
-            await msg.reply_text(tt(language, "email_invalid"))
+        contacts = [x for x in re.split(r"[\s,;]+", text) if x]      # one email per line (or space / comma)
+        bad = [x for x in contacts if not EMAIL_RE.match(x)]
+        if not contacts or bad:
+            await msg.reply_text(tt(language, "email_invalid") + (("\n\n" + "\n".join(bad[:10])) if bad else ""))
+            return
+        if len(contacts) > MAX_BULK:
+            await msg.reply_text(f"Maximum {MAX_BULK} emails per order. You sent {len(contacts)}.")
             return
         p = db.get_product(st["pid"])
         if not p or not is_manual(p):
             clear_await(context)
             return
         unit = db.get_effective_price(uid, p["id"], p["price"], 1, True)
+        n = len(contacts)
+        total = round(unit * n, 2)
         delivery = (p["delivery"] or "").strip() or tt(language, "default_manual_delivery")
-        context.user_data["manual"] = {"pid": p["id"], "contact": text}
+        context.user_data["manual"] = {"pid": p["id"], "contacts": contacts, "contact": "\n".join(contacts)}
         context.user_data.pop("await", None)
-        markup = Markup([[Btn(tt(language, "btn_confirm", price=money(unit)), callback_data="mok", style="success")],
+        markup = Markup([[Btn(tt(language, "btn_confirm", price=money(total)), callback_data="mok", style="success")],
                          [Btn(tt(language, "btn_cancel"), callback_data="cx", style="danger")]])
-        await msg.reply_text(tt(language, "confirm", name=card_name_html(p), contact=esc(text), price=money(unit),
-                                delivery=esc(delivery)), reply_markup=markup, parse_mode=HTML)
+        shown = "\n".join(contacts[:15]) + (f"\n… +{n - 15} more" if n > 15 else "")
+        await msg.reply_text(tt(language, "confirm", name=card_name_html(p) + (f" × {n}" if n > 1 else ""),
+                                contact=esc(shown), price=money(total), delivery=esc(delivery)),
+                             reply_markup=markup, parse_mode=HTML)
 
     elif kind == "amount":
         try:

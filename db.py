@@ -148,7 +148,7 @@ class Database(GrowthMixin):
             "products": [("description", "TEXT"), ("delivery", "TEXT"), ("warranty", "TEXT"),
                          ("category", "TEXT"), ("old_price", "REAL"), ("kind", "TEXT DEFAULT 'auto'"),
                          ("prompt", "TEXT"), ("cost", "REAL")],
-            "orders": [("paid_with", "TEXT DEFAULT 'crypto'"), ("contact", "TEXT"), ("admin_note", "TEXT")] + _GROWTH_ORDER_COLUMNS,
+            "orders": [("paid_with", "TEXT DEFAULT 'crypto'"), ("contact", "TEXT"), ("admin_note", "TEXT"), ("group_id", "TEXT")] + _GROWTH_ORDER_COLUMNS,
             "deposits": [("inr_amount", "REAL"), ("rate", "REAL"), ("upi_id", "TEXT"), ("utr", "TEXT"),
                          ("utr_at", "TEXT"), ("reviewed_by", "TEXT")],
         }
@@ -157,6 +157,10 @@ class Database(GrowthMixin):
             for name, ddl in columns:
                 if name not in have:
                     c.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+        c.execute("CREATE TABLE IF NOT EXISTS order_items(id INTEGER PRIMARY KEY AUTOINCREMENT, order_id TEXT NOT NULL, "
+                  "idx INTEGER, item TEXT NOT NULL, created_at TEXT)")
+        c.execute("CREATE INDEX IF NOT EXISTS ix_order_items_order ON order_items(order_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS ix_orders_group ON orders(group_id)")
         c.execute("UPDATE users SET created_at=? WHERE created_at IS NULL", (self._now(),))
         try:
             import profit
@@ -343,6 +347,71 @@ class Database(GrowthMixin):
         except Exception:
             pass        # never block a sale because of the Netflix list
 
+    def _record_items(self, c, oid, items):
+        """Keep what was delivered, so My Orders can show / re-send it later."""
+        now = self._now()
+        for i, it in enumerate(items, 1):
+            c.execute("INSERT INTO order_items(order_id,idx,item,created_at) VALUES(?,?,?,?)", (oid, i, it, now))
+
+    def items_of(self, order_ids):
+        """{order_id: [delivered items]} for the given order ids."""
+        ids = list(order_ids)
+        if not ids:
+            return {}
+        c = self.conn()
+        q = ",".join("?" * len(ids))
+        rows = c.execute(f"SELECT order_id,item FROM order_items WHERE order_id IN ({q}) ORDER BY id", ids).fetchall()
+        c.close()
+        out = {}
+        for r in rows:
+            out.setdefault(r["order_id"], []).append(r["item"])
+        return out
+
+    def buy_manual_bulk(self, uid, pid, unit, contacts):
+        """Made-to-order purchase with several emails: ONE payment, one separate order per email
+        (ORD-X-1, ORD-X-2 ...). Same email may repeat. Returns (group_id, [order ids]) or 'balance'."""
+        n = len(contacts)
+        amount = round(unit * n, 2)
+        c = self.conn()
+        c.execute("BEGIN IMMEDIATE")
+        u = c.execute("SELECT COALESCE(balance,0) b FROM users WHERE user_id=?", (uid,)).fetchone()
+        if not u or u["b"] + 1e-9 < amount:
+            c.rollback(); c.close(); return "balance"
+        gid = "ORD-" + secrets.token_hex(5).upper()
+        now = self._now()
+        ids = []
+        for i, contact in enumerate(contacts, 1):
+            oid = gid if n == 1 else f"{gid}-{i}"
+            ids.append(oid)
+            c.execute("INSERT INTO orders(id,user_id,product_id,quantity,unit_price,amount,status,expires_at,created_at,paid_with,contact,group_id) "
+                      "VALUES(?,?,?,?,?,?,'processing',?,?,'balance',?,?)", (oid, uid, pid, 1, unit, unit, now, now, contact, gid))
+        c.execute("UPDATE users SET balance=ROUND(COALESCE(balance,0)-?,2) WHERE user_id=?", (amount, uid))
+        c.commit(); c.close()
+        return gid, ids
+
+    def user_order_groups(self, uid, limit=8, offset=0):
+        """My Orders list: one row per purchase (a bulk purchase is ONE row). -> (rows, total)."""
+        c = self.conn()
+        where = "o.user_id=? AND (o.status!='failed' OR o.failure_reason='timeout')"
+        total = c.execute(f"SELECT COUNT(DISTINCT COALESCE(o.group_id,o.id)) FROM orders o WHERE {where}", (uid,)).fetchone()[0]
+        rows = c.execute(f"""SELECT COALESCE(o.group_id,o.id) AS gid, MIN(o.created_at) AS created_at, MIN(o.product_id) AS product_id,
+            MAX(p.name) AS name, SUM(o.quantity) AS qty, SUM(o.amount) AS amount, COUNT(*) AS n,
+            SUM(CASE WHEN o.status='paid' THEN 1 ELSE 0 END) AS done,
+            SUM(CASE WHEN o.status IN ('processing','pending') THEN 1 ELSE 0 END) AS pend,
+            SUM(CASE WHEN o.status IN ('refunded','failed') THEN 1 ELSE 0 END) AS bad
+            FROM orders o LEFT JOIN products p ON p.id=o.product_id WHERE {where}
+            GROUP BY gid ORDER BY MIN(o.created_at) DESC LIMIT ? OFFSET ?""", (uid, limit, offset)).fetchall()
+        c.close()
+        return rows, total
+
+    def group_orders(self, uid, gid):
+        """Every order row of one purchase (only if it belongs to this user)."""
+        c = self.conn()
+        rows = c.execute("""SELECT o.*, p.name AS pname FROM orders o LEFT JOIN products p ON p.id=o.product_id
+            WHERE o.user_id=? AND COALESCE(o.group_id,o.id)=? ORDER BY o.rowid""", (uid, gid)).fetchall()
+        c.close()
+        return rows
+
     def fulfill_order(self,oid):
         c=self.conn()
         c.execute("BEGIN IMMEDIATE")
@@ -355,6 +424,7 @@ class Database(GrowthMixin):
         for x in links:
             c.execute("UPDATE stock SET sold=1 WHERE id=?",(x["id"],))
         c.execute("UPDATE orders SET status='paid',paid_at=?,paid_with='crypto' WHERE id=?",(datetime.now(timezone.utc).isoformat(),oid))
+        self._record_items(c, oid, [x["link"] for x in links])
         self._otp_grant(c, o["user_id"], oid, [x["link"] for x in links])
         self._nf_record(c, o["user_id"], oid, o["product_id"], [x["link"] for x in links])
         self._credit_spend(c, o["user_id"], o["amount"])
@@ -442,6 +512,7 @@ class Database(GrowthMixin):
         c.execute("INSERT INTO orders(id,user_id,product_id,quantity,unit_price,amount,status,expires_at,created_at,paid_at,paid_with) "
                   "VALUES(?,?,?,?,?,?,'paid',?,?,?,'balance')", (oid,uid,pid,qty,unit,amount,now,now,now))
         c.execute("UPDATE users SET balance=ROUND(COALESCE(balance,0)-?,2) WHERE user_id=?", (amount, uid))
+        self._record_items(c, oid, [x["link"] for x in links])
         self._otp_grant(c, uid, oid, [x["link"] for x in links])
         self._nf_record(c, uid, oid, pid, [x["link"] for x in links])
         self._credit_spend(c, uid, amount)
