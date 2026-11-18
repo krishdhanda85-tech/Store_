@@ -355,6 +355,8 @@ def Btn(text, callback_data=None, style=None, url=None, icon=None):
     Colours/icons need a Telegram app released after 9 Feb 2026; older apps show a normal button."""
     kwargs = {"callback_data": callback_data} if url is None else {"url": url}
     extra = {}
+    if style is None and BLUE_ONLY and callback_data != "noop":
+        style = "primary"                    # buttons without a colour are blue too
     if style == "success" and BLUE_ONLY:     # every green button becomes blue (red = sold out stays red)
         style = "primary"
     elif style == "green":                   # a button that must stay green (Supply With Us)
@@ -375,13 +377,11 @@ def Btn(text, callback_data=None, style=None, url=None, icon=None):
 
 
 # ---- main menu (ToolOraX-style): blue inline grid. Optional Railway variables:
-#   WEBSITE_URL  - link for the "Open website" button (default: API_BASE_URL / Railway domain)
 #   SUPPLY_URL   - link for the green "Supply With Us" button (hidden when empty)
-#   BOTTOM_MENU=1 - also keep a (blue) bottom keyboard; default 0 = inline menu only, like ToolOraX
+#   BOTTOM_MENU - 1 (default) = the menu is the blue bottom keyboard; 0 = inline buttons under the welcome text
 #   EMOJI_BTN_<NAME>_ID - premium emoji shown inside a menu button (NAME = PRODUCTS, WALLET, ORDERS,
 #                         GIFT, PROFILE, API, SUPPORT, LANG, WARRANTY, OTP, WEB, SUPPLY)
-BOTTOM_MENU = os.getenv("BOTTOM_MENU", "0") == "1"
-WEBSITE_URL = (os.getenv("WEBSITE_URL") or API_BASE_URL or "").strip()
+BOTTOM_MENU = os.getenv("BOTTOM_MENU", "1") != "0"
 SUPPLY_URL = (os.getenv("SUPPLY_URL") or "").strip()
 
 
@@ -412,13 +412,15 @@ def strip_icons(markup):
 
 # ---------------------------------------------------------------- small helpers
 MENU = {
-    "shop": "🛍 Products", "support": "🎧 Support", "funds": "👛 Wallet", "api": "🔑 API",
+    "shop": "🛍 Products", "funds": "👛 Wallet", "orders": "🧾 Orders", "promo": "🎁 Gift code",
+    "profile": "👤 Profile", "api": "🔑 API Key", "support": "🎧 Support", "settings": "🌐 Language",
     "warranty": "🛡 Warranty",
 }
 # labels of the old bottom menu still open the right screen for customers who did not send /start yet
 LEGACY_MENU = {
     "🛍 Shop": "shop", "💳 Add Funds": "funds", "👤 Profile": "profile", "🧾 My Orders": "orders",
     "🎁 Referral": "ref", "🎧 Support": "support", "⚙️ Settings": "settings", "🔑 Reseller API": "api",
+    "🔑 API": "api",
 }
 MENU_BY_LABEL = {v: k for k, v in MENU.items()}
 MENU_BY_LABEL.update(LEGACY_MENU)
@@ -430,20 +432,25 @@ def _kb(text, style="primary"):
 
 
 def main_keyboard():
-    """Bottom keyboard. Off by default (the menu is the inline grid); a ReplyKeyboardRemove clears old ones."""
+    """Bottom keyboard = the main menu (blue, 2 columns). BOTTOM_MENU=0 removes it instead."""
     if not BOTTOM_MENU:
         return ReplyKeyboardRemove()
-    rows = [[_kb(MENU["shop"]), _kb(MENU["support"])], [_kb(MENU["funds"]), _kb(MENU["api"])], [_kb(MENU["warranty"])]]
+    k = lambda key: _kb(MENU[key])
+    rows = [[k("shop"), k("funds")], [k("orders"), k("promo")], [k("profile"), k("api")],
+            [k("support"), k("settings")]]
+    last = [k("warranty")]
     if netflix_otp.enabled():
-        rows.append([_kb(netflix_otp.BTN_LABEL)])
+        last.append(_kb(netflix_otp.BTN_LABEL))
+    rows.append(last)
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True,
-                               input_field_placeholder="Choose a quick menu b…")
+                               input_field_placeholder="Choose a menu button…")
 
 
 async def show_home(message, uid, language):
     """Send the main menu. Without the bottom keyboard, old keyboards are cleared with a message that is deleted at once."""
     if BOTTOM_MENU:
-        await message.reply_text("👇", reply_markup=main_keyboard())
+        await message.reply_text(welcome_text(language), reply_markup=main_keyboard(), parse_mode=HTML)
+        return
     else:
         try:
             tmp = await message.reply_text("⏳", reply_markup=ReplyKeyboardRemove())
@@ -1444,8 +1451,6 @@ def home_view(uid: int, language: str):
     if netflix_otp.enabled():
         extra.append(mbtn("OTP", "Get OTP", "🔑", "otp"))
     rows.append(extra)
-    if WEBSITE_URL.startswith("http"):
-        rows.append([mbtn("WEB", "Open website", "🌐", url=WEBSITE_URL)])
     if SUPPLY_URL.startswith("http"):
         rows.append([mbtn("SUPPLY", "Supply With Us", "📦", url=SUPPLY_URL, style="green")])
     return text, Markup(rows)
@@ -1745,6 +1750,12 @@ async def show_menu(update, context, key):
         text, markup = settings_view(uid, language)
     elif key == "warranty":
         text, markup = warranty_view(uid, language)
+    elif key == "promo":
+        context.user_data["await"] = {"type": "promo"}
+        await update.effective_message.reply_text(
+            "🎁 <b>Gift code</b>\n\nSend your code now.", parse_mode=HTML,
+            reply_markup=Markup([[Btn("✖️ Cancel", callback_data="cx", style="danger")]]))
+        return
     elif key == "api":
         try:
             text, markup = api_view(uid, language)
