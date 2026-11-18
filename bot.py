@@ -176,7 +176,7 @@ TEXT = {
         "utr_sent": "✅ <b>UTR received</b>\n\n🧾 ID: <code>{id}</code>\n🔢 UTR: <code>{utr}</code>\n💵 ₹{inr} → ${credit}\n\n⏳ We're verifying it. Usually your balance is added within a minute (at most <b>30 min</b>) — we'll message you here.",
         "upi_rejected": "❌ <b>UPI payment not verified</b>\n\n🧾 <code>{id}</code>\n🔢 UTR: <code>{utr}</code>\n\nIf you did pay, open Support and send a screenshot.",
         "upi_none": "UPI is not available right now. Please use Crypto.",
-        "btn_bpay": "Binance Pay",
+        "btn_bpay": "🟡 Binance Pay",
         "btn_crypto": "⚡ Crypto · USDT BEP-20 (Instant)",
         "no_methods": "\n\n⚠️ Top-ups are not available right now.",
         "ask_amount": "💵 <b>{method}</b>\n\nSend the amount to add (${min} — ${max}):",
@@ -345,7 +345,7 @@ def tt(language: str, key: str, /, **kw) -> str:
     raise KeyError(key)
 
 
-PLAIN_BUTTONS = os.getenv("PLAIN_BUTTONS", "1") != "0"        # 1 = no coloured emojis / logos on buttons (text only)
+PLAIN_BUTTONS = os.getenv("PLAIN_BUTTONS", "0") == "1"        # 0 (default) = emoji on every button; 1 = text-only buttons
 _LEAD_EMOJI_RE = re.compile(r"^[\s\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\u2300-\u23FF\uFE0F\u200d]+")
 
 
@@ -357,7 +357,7 @@ def plain_label(text):
     return out or text
 
 
-NEUTRAL_BUTTONS = os.getenv("NEUTRAL_BUTTONS", "1") != "0"   # 1 = plain white/neutral buttons everywhere (0 = coloured)
+NEUTRAL_BUTTONS = os.getenv("NEUTRAL_BUTTONS", "0") == "1"   # 0 (default) = blue buttons everywhere; 1 = plain white/neutral buttons
 BLUE_ONLY = os.getenv("BLUE_ONLY", "1") != "0"           # 1 = all buttons blue (set 0 to get green buttons back)
 # Premium emoji (brand logos) in buttons and texts are ON by default; PREMIUM_EMOJI=0 turns them all off.
 PREMIUM_EMOJI = os.getenv("PREMIUM_EMOJI", "1") != "0"
