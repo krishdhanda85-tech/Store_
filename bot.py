@@ -346,8 +346,8 @@ def tt(language: str, key: str, /, **kw) -> str:
 
 
 BLUE_ONLY = os.getenv("BLUE_ONLY", "1") != "0"           # 1 = all buttons blue (set 0 to get green buttons back)
-# Animated premium emoji are OFF by default (PREMIUM_EMOJI=1 turns them back on, in buttons and in texts).
-PREMIUM_EMOJI = os.getenv("PREMIUM_EMOJI", "0") == "1"
+# Premium emoji (brand logos) in buttons and texts are ON by default; PREMIUM_EMOJI=0 turns them all off.
+PREMIUM_EMOJI = os.getenv("PREMIUM_EMOJI", "1") != "0"
 _TG_EMOJI_RE = re.compile(r'<tg-emoji emoji-id="\d+">(.*?)</tg-emoji>', re.S)
 
 
