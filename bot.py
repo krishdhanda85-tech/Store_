@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
 from telegram import (Update, InlineKeyboardButton as _Btn, InlineKeyboardMarkup as Markup,
-                      ReplyKeyboardMarkup)
+                      KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove)
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -122,7 +122,7 @@ def closed_text():
 TEXT = {
     "en": {
         "welcome": "👋 <b>Welcome to {shop}!</b>\n\n✨ Premium digital products at great prices.\n⚡ Fast delivery • 🔒 Secure checkout • 🎧 Friendly support\n\n🌐 Choose your language / 请选择语言 👇",
-        "menu_ready": "👋 <b>Welcome to {shop}!</b>\n\n✨ Your digital shop for premium subscriptions and services.\n⚡ Quick delivery • 💳 Easy wallet top-ups • 🎧 Support when you need it.\n\n👇 <b>Choose an option below to get started!</b>",
+        "menu_ready": "🏪 <b>{shop}</b>\n\nPay from your wallet — your order is delivered right here in this chat.\n\n👛 <b>Wallet</b> — top up with Crypto, Binance Pay or UPI\n🧾 <b>Orders</b> — your last purchases\n🎁 <b>Gift code</b> — credit or a free product\n🎧 <b>Support</b> — payments and missing items\n\n💡 Keep enough balance before you tap Buy.",
         "lang_set": "✅ Language saved.",
         "shop_head": "🛍️ <b>Welcome to the Shop</b>\n\n<blockquote>🟢 Available products: <b>{avail}</b>\n📦 Total products: <b>{total}</b>\n⚡ Fast digital delivery</blockquote>\n\n🔷 Choose a product below ⬇️",
         "no_products": "🛍 <b>{shop}</b>\n\nNo products available right now.",
@@ -164,7 +164,7 @@ TEXT = {
         "btn_cancel": "❌ Cancel",
         "placed": "✅ <b>Order placed</b>\n\n🧾 Order: <code>{order}</code>\n📦 {name}\n📧 {contact}\n⏳ Delivery: {delivery}\n\nWe'll message you here as soon as it's done.",
         "cancelled": "❌ Cancelled.",
-        "wallet": "💳 <b>Wallet</b>\n\n💰 Balance: <b>${bal}</b> (₹{inr})\n💱 Rate: 1 USDT = ₹{rate}\n<i>Top-up limits: ${min} — ${max}</i>\n\nPick a method ⬇️",
+        "wallet": "💳 <b>Wallet</b>\n━━━━━━━━━━━━━━\n💰 Balance: <b>${bal}</b>  (₹{inr})\n💱 Rate: 1 USDT = ₹{rate}\n📥 Top-up: <b>${min} – ${max}</b>\n\nChoose how to add funds 👇",
         "btn_upi": "🏦 UPI (30 min)",
         "ask_amount_upi": "🏦 <b>UPI · INR</b>\n\nSend the amount to add in USDT (${min} — ${max}).\n💱 Rate: 1 USDT = ₹{rate}",
         "upi_created": "🏦 <b>Pay by UPI</b>\n\n🧾 ID: <code>{id}</code>\n💰 You'll receive: <b>${credit}</b>\n💵 Pay: <b>₹{inr}</b> (₹{rate} per USDT)\n\n📲 UPI ID:\n<code>{upi}</code>\n\n1️⃣ Pay exactly <b>₹{inr}</b>\n2️⃣ Tap <b>I've paid</b> and send the 12-digit <b>UTR</b>\n\n⏳ Usually approved within a minute. If it takes longer, an admin checks it — up to <b>30 min</b>. Send the UTR within {minutes} min.",
@@ -249,7 +249,7 @@ TEXT = {
     },
     "zh": {
         "welcome": "🛍 <b>{shop}</b>\n\n请选择语言 / Choose your language 👇",
-        "menu_ready": "🛍 <b>{shop}</b>\n\n请使用下方菜单 👇",
+        "menu_ready": "🛍 <b>{shop}</b>\n\n请选择下方按钮 👇",
         "lang_set": "✅ 语言已保存。",
         "shop_head": "📦 <b>全部商品</b>\n\n<blockquote>✅ 有货：<b>{avail}</b>\n📦 总数：<b>{total}</b>\n⚡ 自动即时发货</blockquote>\n\n请选择商品 ⬇️",
         "no_products": "🛍 <b>{shop}</b>\n\n暂无商品。",
@@ -345,6 +345,7 @@ def tt(language: str, key: str, /, **kw) -> str:
     raise KeyError(key)
 
 
+BLUE_ONLY = os.getenv("BLUE_ONLY", "1") != "0"           # 1 = all buttons blue (set 0 to get green buttons back)
 BUTTON_ICONS = os.getenv("BUTTON_ICONS", "1") != "0"   # premium emoji inside buttons (needs Telegram Premium on the bot owner)
 
 
@@ -354,6 +355,10 @@ def Btn(text, callback_data=None, style=None, url=None, icon=None):
     Colours/icons need a Telegram app released after 9 Feb 2026; older apps show a normal button."""
     kwargs = {"callback_data": callback_data} if url is None else {"url": url}
     extra = {}
+    if style == "success" and BLUE_ONLY:     # every green button becomes blue (red = sold out stays red)
+        style = "primary"
+    elif style == "green":                   # a button that must stay green (Supply With Us)
+        style = "success"
     if not icon and BUTTON_ICONS:
         try:
             text, icon = ui_button_icon(text)      # rules the admin set with /emoji
@@ -367,6 +372,25 @@ def Btn(text, callback_data=None, style=None, url=None, icon=None):
         except TypeError:  # older python-telegram-bot without the style field
             extra["style"] = style
     return _Btn(text, api_kwargs=extra or None, **kwargs)
+
+
+# ---- main menu (ToolOraX-style): blue inline grid. Optional Railway variables:
+#   WEBSITE_URL  - link for the "Open website" button (default: API_BASE_URL / Railway domain)
+#   SUPPLY_URL   - link for the green "Supply With Us" button (hidden when empty)
+#   BOTTOM_MENU=1 - also keep a (blue) bottom keyboard; default 0 = inline menu only, like ToolOraX
+#   EMOJI_BTN_<NAME>_ID - premium emoji shown inside a menu button (NAME = PRODUCTS, WALLET, ORDERS,
+#                         GIFT, PROFILE, API, SUPPORT, LANG, WARRANTY, OTP, WEB, SUPPLY)
+BOTTOM_MENU = os.getenv("BOTTOM_MENU", "0") == "1"
+WEBSITE_URL = (os.getenv("WEBSITE_URL") or API_BASE_URL or "").strip()
+SUPPLY_URL = (os.getenv("SUPPLY_URL") or "").strip()
+
+
+def mbtn(key, label, emoji, callback_data=None, url=None, style="primary"):
+    """Menu button: premium icon inside the button when EMOJI_BTN_<key>_ID is set, else a normal emoji."""
+    icon = os.getenv(f"EMOJI_BTN_{key}_ID", "").strip()
+    if icon.isdigit() and BUTTON_ICONS:
+        return Btn(label, callback_data=callback_data, url=url, style=style, icon=icon)
+    return Btn(f"{emoji} {label}", callback_data=callback_data, url=url, style=style)
 
 
 def strip_icons(markup):
@@ -401,11 +425,33 @@ MENU_BY_LABEL.update(LEGACY_MENU)
 MENU_RE = "^(" + "|".join(re.escape(v) for v in MENU_BY_LABEL) + ")$"
 
 
+def _kb(text, style="primary"):
+    return KeyboardButton(text, api_kwargs={"style": style})
+
+
 def main_keyboard():
-    return ReplyKeyboardMarkup(
-        [[MENU["shop"], MENU["support"]], [MENU["funds"], MENU["api"]], [MENU["warranty"]]]
-        + ([[netflix_otp.BTN_LABEL]] if netflix_otp.enabled() else []),
-        resize_keyboard=True, is_persistent=True, input_field_placeholder="Choose a quick menu b…")
+    """Bottom keyboard. Off by default (the menu is the inline grid); a ReplyKeyboardRemove clears old ones."""
+    if not BOTTOM_MENU:
+        return ReplyKeyboardRemove()
+    rows = [[_kb(MENU["shop"]), _kb(MENU["support"])], [_kb(MENU["funds"]), _kb(MENU["api"])], [_kb(MENU["warranty"])]]
+    if netflix_otp.enabled():
+        rows.append([_kb(netflix_otp.BTN_LABEL)])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True,
+                               input_field_placeholder="Choose a quick menu b…")
+
+
+async def show_home(message, uid, language):
+    """Send the main menu. Without the bottom keyboard, old keyboards are cleared with a message that is deleted at once."""
+    if BOTTOM_MENU:
+        await message.reply_text("👇", reply_markup=main_keyboard())
+    else:
+        try:
+            tmp = await message.reply_text("⏳", reply_markup=ReplyKeyboardRemove())
+            await tmp.delete()
+        except Exception:
+            pass
+    text, markup = home_view(uid, language)
+    await message.reply_text(text, reply_markup=markup, parse_mode=HTML)
 
 
 def lang(user_id: int) -> str:
@@ -1345,16 +1391,19 @@ def wallet_view(uid: int, language: str):
               min=f"{min_deposit():g}", max=f"{max_deposit():g}") + growth_bot.wallet_extra_text()
     rows = []
     if binance.binance_enabled:
-        rows.append([Btn(tt(language, "btn_bpay"), callback_data="fm:bpay")])
+        rows.append([Btn(tt(language, "btn_bpay"), callback_data="fm:bpay", style="primary")])
     if binance.bsc_enabled:
-        rows.append([Btn(tt(language, "btn_crypto"), callback_data="fm:bsc")])
+        rows.append([Btn(tt(language, "btn_crypto"), callback_data="fm:bsc", style="success")])
     if db.upi_active_count() > 0:
-        rows.append([Btn(tt(language, "btn_upi"), callback_data="fm:upi")])
+        rows.append([Btn(tt(language, "btn_upi"), callback_data="fm:upi", style="primary")])
     if not rows:
         text += tt(language, "no_methods")
-    rows.extend(growth_bot.wallet_rows())
-    rows.append([Btn("👤 Profile", callback_data="menu:profile"), Btn("🧾 My Orders", callback_data="menu:orders")])
-    rows.append([Btn("🎁 Referral", callback_data="menu:ref"), Btn("⚙️ Settings", callback_data="menu:settings")])
+    rows.append([Btn("🎟 Promo code", callback_data="g:promo", style="primary"),
+                 Btn("📜 Transactions", callback_data="menu:tx", style="primary")])
+    rows.append([Btn("👤 Profile", callback_data="menu:profile", style="primary"),
+                 Btn("🧾 My Orders", callback_data="menu:orders", style="primary")])
+    rows.append([Btn("🎁 Referral", callback_data="menu:ref", style="primary"),
+                 Btn("⚙️ Settings", callback_data="menu:settings", style="primary")])
     rows.append(main_menu_row(language))
     return text, Markup(rows)
 
@@ -1383,14 +1432,22 @@ STATUS_ICON = {"paid": "✅", "processing": "⏳", "pending": "⏳", "failed": "
 
 
 def home_view(uid: int, language: str):
-    """Main menu (Cupon'sHub style): green = buy / orders, blue = account / help, two per row."""
-    text = "🏠 <b>Main menu</b>\n👇 Choose an option:"
+    """Main menu (ToolOraX style): blue two-column grid, full-width website button, green supply button."""
+    text = welcome_text(language)
     rows = [
-        [Btn("🛍 Buy products", callback_data="shop", style="success"), Btn("💰 Wallet", callback_data="menu:funds", style="primary")],
-        [Btn("📦 My orders", callback_data="menu:orders", style="success"), Btn("🎧 Support", callback_data="menu:support", style="primary")],
-        [Btn("🔑 API", callback_data="menu:api", style="success"), Btn("🎁 Refer & earn", callback_data="menu:ref", style="primary")],
-        [Btn("🛡 Warranty", callback_data="menu:warranty", style="success"), Btn("🌐 Language", callback_data="menu:settings", style="primary")],
+        [mbtn("PRODUCTS", "Products", "🛍", "shop"), mbtn("WALLET", "Wallet", "👛", "menu:funds")],
+        [mbtn("ORDERS", "Orders", "🧾", "menu:orders"), mbtn("GIFT", "Gift code", "🎁", "g:promo")],
+        [mbtn("PROFILE", "Profile", "👤", "menu:profile"), mbtn("API", "API Key", "🔑", "menu:api")],
+        [mbtn("SUPPORT", "Support", "🎧", "menu:support"), mbtn("LANG", "Language", "🌐", "menu:settings")],
     ]
+    extra = [mbtn("WARRANTY", "Warranty", "🛡", "menu:warranty")]
+    if netflix_otp.enabled():
+        extra.append(mbtn("OTP", "Get OTP", "🔑", "otp"))
+    rows.append(extra)
+    if WEBSITE_URL.startswith("http"):
+        rows.append([mbtn("WEB", "Open website", "🌐", url=WEBSITE_URL)])
+    if SUPPLY_URL.startswith("http"):
+        rows.append([mbtn("SUPPLY", "Supply With Us", "📦", url=SUPPLY_URL, style="green")])
     return text, Markup(rows)
 
 
@@ -1639,10 +1696,7 @@ async def send_start_screen(message, user, context):
     if not language:
         await message.reply_text(tt("en", "welcome", shop=esc(shop_name())), reply_markup=kb_lang(), parse_mode=HTML)
         return
-    await message.reply_text(welcome_text(language),
-                             reply_markup=main_keyboard(), parse_mode=HTML)
-    text, markup = home_view(user.id, language)
-    await message.reply_text(text, reply_markup=markup, parse_mode=HTML)
+    await show_home(message, user.id, language)
 
 
 # ---------------------------------------------------------------- commands + menu buttons
@@ -1720,9 +1774,7 @@ async def cb_lang(update, context, arg):
     db.set_user_language(q.from_user.id, arg, q.from_user.username)
     await q.answer()
     await edit(q, tt(arg, "lang_set"))
-    await q.message.reply_text(welcome_text(arg), reply_markup=main_keyboard(), parse_mode=HTML)
-    text, markup = home_view(q.from_user.id, arg)
-    await q.message.reply_text(text, reply_markup=markup, parse_mode=HTML)
+    await show_home(q.message, q.from_user.id, arg)
 
 
 async def cb_setlang(update, context, arg):
