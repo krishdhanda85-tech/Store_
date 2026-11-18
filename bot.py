@@ -346,7 +346,19 @@ def tt(language: str, key: str, /, **kw) -> str:
 
 
 BLUE_ONLY = os.getenv("BLUE_ONLY", "1") != "0"           # 1 = all buttons blue (set 0 to get green buttons back)
-BUTTON_ICONS = os.getenv("BUTTON_ICONS", "1") != "0"   # premium emoji inside buttons (needs Telegram Premium on the bot owner)
+# Animated premium emoji are OFF by default (PREMIUM_EMOJI=1 turns them back on, in buttons and in texts).
+PREMIUM_EMOJI = os.getenv("PREMIUM_EMOJI", "0") == "1"
+_TG_EMOJI_RE = re.compile(r'<tg-emoji emoji-id="\d+">(.*?)</tg-emoji>', re.S)
+
+
+def noanim(text):
+    """Replace premium (animated) emoji in an HTML text by their plain emoji."""
+    if PREMIUM_EMOJI or not isinstance(text, str) or "<tg-emoji" not in text:
+        return text
+    return _TG_EMOJI_RE.sub(r"\1", text)
+
+
+BUTTON_ICONS = PREMIUM_EMOJI and os.getenv("BUTTON_ICONS", "1") != "0"   # premium emoji inside buttons (needs Telegram Premium on the bot owner)
 
 
 def Btn(text, callback_data=None, style=None, url=None, icon=None):
@@ -561,7 +573,7 @@ def product_name_html(name) -> str:
     """Return a safely escaped product name prefixed with its configured Telegram custom emoji."""
     raw = str(name or "")
     emoji_id = product_icon_id(raw)
-    if emoji_id:
+    if emoji_id and PREMIUM_EMOJI:
         return f'<tg-emoji emoji-id="{emoji_id}">🔹</tg-emoji> {esc(raw)}'
     return esc(raw)
 
@@ -584,7 +596,7 @@ def fmt_get(pid, field, plain):
     """HTML version of a product text (with premium emojis / formatting) or None when it is stale."""
     e = _jload("fmt_text", {}).get(f"{pid}:{field}")
     if isinstance(e, dict) and e.get("p") == (plain or "").strip() and e.get("h"):
-        return e["h"]
+        return noanim(e["h"])
     return None
 
 
@@ -612,8 +624,8 @@ def card_name_html(p) -> str:
     """Product name for messages: admin-edited HTML (premium emojis inside) or the icon + plain name."""
     h = fmt_get(p["id"], "name", p["name"])
     if h:
-        return h
-    icon = product_icon_for(p)
+        return noanim(h)
+    icon = product_icon_for(p) if PREMIUM_EMOJI else None
     raw = str(p["name"] or "")
     if icon:
         return f'<tg-emoji emoji-id="{icon}">🔹</tg-emoji> {esc(raw)}'
@@ -628,6 +640,8 @@ def entities_to_html(text, entities):
     for e in sorted(entities or [], key=lambda e: (e.offset, -e.length)):
         t = e.type
         if t == "custom_emoji" and e.custom_emoji_id:
+            if not PREMIUM_EMOJI:
+                continue                      # keep the plain emoji character, drop the animated one
             o, c = f'<tg-emoji emoji-id="{e.custom_emoji_id}">', "</tg-emoji>"
         elif t == "text_link" and e.url:
             o, c = f'<a href="{html.escape(e.url, quote=True)}">', "</a>"
@@ -822,8 +836,8 @@ def allowed_hook_emojis():
 
 def apply_emoji_map(text: str) -> str:
     emap = {k: str(v) for k, v in _jload("emoji_map", {}).items() if k and str(v).isdigit()}
-    if not emap:
-        return text
+    if not emap or not PREMIUM_EMOJI:
+        return noanim(text)
     pat = re.compile("(" + "|".join(re.escape(k) for k in sorted(emap, key=len, reverse=True)) + ")\ufe0f?")
     parts = _PROTECTED.split(text)
     for i in range(0, len(parts), 2):          # odd parts are protected (code / existing premium emoji)
@@ -1117,6 +1131,7 @@ def tier_for(spent: float, language: str) -> str:
 
 async def edit(q, text, markup=None):
     """Edit the message in place; ignore Telegram's 'message is not modified'."""
+    text = noanim(text)
     try:
         await q.edit_message_text(text, reply_markup=markup, parse_mode=HTML, disable_web_page_preview=True)
     except BadRequest as e:
@@ -1141,6 +1156,7 @@ async def edit(q, text, markup=None):
 async def respond(update, text, markup=None):
     """Edit the tapped message (inline button) or send a new one (menu button / typed text)."""
     q = update.callback_query
+    text = noanim(text)
     if q:
         await edit(q, text, markup)
     else:
