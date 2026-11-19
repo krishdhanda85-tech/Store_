@@ -15,7 +15,7 @@ bp = Blueprint("nets_admin", __name__)
 PAGE = r"""{% extends 'base.html' %}{% block body %}
 <h2>Crypto coins</h2>
 <p class="muted">Coins / networks customers can deposit with. Changes show in the bot at once.
-Every coin added here is checked by an admin in Telegram (Approve / Reject) after the customer sends the TXID.</p>
+EVM token networks with RPC + chain ID + contract configured are verified automatically after TXID submission. Non-EVM networks remain manual until a matching chain verifier is configured.</p>
 
 <div class="card"><h3>Add a coin</h3>
 <form method="post" action="{{ url_for('nets_admin.add') }}">
@@ -29,6 +29,12 @@ Every coin added here is checked by an admin in Telegram (Approve / Reject) afte
 <input name="address" required maxlength="200" placeholder="T..." autocomplete="off" autocapitalize="none">
 <label>Memo / tag <span class="hint">optional</span></label>
 <input name="memo" maxlength="60">
+<h4>Automatic verification (EVM token networks)</h4>
+<label>RPC URL</label><input name="rpc_url" placeholder="https://your-rpc-endpoint" autocomplete="off">
+<label>Chain ID</label><input name="chain_id" type="number" min="1" placeholder="56">
+<label>Token contract address</label><input name="contract" maxlength="42" placeholder="0x..." autocomplete="off">
+<label>Token decimals</label><input name="decimals" type="number" min="0" max="36" value="6">
+<label>Required confirmations</label><input name="confirmations" type="number" min="1" value="12">
 <div style="margin-top:10px"><button type="submit">Add coin</button></div></form></div>
 
 <div class="card"><h3>Your coins ({{ nets|length }})</h3>
@@ -42,7 +48,13 @@ Every coin added here is checked by an admin in Telegram (Approve / Reject) afte
 <input name="address" value="{{ n.address }}" required maxlength="200" autocomplete="off" autocapitalize="none">
 <label>Memo / tag</label>
 <input name="memo" value="{{ n.get('memo', '') }}" maxlength="60">
-<div style="margin-top:8px"><button type="submit" class="sm">Save address</button></div></form>
+<label>RPC URL</label><input name="rpc_url" value="{{ n.get('rpc_url', '') }}" autocomplete="off">
+<label>Chain ID</label><input name="chain_id" type="number" min="1" value="{{ n.get('chain_id', '') }}">
+<label>Token contract address</label><input name="contract" value="{{ n.get('contract', '') }}" maxlength="42" autocomplete="off">
+<label>Token decimals</label><input name="decimals" type="number" min="0" max="36" value="{{ n.get('decimals', 6) }}">
+<label>Required confirmations</label><input name="confirmations" type="number" min="1" value="{{ n.get('confirmations', 12) }}">
+<p class="muted">Auto verification: {{ 'Enabled' if n.get('auto_verify') else 'Not configured' }}</p>
+<div style="margin-top:8px"><button type="submit" class="sm">Save settings</button></div></form>
 <div style="display:flex;gap:8px;margin-top:8px">
 <form method="post" action="{{ url_for('nets_admin.toggle', key=n.key) }}"><button type="submit" class="sm">{{ 'Hide' if n.get('active', True) else 'Show' }}</button></form>
 <form method="post" action="{{ url_for('nets_admin.delete', key=n.key) }}" onsubmit="return confirm('Delete {{ n.coin }} · {{ n.network }}?')"><button type="submit" class="sm">Delete</button></form>
@@ -68,7 +80,7 @@ def add():
     f = request.form
     try:
         crypto_nets.add(web.db, f.get("key", ""), f.get("coin", ""), f.get("network", ""),
-                        f.get("address", ""), f.get("memo", ""))
+                        f.get("address", ""), f.get("memo", ""), f.get("rpc_url", ""), f.get("chain_id", "0"), f.get("contract", ""), f.get("decimals", "6"), f.get("confirmations", "12"))
         flash("Coin added.")
     except ValueError as e:
         flash(str(e), "err")
@@ -80,7 +92,8 @@ def address(key):
     import web
     try:
         crypto_nets.set_address(web.db, key, request.form.get("address", ""), request.form.get("memo", ""))
-        flash("Address saved.")
+        crypto_nets.update_config(web.db, key, request.form.get("rpc_url", ""), request.form.get("chain_id", "0"), request.form.get("contract", ""), request.form.get("decimals", "6"), request.form.get("confirmations", "12"))
+        flash("Address and verification settings saved.")
     except ValueError as e:
         flash(str(e), "err")
     return _back()

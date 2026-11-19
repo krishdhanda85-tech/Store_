@@ -9,9 +9,9 @@ and survives restarts/backups.  Managed from Telegram by the owner:
   /togglenet key                                show / hide in the bot
   /delnet key
 
-The built-in BEP20 method (auto-verified on-chain) still comes from the Railway variables
-(NODEREAL_RPC_URL, DEPOSIT_ADDRESS, USDT_CONTRACT_ADDRESS).  Every network added here is verified
-by an admin (Approve / Reject buttons in Telegram) after the customer sends the TXID.
+The built-in BEP20 method remains compatible with Railway variables. Extra EVM token networks can
+be configured from the website with an RPC URL, chain ID, token contract, decimals and confirmations.
+Those networks are automatically verified on-chain. Non-EVM networks are not auto-verified by this adapter.
 """
 import json
 import re
@@ -67,7 +67,7 @@ def check_address(network, address):
     return None
 
 
-def add(db, key, coin, network, address, memo=""):
+def add(db, key, coin, network, address, memo="", rpc_url="", chain_id="", contract="", decimals="6", confirmations="12"):
     key = (key or "").strip().lower()
     if not KEY_RE.match(key) or key in RESERVED:
         raise ValueError("Key must be 2-12 letters/digits (e.g. trc20, plasma, btc) and not a reserved word.")
@@ -84,8 +84,15 @@ def add(db, key, coin, network, address, memo=""):
         raise ValueError(f"'{key}' already exists. Use /setaddr {key} | <address> to change it.")
     if len(nets) >= 12:
         raise ValueError("Maximum 12 extra networks.")
-    nets.append({"key": key, "coin": coin, "network": network, "address": address,
-                 "memo": (memo or "").strip()[:60], "active": True})
+    evm = any(w in network.lower() for w in _EVM_WORDS)
+    cfg = {"key": key, "coin": coin, "network": network, "address": address,
+           "memo": (memo or "").strip()[:60], "active": True,
+           "rpc_url": (rpc_url or "").strip(), "chain_id": int(chain_id or 0),
+           "contract": (contract or "").strip(), "decimals": int(decimals or 6),
+           "confirmations": max(1, int(confirmations or 12)), "auto_verify": False}
+    if evm and cfg["rpc_url"] and cfg["chain_id"] > 0 and re.fullmatch(r"0x[0-9a-fA-F]{40}", cfg["contract"]) and 0 <= cfg["decimals"] <= 36:
+        cfg["auto_verify"] = True
+    nets.append(cfg)
     _save(db, nets)
 
 
@@ -124,3 +131,19 @@ def remove(db, key):
 
 def label(n):
     return f"{n['coin']} · {n['network']}"
+
+
+def update_config(db, key, rpc_url, chain_id, contract, decimals, confirmations):
+    nets = _load(db)
+    for n in nets:
+        if n["key"] == (key or "").strip().lower():
+            n["rpc_url"] = (rpc_url or "").strip()
+            n["chain_id"] = int(chain_id or 0)
+            n["contract"] = (contract or "").strip()
+            n["decimals"] = int(decimals or 6)
+            n["confirmations"] = max(1, int(confirmations or 12))
+            n["auto_verify"] = bool(n["rpc_url"] and n["chain_id"] > 0 and
+                re.fullmatch(r"0x[0-9a-fA-F]{40}", n["contract"]) and 0 <= n["decimals"] <= 36)
+            _save(db, nets)
+            return n
+    raise ValueError("No such network key.")

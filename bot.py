@@ -21,6 +21,7 @@ from telegram.ext import (
 
 import agents
 import binance_withdraw
+import crypto_nets
 import fampay_verify
 import growth_bot
 import netflix_otp
@@ -1441,6 +1442,12 @@ def wallet_view(uid: int, language: str):
         rows.append([Btn(tt(language, "btn_bpay"), callback_data="fm:bpay", style="primary")])
     if binance.bsc_enabled:
         rows.append([Btn(tt(language, "btn_crypto"), callback_data="fm:bsc", style="success")])
+    try:
+        for net in crypto_nets.active_nets(db):
+            if net.get("auto_verify"):
+                rows.append([Btn(f"⚡ {net['coin']} · {net['network']} (Auto)", callback_data=f"fm:net:{net['key']}", style="success")])
+    except Exception:
+        log.exception("could not load configured crypto networks")
     if db.upi_active_count() > 0:
         rows.append([Btn(tt(language, "btn_upi"), callback_data="fm:upi", style="primary")])
     if not rows:
@@ -1635,6 +1642,10 @@ def delivery_text(language: str, order, items) -> str:
 
 
 def payment_details(method: str) -> str:
+    if method.startswith("net:"):
+        cfg = binance.network_config(method.split(":", 1)[1]) or {}
+        memo = f"\nMemo / tag: <code>{esc(cfg.get('memo'))}</code>" if cfg.get("memo") else ""
+        return f"💳 {esc(cfg.get('coin', 'Token'))} ({esc(cfg.get('network', 'Network'))}) address:\n<code>{esc(cfg.get('address', ''))}</code>{memo}\n\nAfter payment, submit the TXN hash for automatic verification."
     if method == "bpay":
         return f"🟡 Binance Pay ID / UID:\n<code>{esc(binance.pay_id)}</code>\n\nBinance app → Pay → Send → Pay ID, then send the exact amount in USDT."
     net = f" ({esc(binance.deposit_network)})" if binance.deposit_network else ""
@@ -2090,7 +2101,13 @@ async def cb_fund_method(update, context, arg):
         await edit(q, tt(language, "ask_amount_upi", rate=rate_text(), min=f"{min_deposit():g}", max=f"{max_deposit():g}"),
                    Markup([[Btn(tt(language, "back"), callback_data="fund", style="primary")]]))
         return
-    if (arg == "bsc" and not binance.bsc_enabled) or (arg == "bpay" and not binance.binance_enabled) or arg not in ("bsc", "bpay"):
+    valid = arg in ("bsc", "bpay")
+    if arg == "bsc" and not binance.bsc_enabled: valid = False
+    if arg == "bpay" and not binance.binance_enabled: valid = False
+    if arg.startswith("net:"):
+        cfg = binance.network_config(arg.split(":", 1)[1])
+        valid = bool(cfg and cfg.get("auto_verify"))
+    if not valid:
         await q.answer(tt(language, "not_configured"), show_alert=True)
         return
     await q.answer()
@@ -2143,7 +2160,7 @@ async def cb_dep_txhash(update, context, arg):
     uid = q.from_user.id
     language = lang(uid)
     dep = db.get_deposit(arg)
-    if not dep or dep["user_id"] != uid or dep["method"] != "bsc" or dep["status"] != "pending":
+    if not dep or dep["user_id"] != uid or not (dep["method"] == "bsc" or str(dep["method"]).startswith("net:")) or dep["status"] != "pending":
         await q.answer()
         return
     await q.answer()
@@ -2513,7 +2530,7 @@ async def create_deposit_flow(update, context, method: str, amount: float):
         db.fail_deposit(dep_id)
         await update.message.reply_text(tt(language, "bpay_down" if (method == "bpay" and binance.bsc_enabled) else "pay_down"))
         return
-    if method == "bsc":
+    if method == "bsc" or method.startswith("net:"):
         markup = Markup([[Btn("🧾 Submit TXN Hash", callback_data=f"ftx:{dep_id}", style="success")],
                          [Btn(tt(language, "check"), callback_data=f"fc:{dep_id}")],
                          [Btn(tt(language, "cancel_dep"), callback_data=f"fx:{dep_id}", style="danger")]])

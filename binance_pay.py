@@ -104,6 +104,20 @@ class BinancePayClient:
     def _conn(self):
         return _connect(self.db_path)
 
+    def _net_cfg(self, key):
+        """Read an owner-configured network from this shop's settings table."""
+        import json
+        c = self._conn()
+        try:
+            row = c.execute("SELECT value FROM settings WHERE key='crypto_nets'").fetchone()
+            nets = json.loads(row[0]) if row and row[0] else []
+        finally:
+            c.close()
+        return next((n for n in nets if n.get("key") == key and n.get("active", True)), None)
+
+    def network_config(self, key):
+        return self._net_cfg(key)
+
     # ---------- BSC ----------
     def _rpc(self, method, params):
         if not self.rpc_url: raise RuntimeError("BSC RPC is not configured on the platform (NODEREAL_RPC_URL).")
@@ -207,7 +221,13 @@ class BinancePayClient:
         finally: c.close()
 
     def create_order(self, merchant_trade_no, amount, description, method="bsc"):
-        if method == "bpay":
+        if method.startswith("net:"):
+            key = method.split(":", 1)[1]
+            cfg = self._net_cfg(key)
+            if not cfg or not cfg.get("auto_verify"):
+                raise RuntimeError("This network is not configured for automatic EVM token verification.")
+            where = [f"Send EXACTLY {{text}} {cfg['coin']} on {cfg['network']}:", f"Deposit address: {cfg['address']}"]
+        elif method == "bpay":
             if not self.binance_enabled:
                 raise RuntimeError("Binance Pay is not configured.")
             self._bpay_history()  # preflight: fail now (e.g. 451) instead of after the user has paid
@@ -221,7 +241,7 @@ class BinancePayClient:
             method = "bsc"
         payable = self._reserve(merchant_trade_no, float(amount), method)
         text = f"{payable:.{DECIMALS}f}"
-        tail = "After paying, submit the transaction hash (TXN). Payment is verified automatically after confirmations." if method == "bsc" else "After paying, press Check Payment."
+        tail = "After paying, submit the transaction hash (TXN). Payment is verified automatically after confirmations." if (method == "bsc" or method.startswith("net:")) else "After paying, press Check Payment."
         details = "\n".join([where[0].format(text=text), where[1], "", tail])
         return {"prepay_id": merchant_trade_no, "checkout_url": "", "amount_text": text, "details": details}
 
@@ -230,8 +250,11 @@ class BinancePayClient:
         if not row: return "UNKNOWN"
         if row["txid"]: return "PAID"
         try:
-            if (row["method"] or "bsc") == "bpay":
+            method = row["method"] or "bsc"
+            if method == "bpay":
                 return self._query_bpay(order_id, row)
+            if method.startswith("net:"):
+                return self._query_evm_network(order_id, row, method.split(":", 1)[1])
             return self._query_bsc(order_id, row)
         except Exception:
             log.exception("payment verification failed for order %s", order_id)
@@ -255,6 +278,70 @@ class BinancePayClient:
             except (KeyError, ValueError, TypeError, InvalidOperation):
                 continue
         return "PENDING"
+
+    def _query_evm_network(self, order_id, row, key):
+        cfg = self._net_cfg(key)
+        if not cfg or not cfg.get("auto_verify"):
+            raise RuntimeError(f"Network {key} is not configured for automatic verification.")
+        rpc_url = str(cfg.get("rpc_url") or "").strip()
+        deposit = str(cfg.get("address") or "").lower()
+        token = str(cfg.get("contract") or "").lower()
+        chain_id_expected = int(cfg.get("chain_id") or 0)
+        decimals = int(cfg.get("decimals", 6))
+        confirmations = max(1, int(cfg.get("confirmations", 12)))
+        txid = str(row["submitted_txid"] or "").strip().lower()
+        if not txid:
+            return "PENDING"
+        def rpc(method, params):
+            resp = requests.post(rpc_url, json={"jsonrpc":"2.0", "id":1, "method":method, "params":params}, timeout=20)
+            resp.raise_for_status(); data = resp.json()
+            if data.get("error"):
+                raise RuntimeError(f"RPC error: {data['error']}")
+            return data.get("result")
+        actual_chain = int(rpc("eth_chainId", []), 16)
+        if actual_chain != chain_id_expected:
+            raise RuntimeError(f"Wrong RPC chain: expected {chain_id_expected}, got {actual_chain}.")
+        tx = rpc("eth_getTransactionByHash", [txid])
+        if not tx or str(tx.get("hash") or "").lower() != txid:
+            return "PENDING"
+        receipt = rpc("eth_getTransactionReceipt", [txid])
+        if not receipt or int(receipt.get("status", "0x0"), 16) != 1:
+            return "PENDING"
+        if str(receipt.get("transactionHash") or "").lower() != txid:
+            return "PENDING"
+        block = int(receipt.get("blockNumber", "0x0"), 16)
+        latest = int(rpc("eth_blockNumber", []), 16)
+        if latest - block + 1 < confirmations:
+            return "PENDING"
+        block_data = rpc("eth_getBlockByNumber", [hex(block), False])
+        canonical = str((block_data or {}).get("hash") or "").lower()
+        if not canonical or str(receipt.get("blockHash") or "").lower() != canonical or str(tx.get("blockHash") or "").lower() != canonical:
+            return "PENDING"
+        if int((block_data or {}).get("timestamp", "0x0"), 16) * 1000 < int(row["created_ms"]):
+            return "PENDING"
+        payable = Decimal(str(row["payable"]))
+        found = False
+        for item in receipt.get("logs", []):
+            try:
+                if str(item.get("address", "")).lower() != token:
+                    continue
+                topics = item.get("topics") or []
+                if len(topics) < 3 or str(topics[0]).lower() != TRANSFER_TOPIC:
+                    continue
+                recipient = "0x" + str(topics[2])[-40:].lower()
+                if recipient != deposit:
+                    continue
+                received = Decimal(int(item.get("data", "0x0"), 16)) / (Decimal(10) ** decimals)
+                if received == payable:
+                    found = True; break
+            except (ValueError, TypeError, InvalidOperation):
+                continue
+        if not found:
+            return "PENDING"
+        if self._claim(order_id, f"{key}:{txid}"):
+            return "PAID"
+        current = get_payment_info(order_id, self.db_path)
+        return "PAID" if current and current["txid"] == f"{key}:{txid}" else "PENDING"
 
     def _query_bsc(self, order_id, row):
         if not self.bsc_enabled:
