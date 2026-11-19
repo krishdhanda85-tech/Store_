@@ -47,6 +47,8 @@ from alerts_admin import register as register_alerts_admin
 register_alerts_admin(app)
 from folders_admin import register as register_folders_admin
 register_folders_admin(app)
+from nets_admin import register as register_nets_admin
+register_nets_admin(app)
 from netflix_otp import register_admin as register_otp_admin
 register_otp_admin(app)
 from netflix_admin import register_admin as register_netflix_admin
@@ -302,6 +304,7 @@ a:hover{text-decoration:underline}
 <div class="grp">Payments</div>
 {{ nl('upipay','UPI payments','card',upi_pending) }}
 {{ nl('upi','UPI setup','qr') }}
+{{ nl('nets_admin.home','Crypto coins','card') }}
 <div class="grp">Customers</div>
 {{ nl('users','Users','users') }}
 {{ nl('tickets','Support','help',open_tickets,'ticket') }}
