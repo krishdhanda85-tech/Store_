@@ -96,6 +96,35 @@ def _body_text(msg):
     return "\n".join(parts)
 
 
+def extract_code(text, subject, d=None):
+    """Find the Netflix sign-in code in any language (EN/ES/PT/FR/IT/DE...).
+
+    Whitespace is collapsed and URLs removed first, because HTML mails put a lot of blank space between the
+    words and the code and French/Spanish sentences are long - a short search window missed the code and the
+    bot fell back to sending the link.
+    """
+    d = d or OTP_DIGITS
+    t = re.sub(r"https?://\S+", " ", text or "")
+    t = re.sub(r"[\u00a0\u202f\u200b\u200c\u200d\ufeff]", " ", t)
+    t = re.sub(r"\s+", " ", t)
+    kw = r"(?:code|c[oó]digo|codigo|codice|kod|cod\.?|connexion|saisissez|entrez|verification|v[eé]rification)"
+    num = r"(?<![\d.,])(\d{%d})(?![\d])" % d
+    # 1) number AFTER a code word ("Saisissez ce code ... 1234")
+    m = re.search(kw + r"[^\d]{0,150}?" + num, t, re.I)
+    # 2) number BEFORE a code word ("1234 est votre code de connexion")
+    if not m:
+        m = re.search(num + r"[^\d]{0,60}?" + kw, t, re.I)
+    if m:
+        return m.group(1)
+    # 3) a lone number in the body (a year like 2026 is ignored)
+    m = re.search(num, re.sub(r"\b(19|20)\d\d\b", " ", t))
+    if m:
+        return m.group(1)
+    # 4) a lone number in the subject
+    m = re.search(num, re.sub(r"\b(19|20)\d\d\b", " ", subject or ""))
+    return m.group(1) if m else None
+
+
 def fetch_netflix_mail(addr, pwd, host):
     """Newest recent Netflix mail as {'code','link'} or None (blocking - run in a thread)."""
     M = imaplib.IMAP4_SSL(host, timeout=20)
@@ -119,13 +148,7 @@ def fetch_netflix_mail(addr, pwd, host):
                 continue
             subject = str(make_header(decode_header(msg.get("Subject", ""))))
             text = _body_text(msg)
-            # Netflix login codes are exactly OTP_DIGITS (default 4) digits. Look next to the word "code" in
-            # English / Spanish / Portuguese / French / Italian / German ("codigo", "código", "codice", "kod"),
-            # then a lone number in the subject (a year like 2026 is ignored)
-            d = OTP_DIGITS
-            m = (re.search(r"(?:code|c[oó]digo|codigo|codice|kod|cod\.?)[^\d]{0,80}(?<!\d)(\d{%d})(?!\d)" % d, text, re.I)
-                 or re.search(r"(?<!\d)(\d{%d})(?!\d)" % d, re.sub(r"\b(19|20)\d\d\b", " ", subject)))
-            code = m.group(1) if m else None
+            code = extract_code(text, subject)
             link = None
             for l in re.findall(r"https://www\.netflix\.com/[^\s\"'<>\]\)]+", text):
                 if re.search(r"verify|travel|update-primary|households|password", l, re.I):
@@ -137,11 +160,9 @@ def fetch_netflix_mail(addr, pwd, host):
                 best_link = link
             if best_code and best_link:
                 break
-        # A sign-in code always wins. A plain "verify email" link is useless next to a code, so it is dropped then.
+        # A sign-in code always wins - when a code was found the link is not sent at all.
         if best_code:
-            if best_link and re.search(r"verifyemail", best_link, re.I):
-                best_link = None
-            return {"code": best_code, "link": best_link}
+            return {"code": best_code, "link": None}
         if best_link:
             return {"code": None, "link": best_link}
         return None
