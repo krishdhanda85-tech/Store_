@@ -46,6 +46,8 @@ from compare_admin import register as register_compare_admin
 register_compare_admin(app)
 from alerts_admin import register as register_alerts_admin
 register_alerts_admin(app)
+from joinexempt_admin import register as register_joinexempt_admin
+register_joinexempt_admin(app)
 from folders_admin import register as register_folders_admin
 register_folders_admin(app)
 from nets_admin import register as register_nets_admin
@@ -328,6 +330,7 @@ a:hover{text-decoration:underline}
 {% if is_main %}{{ nl('topup_admin.topup','Supplier top-up','key') }}{% endif %}
 {{ nl('reseller_admin.resellers','Resellers API','key') }}
 {{ nl('admins','Admins','shield') }}
+{{ nl('joinexempt_admin.home','Join exemptions','shield') }}
 {{ nl('emojis','Premium emojis','tag') }}
 {{ nl('settings','Settings','sliders') }}
 {% if is_main %}{{ nl('telethon_admin_home','Telethon Marketing','link') }}{% endif %}

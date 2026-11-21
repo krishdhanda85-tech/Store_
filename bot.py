@@ -1688,6 +1688,12 @@ async def is_required_channel_member(bot, user_id: int) -> bool:
     if not required_channel():
         return True
     try:
+        import joinexempt_admin
+        if joinexempt_admin.is_exempt(db, user_id):
+            return True  # admin gave this user a free pass (Join-check exemptions)
+    except Exception:
+        log.exception("join exemption lookup failed")
+    try:
         member = await bot.get_chat_member(_normalized_channel(), user_id)
         if member.status in ("member", "administrator", "creator"):
             return True
@@ -2928,6 +2934,8 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Admins can only add/manage stock items.\n"
         "Descriptions, warranty, delivery time and made-to-order orders are managed on the admin site.\n\n"
         "OWNER ONLY\n"
+        "/exempt <telegram_id> [note] - user can use bot without joining channel/group\n"
+        "/unexempt <telegram_id>\n"
         "/addadmin <telegram_id>\n"
         "/removeadmin <telegram_id>\n"
         "/setprice <product_id> <price>\n"
@@ -2943,6 +2951,33 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/apibalance - supplier wallets\n\n"
         "UPI accounts, QR codes, UPI verification and support replies are done on the admin site."
     )
+
+async def exempt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/exempt <telegram_id> [note]  -> that user can use the bot without joining the channel/group."""
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("Owner only.")
+        return
+    import joinexempt_admin
+    if not context.args or not context.args[0].isdigit():
+        data = joinexempt_admin.load(db)
+        lst = "\n".join(f"{k} {v}".strip() for k, v in data.items()) or "nobody yet"
+        await update.message.reply_text("Usage: /exempt <telegram_id> [note]\n/unexempt <telegram_id>\n\nExempt users:\n" + lst)
+        return
+    joinexempt_admin.add(db, int(context.args[0]), " ".join(context.args[1:]))
+    await update.message.reply_text(f"✅ {context.args[0]} can now use the bot without joining the channel/group.")
+
+
+async def unexempt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("Owner only.")
+        return
+    import joinexempt_admin
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /unexempt <telegram_id>")
+        return
+    ok = joinexempt_admin.remove(db, int(context.args[0]))
+    await update.message.reply_text("Removed. They must join again." if ok else "That ID was not in the list.")
+
 
 async def addlink(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -4148,6 +4183,8 @@ def build_application(tenant):
     app.add_handler(CommandHandler("folders", folders_cmd))
     app.add_handler(CommandHandler("emojiall", emojiall_cmd))
     app.add_handler(CommandHandler("owner", owner_cmd))
+    app.add_handler(CommandHandler("exempt", exempt_cmd))
+    app.add_handler(CommandHandler("unexempt", unexempt_cmd))
     app.add_handler(CommandHandler("addlink", addlink))
     app.add_handler(CommandHandler("products", products_cmd))
     app.add_handler(CommandHandler("addadmin", addadmin))
