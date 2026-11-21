@@ -31,6 +31,8 @@ MIN_INTERVAL_MIN = 10      # auto-post: shortest repeat time the owner may set
 MIN_GAP_SEC = 5            # shortest pause between two groups
 MAX_MSG = 3500
 MAX_FAILS_IN_ROW = 8
+MAX_ADS = 10               # ads that can rotate
+DEFAULT_DAILY = 2          # max posts per group in 24 hours
 _TICK = 20                 # scheduler wake-up (seconds)
 
 _pending = {}
@@ -203,11 +205,75 @@ async def _nap(seconds):
         await asyncio.sleep(min(1.0, max(0.0, end - time.time())))
 
 
+# ------------------------------------------------------------------ premium (custom) emojis
+# In the message write  {e:5368324170671202286}  or  {e:5368324170671202286|🔥}  (the part after | is
+# the normal emoji shown to people without Premium). The HTML tag
+# <tg-emoji emoji-id="5368324170671202286">🔥</tg-emoji>  works too. Bold/italic/links use Telegram HTML
+# (<b>, <i>, <a href="...">) - plain text without tags is sent as it is.
+_EMOJI_RE = re.compile(
+    r'<tg-emoji\s+emoji-id=["\']?(\d{5,30})["\']?\s*>(.*?)</tg-emoji>|\{e:(\d{5,30})(?:\|([^}]{0,8}))?\}',
+    re.S)
+_PUA = 0xE000
+_DEFAULT_FALLBACK = "\u2b50"      # star, shown when no fallback emoji was given
+
+
+def _u16(s):
+    return sum(2 if ord(c) > 0xFFFF else 1 for c in s)
+
+
+def build_message(message):
+    """message text -> (plain_text, entities) with MessageEntityCustomEmoji for every premium emoji."""
+    from telethon.extensions import html as tl_html
+    from telethon.tl.types import MessageEntityCustomEmoji
+    found = []
+
+    def _swap(m):
+        eid = int(m.group(1) or m.group(3))
+        fb = (m.group(2) if m.group(1) else m.group(4)) or ""
+        fb = re.sub(r"<[^>]*>", "", fb).strip() or _DEFAULT_FALLBACK
+        found.append((eid, fb))
+        return chr(_PUA + len(found) - 1)
+
+    marked = _EMOJI_RE.sub(_swap, message)
+    text, entities = tl_html.parse(marked)
+    if not found:
+        return text, entities
+    out, shifts, extra, pos = [], [], [], 0     # shifts: (utf16 position in old text, added length)
+    for ch in text:
+        idx = ord(ch) - _PUA
+        if 0 <= idx < len(found):
+            eid, fb = found[idx]
+            extra.append((0, pos, eid, fb))
+            shifts.append((pos, _u16(fb) - 1))
+            out.append(fb)
+        else:
+            out.append(ch)
+        pos += _u16(ch)
+
+    def _new(old):                       # old utf-16 offset -> offset in the final text
+        return old + sum(d for at, d in shifts if at < old)
+
+    final = []
+    for e in entities:
+        start, end = _new(e.offset), _new(e.offset + e.length)
+        e.offset, e.length = start, max(0, end - start)
+        final.append(e)
+    for _, at, eid, fb in extra:
+        final.append(MessageEntityCustomEmoji(offset=_new(at), length=_u16(fb), document_id=eid))
+    final.sort(key=lambda e: e.offset)
+    return "".join(out), final
+
+
 async def _send_one(client, target, message):
     for attempt in (1, 2):
         try:
             entity = await client.get_entity(_entity_ref(target))
-            await client.send_message(entity, message, link_preview=False)
+            try:
+                text, ents = build_message(message)
+                await client.send_message(entity, text, formatting_entities=ents,
+                                          parse_mode=None, link_preview=False)
+            except (TypeError, ValueError):
+                await client.send_message(entity, message, link_preview=False)
             return "ok", ""
         except Exception as e:
             name = type(e).__name__
@@ -228,7 +294,7 @@ async def _send_one(client, target, message):
 async def _a_campaign(api_id, api_hash, session_string, targets, message, gap):
     client = _new_client(api_id, api_hash, session_string)
     await client.connect()
-    res = {"abort": "", "fatal": False, "wait": 0}
+    res = {"abort": "", "fatal": False, "wait": 0, "ok_targets": []}
     try:
         if not await client.is_user_authorized():
             res.update(abort="Telegram session expired. Reconnect it.", fatal=True)
@@ -248,6 +314,7 @@ async def _a_campaign(api_id, api_hash, session_string, targets, message, gap):
             status, info = await _send_one(client, target, message)
             with _state_lock:
                 if status == "ok":
+                    res["ok_targets"].append(target)
                     _state["sent"] += 1
                     misses = 0
                 elif status == "fail":
@@ -272,6 +339,105 @@ async def _a_campaign(api_id, api_hash, session_string, targets, message, gap):
             pass
 
 
+
+# ------------------------------------------------------------------ helpers used by the Telegram bot (/ad)
+def bot_status(db):
+    """Everything the owner needs to see in the bot: connection, groups, ad, timing, running state."""
+    with _state_lock:
+        st = dict(_state)
+    nxt = _float_setting(db, "next_run", 0.0)
+    return {
+        "connected": bool(_saved_session(db)),
+        "api": bool(all(_api_credentials(db))),
+        "groups": len(_targets(db)),
+        "ads": _ads(db) or ([_get(db, "auto_message", "")] if _get(db, "auto_message", "").strip() else []),
+        "rotating": bool(_ads(db)),
+        "daily_limit": _daily_limit(db),
+        "auto_on": _get(db, "auto_enabled", "0") == "1",
+        "interval": _int_setting(db, "interval_min", 60, MIN_INTERVAL_MIN, 10080),
+        "gap": _int_setting(db, "gap_sec", 12, MIN_GAP_SEC, 3600),
+        "next_in_min": max(0, int((nxt - time.time()) / 60) + 1) if nxt > time.time() else 0,
+        "last": _get(db, "last_run_text", ""),
+        "running": st["running"], "sent": st["sent"], "total": st["total"],
+    }
+
+
+def bot_set_ad(db, message):
+    """Adds one ad to the rotation."""
+    message = (message or "").strip()
+    if not message:
+        return False, "The ad is empty."
+    if len(message) > MAX_MSG:
+        return False, f"The ad is too long (max {MAX_MSG} characters incl. emoji tags)."
+    ads = _ads(db)
+    if not ads and _get(db, "auto_message", "").strip():
+        ads = [_get(db, "auto_message", "").strip()]      # keep the ad written on the website
+    if len(ads) >= MAX_ADS:
+        return False, f"Maximum {MAX_ADS} ads. Delete one first."
+    ads.append(message)
+    _save_ads(db, ads)
+    return True, f"Ad added. You now have {len(ads)} ad(s); they are sent one after another."
+
+
+def bot_delete_ad(db, i):
+    ads = _ads(db)
+    if not ads and _get(db, "auto_message", "").strip():
+        ads = [_get(db, "auto_message", "").strip()]
+    if not 0 <= i < len(ads):
+        return False, "That ad does not exist."
+    ads.pop(i)
+    _save_ads(db, ads)
+    _set(db, "auto_message", "")
+    return True, f"Ad deleted. {len(ads)} left."
+
+
+def bot_set_limit(db, n):
+    if not 1 <= n <= 50:
+        return False, "Send a number from 1 to 50."
+    _set(db, "daily_limit", str(int(n)))
+    return True, f"Daily limit saved: max {int(n)} post(s) per group in 24 hours."
+
+
+def bot_set_timing(db, interval=None, gap=None):
+    if interval is not None:
+        if interval < MIN_INTERVAL_MIN:
+            return False, f"Interval must be at least {MIN_INTERVAL_MIN} minutes."
+        _set(db, "interval_min", str(min(int(interval), 10080)))
+        if _get(db, "auto_enabled", "0") == "1":
+            _set(db, "next_run", str(time.time() + int(interval) * 60))
+    if gap is not None:
+        if gap < MIN_GAP_SEC:
+            return False, f"Gap must be at least {MIN_GAP_SEC} seconds."
+        _set(db, "gap_sec", str(min(int(gap), 3600)))
+    return True, "Saved."
+
+
+def bot_set_auto(db, enable):
+    if enable:
+        if not _ads(db) and not _get(db, "auto_message", "").strip():
+            return False, "Add an ad first."
+        if not _saved_session(db):
+            return False, "Connect the Telegram account first (website -> Telethon Marketing)."
+        if not _targets(db):
+            return False, "Add at least one group first (website -> Telethon Marketing)."
+        interval = _int_setting(db, "interval_min", 60, MIN_INTERVAL_MIN, 10080)
+        _set(db, "auto_enabled", "1")
+        _set(db, "next_run", str(time.time() + interval * 60))
+        return True, f"Auto-post is ON: every {interval} min."
+    _set(db, "auto_enabled", "0")
+    return True, "Auto-post is OFF."
+
+
+def bot_send_now(db):
+    return _start_campaign(db, None, "manual")
+
+
+def bot_stop():
+    with _state_lock:
+        if _state["running"]:
+            _state["stop"] = True
+
+
 # ------------------------------------------------------------------ campaigns
 def _finish(db, tenant, source, res):
     with _state_lock:
@@ -289,6 +455,8 @@ def _finish(db, tenant, source, res):
         with tenancy.use(tenant):
             _set(db, "last_run_ts", str(time.time()))
             _set(db, "last_run_text", text[:600])
+            if res.get("ok_targets"):
+                _record_sent(db, res["ok_targets"])
             if res.get("fatal"):
                 _set(db, "auto_enabled", "0")
             if source == "auto" and _get(db, "auto_enabled", "0") == "1":
@@ -299,8 +467,62 @@ def _finish(db, tenant, source, res):
         log.exception("could not save Telethon campaign result")
 
 
+# ------------------------------------------------------------------ ad rotation + per-group daily limit
+def _ads(db):
+    try:
+        v = json.loads(_get(db, "ads", "[]") or "[]")
+    except ValueError:
+        v = []
+    return [a for a in v if isinstance(a, str) and a.strip()]
+
+
+def _save_ads(db, ads):
+    _set(db, "ads", json.dumps(ads, ensure_ascii=False))
+
+
+def _pick_ad(db):
+    """Next ad of the rotation (or the single auto message). Returns (message, index)."""
+    ads = _ads(db)
+    if not ads:
+        return _get(db, "auto_message", ""), -1
+    try:
+        i = int(_get(db, "ad_idx", "0") or 0)
+    except ValueError:
+        i = 0
+    return ads[i % len(ads)], i
+
+
+def _daily_limit(db):
+    return _int_setting(db, "daily_limit", DEFAULT_DAILY, 1, 50)
+
+
+def _sent_log(db):
+    try:
+        v = json.loads(_get(db, "sent_log", "{}") or "{}")
+    except ValueError:
+        v = {}
+    cut = time.time() - 86400
+    return {k: [t for t in ts if t > cut] for k, ts in v.items() if isinstance(ts, list)}
+
+
+def _within_limit(db, targets):
+    log_, lim = _sent_log(db), _daily_limit(db)
+    return [t for t in targets if len(log_.get(t, [])) < lim]
+
+
+def _record_sent(db, ok_targets):
+    log_, now = _sent_log(db), time.time()
+    for t in ok_targets:
+        log_.setdefault(t, []).append(now)
+    _set(db, "sent_log", json.dumps({k: v for k, v in log_.items() if v}))
+
+
 def _start_campaign(db, message, source):
     """Starts a background campaign. Returns (ok, text). Must run with the owner shop active."""
+    rotate = message is None
+    idx = -1
+    if rotate:
+        message, idx = _pick_ad(db)
     message = (message or "").strip()
     if not message:
         return False, "Message is empty."
@@ -315,12 +537,18 @@ def _start_campaign(db, message, source):
     targets = _targets(db)
     if not targets:
         return False, "Add at least one approved group first."
+    allowed = _within_limit(db, targets)
+    if not allowed:
+        return False, f"All groups already got {_daily_limit(db)} post(s) in the last 24h (daily limit)."
+    targets = allowed
     gap = _int_setting(db, "gap_sec", 12, MIN_GAP_SEC, 3600)
     with _state_lock:
         if _state["running"]:
             return False, "A campaign is already running."
         _state.update(running=True, source=source, sent=0, total=len(targets), failed=[],
                       started=time.time(), stop=False, current="")
+    if rotate and idx >= 0:
+        _set(db, "ad_idx", str(idx + 1))
     tenant = tenancy.get_tenant(tenancy.MAIN_ID)
 
     async def _job():
@@ -328,7 +556,7 @@ def _start_campaign(db, message, source):
             res = await _a_campaign(api_id, api_hash, session_string, targets, message, gap)
         except Exception as e:
             log.exception("Telethon campaign crashed")
-            res = {"abort": _errtext(e), "fatal": False, "wait": 0}
+            res = {"abort": _errtext(e), "fatal": False, "wait": 0, "ok_targets": []}
         _finish(db, tenant, source, res)
 
     try:
@@ -354,7 +582,7 @@ def _scheduler(db):
                 if time.time() < _float_setting(db, "next_run", 0.0):
                     continue
                 interval = _int_setting(db, "interval_min", 60, MIN_INTERVAL_MIN, 10080)
-                ok, info = _start_campaign(db, _get(db, "auto_message", ""), "auto")
+                ok, info = _start_campaign(db, None, "auto")
                 if not ok:
                     _set(db, "next_run", str(time.time() + interval * 60))
                     _set(db, "last_run_ts", str(time.time()))
@@ -419,10 +647,17 @@ def register(app, render_str, db):
 <label style="display:flex;gap:8px;align-items:center"><input style="width:auto;margin:0" type="checkbox" name="enabled" value="1" {% if auto_on %}checked{% endif %}> Turn auto-post ON</label>
 <label>Repeat every (minutes, minimum {{ min_interval }})</label><input name="interval" type="number" min="{{ min_interval }}" value="{{ interval }}" required>
 <label>Gap between groups (seconds, minimum {{ min_gap }})</label><input name="gap" type="number" min="{{ min_gap }}" value="{{ gap }}" required>
-<label>Auto message</label><textarea name="message" rows="6" maxlength="3500" placeholder="Message to post automatically...">{{ auto_message }}</textarea>
+<p class="muted">Premium emoji: write <span class="mono">{e:EMOJI_ID|🔥}</span> (ID of the premium emoji, 🔥 = fallback). Needs Telegram Premium on the connected account. Bold/italic: <span class="mono">&lt;b&gt;text&lt;/b&gt;</span>.</p><label>Auto message</label><textarea name="message" rows="6" maxlength="3500" placeholder="Message to post automatically...">{{ auto_message }}</textarea>
 <label style="display:flex;gap:8px;align-items:center"><input style="width:auto;margin:0" type="checkbox" name="confirm" value="yes"> I confirm this message is allowed in every group below (needed to turn auto-post ON).</label>
 <button type="submit">Save auto-post settings</button></form>
 <form method="post" action="{{ url_for('telethon_auto_run_now') }}" style="margin-top:8px"><button type="submit" {% if state.running or not connected or not targets %}disabled{% endif %}>Send the auto message now</button></form>
+</div>
+
+<div class="card"><h3>Ads (rotation) &middot; {{ ads|length }}/{{ max_ads }}</h3>
+<p class="muted">Add different real ads (e.g. Netflix, Spotify, Gemini). Each run sends the next one in turn. While this list has ads, the single "Auto message" above is not used. Premium emoji: <span class="mono">{e:EMOJI_ID|🔥}</span>.</p>
+{% if ads %}<div class="scroll"><table><thead><tr><th>#</th><th>Ad</th><th>Action</th></tr></thead><tbody>{% for a in ads %}<tr><td>{{ loop.index }}</td><td style="white-space:pre-wrap">{{ a }}</td><td><form method="post" action="{{ url_for('telethon_ad_delete') }}"><input type="hidden" name="i" value="{{ loop.index0 }}"><button class="red sm" type="submit">Delete</button></form></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">No rotation ads yet.</p>{% endif %}
+<form method="post" action="{{ url_for('telethon_ad_add') }}"><label>New ad</label><textarea name="message" rows="5" maxlength="3500" placeholder="Write one ad..." required></textarea><label style="display:flex;gap:8px;align-items:center"><input style="width:auto;margin:0" type="checkbox" name="confirm" value="yes" required> I confirm this ad is allowed in every group below.</label><button type="submit">Add ad</button></form>
+<form method="post" action="{{ url_for('telethon_limit_save') }}" style="margin-top:10px"><label>Daily limit: max posts per group in 24 hours (1-50, recommended 1-2)</label><input name="limit" type="number" min="1" max="50" value="{{ daily_limit }}" required><button type="submit">Save daily limit</button></form>
 </div>
 
 <div class="card"><h3>Approved groups ({{ targets|length }})</h3><p class="muted">No limit. Add only groups where you are an admin or promotions are allowed. One group per line.</p>
@@ -431,7 +666,7 @@ def register(app, render_str, db):
 <form method="post" action="{{ url_for('telethon_clear_targets') }}" onsubmit="return confirm('Remove ALL groups?')"><button class="red sm" type="submit">Remove all groups</button></form>{% else %}<p class="empty">No groups added yet.</p>{% endif %}</div>
 
 <div class="card"><h3>Send once now</h3><p class="muted">Sends this message to all groups above in the background (with the gap set in Auto-post).</p>
-<form method="post" action="{{ url_for('telethon_send_message') }}"><label>Message</label><textarea name="message" rows="5" maxlength="3500" placeholder="Write your promotion..." required></textarea><label style="display:flex;gap:8px;align-items:center"><input style="width:auto;margin:0" type="checkbox" name="confirm" value="yes" required> I confirm this message is relevant and allowed in every group.</label><button type="submit" {% if state.running or not connected or not targets %}disabled{% endif %}>Send now</button></form></div>
+<form method="post" action="{{ url_for('telethon_send_message') }}"><p class="muted">Premium emoji: write <span class="mono">{e:EMOJI_ID|🔥}</span> (ID of the premium emoji, 🔥 = fallback). Needs Telegram Premium on the connected account. Bold/italic: <span class="mono">&lt;b&gt;text&lt;/b&gt;</span>.</p><label>Message</label><textarea name="message" rows="5" maxlength="3500" placeholder="Write your promotion..." required></textarea><label style="display:flex;gap:8px;align-items:center"><input style="width:auto;margin:0" type="checkbox" name="confirm" value="yes" required> I confirm this message is relevant and allowed in every group.</label><button type="submit" {% if state.running or not connected or not targets %}disabled{% endif %}>Send now</button></form></div>
 
 <div class="card"><h3>Connection</h3>
 {% if connected %}<p><span class="badge" style="background:#13805a;color:white">Session saved</span> Telegram account is connected.</p>
@@ -454,6 +689,7 @@ def register(app, render_str, db):
             interval=_int_setting(db, "interval_min", 60, MIN_INTERVAL_MIN, 10080),
             gap=_int_setting(db, "gap_sec", 12, MIN_GAP_SEC, 3600),
             auto_message=_get(db, "auto_message", ""),
+            ads=_ads(db), max_ads=MAX_ADS, daily_limit=_daily_limit(db),
             min_interval=MIN_INTERVAL_MIN, min_gap=MIN_GAP_SEC)
 
     @app.post("/telethon/save-api")
@@ -637,7 +873,7 @@ def register(app, render_str, db):
     def telethon_auto_run_now():
         if not _owner_only():
             return _deny()
-        ok, info = _start_campaign(db, _get(db, "auto_message", ""), "manual")
+        ok, info = _start_campaign(db, None, "manual")
         flash(info, None if ok else "err")
         return _home()
 
@@ -659,5 +895,40 @@ def register(app, render_str, db):
             flash("Confirm that the message is allowed in every group.", "err")
             return _home()
         ok, info = _start_campaign(db, request.form.get("message"), "manual")
+        flash(info, None if ok else "err")
+        return _home()
+
+    @app.post("/telethon/ads/add")
+    def telethon_ad_add():
+        if not _owner_only():
+            return _deny()
+        if request.form.get("confirm") != "yes":
+            flash("Confirm that the ad is allowed in every group.", "err")
+            return _home()
+        ok, info = bot_set_ad(db, request.form.get("message"))
+        flash(info, None if ok else "err")
+        return _home()
+
+    @app.post("/telethon/ads/delete")
+    def telethon_ad_delete():
+        if not _owner_only():
+            return _deny()
+        try:
+            i = int(request.form.get("i") or -1)
+        except ValueError:
+            i = -1
+        ok, info = bot_delete_ad(db, i)
+        flash(info, None if ok else "err")
+        return _home()
+
+    @app.post("/telethon/limit")
+    def telethon_limit_save():
+        if not _owner_only():
+            return _deny()
+        try:
+            n = int(float(request.form.get("limit") or 0))
+        except ValueError:
+            n = 0
+        ok, info = bot_set_limit(db, n)
         flash(info, None if ok else "err")
         return _home()

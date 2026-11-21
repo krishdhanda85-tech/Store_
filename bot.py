@@ -28,6 +28,7 @@ import netflix_otp
 import orders_plus
 import provider
 import textedit
+import telethon_bot
 import reseller_api
 import tenancy
 from binance_pay import public_url
@@ -2610,6 +2611,9 @@ async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if kind in ("admedit", "admicon", "admcat"):
         await admin_text(update, context, st)
         return
+    if kind in ("tmad", "tmint", "tmgap", "tmlim"):
+        await telethon_bot.ad_text(update, context, st)
+        return
     if kind == "emojirule":
         await emoji_rule_text(update, context, st)
         return
@@ -4139,6 +4143,8 @@ def build_application(tenant):
     app.add_handler(CommandHandler("chatid", chatid_cmd))
     app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(CommandHandler("emoji", emoji_cmd))
+    app.add_handler(CommandHandler("ad", telethon_bot.ad_cmd))
+    app.add_handler(CallbackQueryHandler(telethon_bot.ad_callback, pattern=r"^tm:"))
     app.add_handler(CommandHandler("folders", folders_cmd))
     app.add_handler(CommandHandler("emojiall", emojiall_cmd))
     app.add_handler(CommandHandler("owner", owner_cmd))
