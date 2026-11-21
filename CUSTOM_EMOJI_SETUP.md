@@ -6,7 +6,7 @@ Configured products include Crunchyroll, HBO Max, Netflix, Spotify, Duolingo Sup
 
 HMA VPN is not configured yet because its Custom Emoji ID was not supplied. Add `EMOJI_HMA_ID` in Railway once you have it.
 
-Custom emojis are applied to product names in supported message text (such as product cards and order summaries). Telegram inline keyboard button labels use a different API format and are not changed by this patch. Please test a few product/order messages after deploying; Telegram may reject custom emoji entities if the bot/account/API setup does not permit them.
+Custom emojis are applied to product names in supported message text (such as product cards and order summaries). Inline keyboard buttons use Telegram’s `icon_custom_emoji_id` field (Bot API 9.4+). The code passes this as a first-class python-telegram-bot 22.7+ field. Button icons require the bot owner to have an active Telegram Premium subscription, or the bot to meet Telegram’s Fragment additional-username eligibility.
 
 ## Edit from inside the bot (owner + admins)
 
