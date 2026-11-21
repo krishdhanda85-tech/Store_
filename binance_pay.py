@@ -206,6 +206,30 @@ class BinancePayClient:
         finally:
             c.close()
 
+    def submit_order_id(self, order_id, binance_order_id):
+        """Binance Pay: attach the customer's Binance Order ID / Transaction ID (digits only)."""
+        bid = "".join(str(binance_order_id or "").split())
+        if not (bid.isdigit() and 8 <= len(bid) <= 40):
+            return "invalid"
+        c = self._conn()
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            row = c.execute("SELECT submitted_txid,txid,method FROM crypto_payments WHERE order_id=?", (order_id,)).fetchone()
+            if not row:
+                c.rollback(); return "missing"
+            if row["txid"]:
+                c.rollback(); return "paid"
+            if (row["method"] or "") != "bpay":
+                c.rollback(); return "invalid"
+            used = c.execute("SELECT 1 FROM crypto_payments WHERE (submitted_txid=? OR txid=?) AND order_id<>?",
+                             (bid, "bpay:" + bid, order_id)).fetchone()
+            if used:
+                c.rollback(); return "duplicate"
+            c.execute("UPDATE crypto_payments SET submitted_txid=? WHERE order_id=?", (bid, order_id))
+            c.commit(); return "ok"
+        finally:
+            c.close()
+
     def release(self, order_id):
         """Free the reserved amount of a cancelled, still-unpaid order."""
         c = self._conn()
@@ -241,7 +265,7 @@ class BinancePayClient:
             method = "bsc"
         payable = self._reserve(merchant_trade_no, float(amount), method)
         text = f"{payable:.{DECIMALS}f}"
-        tail = "After paying, submit the transaction hash (TXN). Payment is verified automatically after confirmations." if (method == "bsc" or method.startswith("net:")) else "After paying, press Check Payment."
+        tail = "After paying, submit the transaction hash (TXN). Payment is verified automatically after confirmations." if (method == "bsc" or method.startswith("net:")) else "After paying, send your Binance Order ID with the Submit Order ID button (or press Check Payment)."
         details = "\n".join([where[0].format(text=text), where[1], "", tail])
         return {"prepay_id": merchant_trade_no, "checkout_url": "", "amount_text": text, "details": details}
 
@@ -264,19 +288,29 @@ class BinancePayClient:
         payable = Decimal(str(row["payable"]))
         since = int(row["created_ms"]) - 5000
         tol = Decimal(1) / (Decimal(10) ** (DECIMALS + 2))
-        for tx in self._bpay_history():
+        want_id = str(row["submitted_txid"] or "").strip()
+        history = self._bpay_history(force=bool(want_id))
+        for tx in history:
             try:
+                ids = {str(tx.get(k) or "") for k in ("transactionId", "orderId", "prepayId", "merchantTradeNo")}
+                ids.discard("")
+                if want_id and want_id not in ids:
+                    continue            # customer gave an Order ID: only that exact transaction counts
                 if str(tx.get("currency", "")).upper() != "USDT": continue
                 if "REFUND" in str(tx.get("orderType", "")).upper(): continue
                 amt = Decimal(str(tx.get("amount")))
                 if amt <= 0: continue  # outgoing
                 if int(tx.get("transactionTime", 0)) < since: continue
                 if abs(amt - payable) > tol: continue
-                tid = str(tx.get("transactionId") or tx.get("orderId") or "")
+                tid = want_id or str(tx.get("transactionId") or tx.get("orderId") or "")
                 if not tid: continue
                 if self._claim(order_id, "bpay:" + tid): return "PAID"
             except (KeyError, ValueError, TypeError, InvalidOperation):
                 continue
+        log.info("Binance Pay: no match for %s (want %s USDT, order id %r). API returned %d rows: %s",
+                 order_id, payable, want_id or "-", len(history),
+                 [(t.get("currency"), t.get("amount"), t.get("orderType"), t.get("transactionId"), t.get("orderId"))
+                  for t in history[:8]])
         return "PENDING"
 
     def _query_evm_network(self, order_id, row, key):

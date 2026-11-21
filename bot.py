@@ -2160,12 +2160,14 @@ async def cb_dep_txhash(update, context, arg):
     uid = q.from_user.id
     language = lang(uid)
     dep = db.get_deposit(arg)
-    if not dep or dep["user_id"] != uid or not (dep["method"] == "bsc" or str(dep["method"]).startswith("net:")) or dep["status"] != "pending":
+    if not dep or dep["user_id"] != uid or not (dep["method"] in ("bsc", "bpay") or str(dep["method"]).startswith("net:")) or dep["status"] != "pending":
         await q.answer()
         return
     await q.answer()
     context.user_data["await"] = {"type": "txhash", "dep": arg}
-    await q.message.reply_text(tt(language, "txhash_ask", confirmations=3), parse_mode=HTML,
+    ask = ("Send your <b>Binance Order ID</b> (the number shown in the Binance Pay payment details)."
+           if dep["method"] == "bpay" else tt(language, "txhash_ask", confirmations=3))
+    await q.message.reply_text(ask, parse_mode=HTML,
         reply_markup=Markup([[Btn(tt(language, "btn_cancel"), callback_data="cx", style="danger")]]))
 
 
@@ -2535,7 +2537,8 @@ async def create_deposit_flow(update, context, method: str, amount: float):
                          [Btn(tt(language, "check"), callback_data=f"fc:{dep_id}")],
                          [Btn(tt(language, "cancel_dep"), callback_data=f"fx:{dep_id}", style="danger")]])
     else:
-        markup = Markup([[Btn(tt(language, "check"), callback_data=f"fc:{dep_id}", style="success")],
+        markup = Markup([[Btn("🧾 Submit Order ID", callback_data=f"ftx:{dep_id}", style="success")],
+                         [Btn(tt(language, "check"), callback_data=f"fc:{dep_id}")],
                          [Btn(tt(language, "cancel_dep"), callback_data=f"fx:{dep_id}", style="danger")]])
     await update.message.reply_text(
         tt(language, "dep_created", id=esc(dep_id), credit=money(amount), amount=pay.get("amount_text", money(amount)),
@@ -2679,7 +2682,11 @@ async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif kind == "txhash":
         tx_hash = re.sub(r"\s+", "", text).lower()
-        result = await asyncio.to_thread(binance.submit_tx_hash, st["dep"], tx_hash)
+        _dep = db.get_deposit(st["dep"])
+        if _dep and _dep["method"] == "bpay":
+            result = await asyncio.to_thread(binance.submit_order_id, st["dep"], tx_hash)
+        else:
+            result = await asyncio.to_thread(binance.submit_tx_hash, st["dep"], tx_hash)
         if result == "invalid":
             await msg.reply_text(tt(language, "txhash_invalid"))
             return
