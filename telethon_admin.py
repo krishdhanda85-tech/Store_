@@ -1,25 +1,54 @@
 """Owner-only Telethon group marketing controls.
 
-Uses a dedicated Telegram user account session. Only explicitly configured groups are
-used; the owner must confirm they administer the group or have permission to promote.
-No group discovery, scraping, unsolicited DMs, or random bulk messaging.
+Uses a dedicated Telegram user account session. Only groups the owner added (and confirmed
+they may promote in) are used. No group discovery, scraping or unsolicited DMs.
+
+Features
+  * Unlimited approved groups (add many at once, one per line).
+  * Manual send and AUTO-POST: the owner sets the repeat interval, the gap between groups
+    and the message from the website.
+  * Sending runs in the background, so large group lists never time out the web page.
+  * Safety: minimum interval / gap, stops on Telegram flood limits, stops after many failures
+    in a row, switches auto-post off if the Telegram session is dead.
 """
+import asyncio
 import json
 import logging
-import os
 import re
 import threading
 import time
+from datetime import datetime, timezone
 
 from flask import request, redirect, url_for, flash
+
+import tenancy
 from provider import encrypt, decrypt
 
 log = logging.getLogger("telethon_admin")
 PREFIX = "telethon_marketing_"
+
+MIN_INTERVAL_MIN = 10      # auto-post: shortest repeat time the owner may set
+MIN_GAP_SEC = 5            # shortest pause between two groups
+MAX_MSG = 3500
+MAX_FAILS_IN_ROW = 8
+_TICK = 20                 # scheduler wake-up (seconds)
+
 _pending = {}
 _pending_lock = threading.RLock()
 
+_state_lock = threading.RLock()
+_state = {"running": False, "source": "", "sent": 0, "total": 0, "failed": [],
+          "started": 0.0, "stop": False, "current": ""}
 
+_loop = None
+_loop_lock = threading.Lock()
+_sched_started = False
+
+_FATAL = {"AuthKeyUnregisteredError", "AuthKeyDuplicatedError", "UserDeactivatedError",
+          "UserDeactivatedBanError", "SessionRevokedError", "SessionExpiredError"}
+
+
+# ------------------------------------------------------------------ settings helpers
 def _get(db, key, default=""):
     return db.get_setting(PREFIX + key, default)
 
@@ -28,12 +57,31 @@ def _set(db, key, value):
     db.set_setting(PREFIX + key, value)
 
 
+def _int_setting(db, key, default, lo, hi):
+    try:
+        v = int(float(_get(db, key, str(default)) or default))
+    except Exception:
+        v = default
+    return max(lo, min(hi, v))
+
+
+def _float_setting(db, key, default=0.0):
+    try:
+        return float(_get(db, key, str(default)) or default)
+    except Exception:
+        return default
+
+
 def _targets(db):
     try:
         data = json.loads(_get(db, "targets", "[]"))
         return data if isinstance(data, list) else []
     except Exception:
         return []
+
+
+def _save_targets(db, targets):
+    _set(db, "targets", json.dumps(targets))
 
 
 def _api_credentials(db):
@@ -45,18 +93,12 @@ def _api_credentials(db):
     return api_id, api_hash
 
 
-def _client(db, session_string=None):
-    from telethon.sync import TelegramClient
-    from telethon.sessions import StringSession
-    api_id, api_hash = _api_credentials(db)
-    if not api_id or not api_hash:
-        raise RuntimeError("Save Telegram API ID and API Hash once in the owner dashboard first.")
-    return TelegramClient(StringSession(session_string or ""), api_id, api_hash)
-
-
 def _saved_session(db):
     enc = _get(db, "session_enc", "")
-    return decrypt(enc) if enc else ""
+    try:
+        return decrypt(enc) if enc else ""
+    except Exception:
+        return ""
 
 
 def _safe_target(value):
@@ -73,7 +115,277 @@ def _safe_target(value):
     return value
 
 
+def _entity_ref(target):
+    return int(target) if re.fullmatch(r"-?\d+", target) else target
+
+
+def _errtext(e):
+    return (str(e) or type(e).__name__)[:240]
+
+
+def _fmt_ts(ts):
+    if not ts:
+        return ""
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+# ------------------------------------------------------------------ Telethon event loop
+# One background event loop owns every Telethon client, so logins that span two web requests
+# and the auto-post scheduler all work safely from any thread.
+def _get_loop():
+    global _loop
+    with _loop_lock:
+        if _loop is None:
+            loop = asyncio.new_event_loop()
+            ready = threading.Event()
+
+            def _run():
+                asyncio.set_event_loop(loop)
+                loop.call_soon(ready.set)
+                loop.run_forever()
+
+            threading.Thread(target=_run, daemon=True, name="telethon-loop").start()
+            ready.wait(5)
+            _loop = loop
+        return _loop
+
+
+def _call(coro, timeout=90):
+    return asyncio.run_coroutine_threadsafe(coro, _get_loop()).result(timeout)
+
+
+def _new_client(api_id, api_hash, session_string=""):
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+    return TelegramClient(StringSession(session_string or ""), api_id, api_hash)
+
+
+async def _a_send_code(api_id, api_hash, phone):
+    client = _new_client(api_id, api_hash)
+    await client.connect()
+    try:
+        sent = await client.send_code_request(phone)
+    except Exception:
+        await client.disconnect()
+        raise
+    return client, sent.phone_code_hash
+
+
+async def _a_sign_in(client, phone, code, code_hash, password, need_password):
+    from telethon.errors import SessionPasswordNeededError
+    if not need_password:
+        try:
+            await client.sign_in(phone=phone, code=code, phone_code_hash=code_hash)
+        except SessionPasswordNeededError:
+            if not password:
+                return "need_password", None
+            await client.sign_in(password=password)
+    else:
+        if not password:
+            return "need_password", None
+        await client.sign_in(password=password)
+    session_string = client.session.save()
+    await client.disconnect()
+    return "ok", session_string
+
+
+async def _a_disconnect(client):
+    await client.disconnect()
+
+
+async def _nap(seconds):
+    """Sleep in 1-second steps so the Stop button reacts quickly."""
+    end = time.time() + seconds
+    while time.time() < end:
+        with _state_lock:
+            if _state["stop"]:
+                return
+        await asyncio.sleep(min(1.0, max(0.0, end - time.time())))
+
+
+async def _send_one(client, target, message):
+    for attempt in (1, 2):
+        try:
+            entity = await client.get_entity(_entity_ref(target))
+            await client.send_message(entity, message, link_preview=False)
+            return "ok", ""
+        except Exception as e:
+            name = type(e).__name__
+            if name == "FloodWaitError":
+                secs = int(getattr(e, "seconds", 0) or 0)
+                if attempt == 1 and secs <= 90:
+                    await asyncio.sleep(secs + 1)
+                    continue
+                return "flood", secs
+            if name == "PeerFloodError":
+                return "flood", 6 * 3600
+            if name in _FATAL:
+                return "fatal", name
+            return "fail", f"{target}: {_errtext(e)[:100]}"
+    return "fail", f"{target}: retry failed"
+
+
+async def _a_campaign(api_id, api_hash, session_string, targets, message, gap):
+    client = _new_client(api_id, api_hash, session_string)
+    await client.connect()
+    res = {"abort": "", "fatal": False, "wait": 0}
+    try:
+        if not await client.is_user_authorized():
+            res.update(abort="Telegram session expired. Reconnect it.", fatal=True)
+            return res
+        if any(_entity_ref(t) != t for t in targets):
+            try:
+                await client.get_dialogs()     # lets Telethon resolve numeric group IDs
+            except Exception:
+                log.warning("get_dialogs failed", exc_info=True)
+        misses = 0
+        for i, target in enumerate(targets):
+            with _state_lock:
+                if _state["stop"]:
+                    res["abort"] = "Stopped by owner."
+                    break
+                _state["current"] = target
+            status, info = await _send_one(client, target, message)
+            with _state_lock:
+                if status == "ok":
+                    _state["sent"] += 1
+                    misses = 0
+                elif status == "fail":
+                    _state["failed"].append(info)
+                    misses += 1
+            if status == "flood":
+                res.update(abort=f"Telegram flood limit - asked to wait {info}s. Stopped.", wait=int(info))
+                break
+            if status == "fatal":
+                res.update(abort=f"Telegram account problem ({info}). Auto-post switched off.", fatal=True)
+                break
+            if misses >= MAX_FAILS_IN_ROW:
+                res["abort"] = f"{MAX_FAILS_IN_ROW} groups failed in a row. Stopped."
+                break
+            if i < len(targets) - 1:
+                await _nap(gap)
+        return res
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+
+# ------------------------------------------------------------------ campaigns
+def _finish(db, tenant, source, res):
+    with _state_lock:
+        sent, total = _state["sent"], _state["total"]
+        failed = list(_state["failed"])
+        _state["running"] = False
+        _state["current"] = ""
+    abort = res.get("abort", "")
+    text = f"{source}: sent {sent}/{total}, failed {len(failed)}."
+    if abort:
+        text += " " + abort
+    if failed:
+        text += " Errors: " + " | ".join(failed[:3])
+    try:
+        with tenancy.use(tenant):
+            _set(db, "last_run_ts", str(time.time()))
+            _set(db, "last_run_text", text[:600])
+            if res.get("fatal"):
+                _set(db, "auto_enabled", "0")
+            if source == "auto" and _get(db, "auto_enabled", "0") == "1":
+                interval = _int_setting(db, "interval_min", 60, MIN_INTERVAL_MIN, 10080)
+                wait = max(interval * 60, int(res.get("wait", 0)) + 60)
+                _set(db, "next_run", str(time.time() + wait))
+    except Exception:
+        log.exception("could not save Telethon campaign result")
+
+
+def _start_campaign(db, message, source):
+    """Starts a background campaign. Returns (ok, text). Must run with the owner shop active."""
+    message = (message or "").strip()
+    if not message:
+        return False, "Message is empty."
+    if len(message) > MAX_MSG:
+        return False, f"Message is too long (max {MAX_MSG} characters)."
+    api_id, api_hash = _api_credentials(db)
+    if not api_id or not api_hash:
+        return False, "Save Telegram API ID and API Hash first."
+    session_string = _saved_session(db)
+    if not session_string:
+        return False, "Connect the Telegram account first."
+    targets = _targets(db)
+    if not targets:
+        return False, "Add at least one approved group first."
+    gap = _int_setting(db, "gap_sec", 12, MIN_GAP_SEC, 3600)
+    with _state_lock:
+        if _state["running"]:
+            return False, "A campaign is already running."
+        _state.update(running=True, source=source, sent=0, total=len(targets), failed=[],
+                      started=time.time(), stop=False, current="")
+    tenant = tenancy.get_tenant(tenancy.MAIN_ID)
+
+    async def _job():
+        try:
+            res = await _a_campaign(api_id, api_hash, session_string, targets, message, gap)
+        except Exception as e:
+            log.exception("Telethon campaign crashed")
+            res = {"abort": _errtext(e), "fatal": False, "wait": 0}
+        _finish(db, tenant, source, res)
+
+    try:
+        asyncio.run_coroutine_threadsafe(_job(), _get_loop())
+    except Exception as e:
+        with _state_lock:
+            _state["running"] = False
+        return False, _errtext(e)
+    return True, f"Started: sending to {len(targets)} group(s) in the background."
+
+
+def _scheduler(db):
+    while True:
+        time.sleep(_TICK)
+        try:
+            tenant = tenancy.get_tenant(tenancy.MAIN_ID)
+            with tenancy.use(tenant):
+                if _get(db, "auto_enabled", "0") != "1":
+                    continue
+                with _state_lock:
+                    if _state["running"]:
+                        continue
+                if time.time() < _float_setting(db, "next_run", 0.0):
+                    continue
+                interval = _int_setting(db, "interval_min", 60, MIN_INTERVAL_MIN, 10080)
+                ok, info = _start_campaign(db, _get(db, "auto_message", ""), "auto")
+                if not ok:
+                    _set(db, "next_run", str(time.time() + interval * 60))
+                    _set(db, "last_run_ts", str(time.time()))
+                    _set(db, "last_run_text", "auto skipped: " + info)
+        except Exception:
+            log.exception("Telethon scheduler error")
+
+
+def _ensure_scheduler(db):
+    global _sched_started
+    if not _sched_started:
+        _sched_started = True
+        threading.Thread(target=_scheduler, args=(db,), daemon=True, name="telethon-scheduler").start()
+
+
+# ------------------------------------------------------------------ web pages
 def register(app, render_str, db):
+    _ensure_scheduler(db)
+
+    def _owner_only():
+        from tenancy import current_or_none
+        t = current_or_none()
+        return bool(t and t.is_main)
+
+    def _deny():
+        flash("Owner access required.", "err")
+        return redirect(url_for("dashboard"))
+
+    def _home():
+        return redirect(url_for("telethon_admin_home"))
+
     @app.get("/telethon")
     def telethon_admin_home():
         from tenancy import current_or_none
@@ -84,35 +396,70 @@ def register(app, render_str, db):
         connected = bool(_saved_session(db))
         targets = _targets(db)
         api_configured = bool(all(_api_credentials(db)))
+        auto_on = _get(db, "auto_enabled", "0") == "1"
+        nxt = _float_setting(db, "next_run", 0.0)
+        now = time.time()
+        if nxt > now:
+            mins = int((nxt - now) / 60) + 1
+            next_text = f"in about {mins} min ({_fmt_ts(nxt)})"
+        else:
+            next_text = "due now (starts within a minute)"
+        with _state_lock:
+            state = dict(_state)
         page = r'''{% extends "base.html" %}{% block body %}
-<div class="page-head"><div><h2>Telethon Marketing</h2><p class="muted">Manage your connected Telegram account and approved promotion groups.</p></div><span class="badge">Owner only</span></div>
+<div class="page-head"><div><h2>Telethon Marketing</h2><p class="muted">Connected Telegram account, approved groups and auto-posting.</p></div><span class="badge">Owner only</span></div>
+
+<div class="card"><h3>Auto-post</h3>
+<p>{% if auto_on %}<span class="badge" style="background:#13805a;color:white">ON</span> Next run: {{ next_text }}{% else %}<span class="badge">OFF</span> Auto-post is not running.{% endif %}</p>
+{% if state.running %}<p><b>Running ({{ state.source }}):</b> sent {{ state.sent }} of {{ state.total }}{% if state.current %} &middot; now: <span class="mono">{{ state.current }}</span>{% endif %}</p>
+<form method="post" action="{{ url_for('telethon_stop') }}"><button class="red sm" type="submit">Stop</button></form>
+<script>setTimeout(function(){location.reload()},8000)</script>{% endif %}
+{% if last_text %}<p class="muted">Last run ({{ last_when }}): {{ last_text }}</p>{% endif %}
+<form method="post" action="{{ url_for('telethon_auto_save') }}">
+<label style="display:flex;gap:8px;align-items:center"><input style="width:auto;margin:0" type="checkbox" name="enabled" value="1" {% if auto_on %}checked{% endif %}> Turn auto-post ON</label>
+<label>Repeat every (minutes, minimum {{ min_interval }})</label><input name="interval" type="number" min="{{ min_interval }}" value="{{ interval }}" required>
+<label>Gap between groups (seconds, minimum {{ min_gap }})</label><input name="gap" type="number" min="{{ min_gap }}" value="{{ gap }}" required>
+<label>Auto message</label><textarea name="message" rows="6" maxlength="3500" placeholder="Message to post automatically...">{{ auto_message }}</textarea>
+<label style="display:flex;gap:8px;align-items:center"><input style="width:auto;margin:0" type="checkbox" name="confirm" value="yes"> I confirm this message is allowed in every group below (needed to turn auto-post ON).</label>
+<button type="submit">Save auto-post settings</button></form>
+<form method="post" action="{{ url_for('telethon_auto_run_now') }}" style="margin-top:8px"><button type="submit" {% if state.running or not connected or not targets %}disabled{% endif %}>Send the auto message now</button></form>
+</div>
+
+<div class="card"><h3>Approved groups ({{ targets|length }})</h3><p class="muted">No limit. Add only groups where you are an admin or promotions are allowed. One group per line.</p>
+<form method="post" action="{{ url_for('telethon_add_target') }}"><label>Group usernames or IDs (one per line)</label><textarea name="targets" rows="5" placeholder="@group1&#10;@group2&#10;-1001234567890" required></textarea><label style="display:flex;gap:8px;align-items:center"><input style="width:auto;margin:0" type="checkbox" name="permission" value="yes" required> I administer these groups or have permission to post promotions.</label><button type="submit">Add groups</button></form>
+{% if targets %}<div class="scroll"><table><thead><tr><th>Group</th><th>Action</th></tr></thead><tbody>{% for target in targets %}<tr><td class="mono">{{ target }}</td><td><form method="post" action="{{ url_for('telethon_remove_target') }}"><input type="hidden" name="target" value="{{ target }}"><button class="red sm" type="submit">Remove</button></form></td></tr>{% endfor %}</tbody></table></div>
+<form method="post" action="{{ url_for('telethon_clear_targets') }}" onsubmit="return confirm('Remove ALL groups?')"><button class="red sm" type="submit">Remove all groups</button></form>{% else %}<p class="empty">No groups added yet.</p>{% endif %}</div>
+
+<div class="card"><h3>Send once now</h3><p class="muted">Sends this message to all groups above in the background (with the gap set in Auto-post).</p>
+<form method="post" action="{{ url_for('telethon_send_message') }}"><label>Message</label><textarea name="message" rows="5" maxlength="3500" placeholder="Write your promotion..." required></textarea><label style="display:flex;gap:8px;align-items:center"><input style="width:auto;margin:0" type="checkbox" name="confirm" value="yes" required> I confirm this message is relevant and allowed in every group.</label><button type="submit" {% if state.running or not connected or not targets %}disabled{% endif %}>Send now</button></form></div>
+
 <div class="card"><h3>Connection</h3>
-{% if connected %}<p><span class="badge" style="background:#13805a;color:white">Session saved</span> Telegram user session is configured.</p>
-<form method="post" action="{{ url_for('telethon_disconnect') }}" onsubmit="return confirm('Disconnect the Telegram user session?')"><button class="red sm" type="submit">Disconnect session</button></form>
+{% if connected %}<p><span class="badge" style="background:#13805a;color:white">Session saved</span> Telegram account is connected.</p>
+<form method="post" action="{{ url_for('telethon_disconnect') }}" onsubmit="return confirm('Disconnect the Telegram account? Auto-post will stop working.')"><button class="red sm" type="submit">Disconnect session</button></form>
 {% else %}<p class="muted">Save your Telegram API credentials below once, then sign in with a dedicated Telegram account.</p>
 {% if api_configured %}<p><span class="badge" style="background:#13805a;color:white">API credentials saved</span></p>{% endif %}
 <form method="post" action="{{ url_for('telethon_send_code') }}"><label>Phone number with country code</label><input name="phone" placeholder="+91XXXXXXXXXX" required><button type="submit">Send Telegram login code</button></form>
-{% if pending %}<form method="post" action="{{ url_for('telethon_verify_code') }}"><label>Telegram login code</label><input name="code" inputmode="numeric" required><label>2-step verification password (only if Telegram asks)</label><input name="password" type="password" autocomplete="off"><button type="submit">Verify and save session</button></form>{% endif %}{% endif %}</div>
-<div class="card"><h3>Telegram API credentials (one-time)</h3><p class="muted">Get these from my.telegram.org → API development tools. Save them here once; no Railway Variables edits are needed. Credentials are encrypted in the store database.</p>
-<form method="post" action="{{ url_for('telethon_save_api') }}"><label>Telegram API ID</label><input name="api_id" inputmode="numeric" placeholder="{% if api_configured %}Saved — enter new value only to replace{% else %}API ID{% endif %}" required><label>Telegram API Hash</label><input name="api_hash" type="password" autocomplete="new-password" placeholder="{% if api_configured %}Saved — enter new value only to replace{% else %}API Hash{% endif %}" required><button type="submit">Save API credentials</button></form></div>
-<div class="card"><h3>Approved groups</h3><p class="muted">Add only groups where you are an admin or the owner has explicitly allowed promotional posts. The tool will not search random groups or message members privately.</p>
-<form method="post" action="{{ url_for('telethon_add_target') }}"><label>Group username or ID</label><input name="target" placeholder="@yourgroup or -1001234567890" required><label style="display:flex;gap:8px;align-items:center"><input style="width:auto;margin:0" type="checkbox" name="permission" value="yes" required> I administer this group or have permission to post promotions.</label><button type="submit">Add approved group</button></form>
-{% if targets %}<div class="scroll"><table><thead><tr><th>Group</th><th>Action</th></tr></thead><tbody>{% for target in targets %}<tr><td class="mono">{{ target }}</td><td><form method="post" action="{{ url_for('telethon_remove_target') }}"><input type="hidden" name="target" value="{{ target }}"><button class="red sm" type="submit">Remove</button></form></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">No groups added yet.</p>{% endif %}</div>
-<div class="card"><h3>Compose promotion</h3><p class="muted">Messages are sent only to the groups listed above. Maximum 5 groups per send, with a delay between sends.</p>
-<form method="post" action="{{ url_for('telethon_send_message') }}"><label>Message</label><textarea name="message" rows="6" maxlength="3500" placeholder="Write your Okiemyshop promotion..." required></textarea><label style="display:flex;gap:8px;align-items:center"><input style="width:auto;margin:0" type="checkbox" name="confirm" value="yes" required> I confirm this message is relevant and allowed in every selected group.</label><button type="submit" {% if not connected or not targets %}disabled{% endif %}>Send to approved groups</button></form></div>
-<p class="muted">API credentials and Telegram session are encrypted in the store database. Keep your existing bot token and Telegram login details private.</p>
-{% endblock %}'''
-        return render_str(page, connected=connected, targets=targets, pending=bool(_pending.get("owner")), api_configured=api_configured)
+{% if pending %}<form method="post" action="{{ url_for('telethon_verify_code') }}"><label>Telegram login code</label><input name="code" inputmode="numeric" {% if not need_password %}required{% endif %}><label>2-step verification password (only if Telegram asks)</label><input name="password" type="password" autocomplete="off"><button type="submit">Verify and save session</button></form>{% endif %}{% endif %}</div>
 
-    def _owner_only():
-        from tenancy import current_or_none
-        t = current_or_none()
-        return bool(t and t.is_main)
+<div class="card"><h3>Telegram API credentials (one-time)</h3><p class="muted">From my.telegram.org &rarr; API development tools. Encrypted in the store database.</p>
+<form method="post" action="{{ url_for('telethon_save_api') }}"><label>Telegram API ID</label><input name="api_id" inputmode="numeric" placeholder="{% if api_configured %}Saved - enter new value only to replace{% else %}API ID{% endif %}" required><label>Telegram API Hash</label><input name="api_hash" type="password" autocomplete="new-password" placeholder="{% if api_configured %}Saved - enter new value only to replace{% else %}API Hash{% endif %}" required><button type="submit">Save API credentials</button></form></div>
+<p class="muted">Tip: use a dedicated Telegram account, and keep the interval and gap generous. Telegram can limit accounts that post too often.</p>
+{% endblock %}'''
+        pend = _pending.get("owner")
+        return render_str(
+            page, connected=connected, targets=targets, api_configured=api_configured,
+            pending=bool(pend), need_password=bool(pend and pend.get("need_password")),
+            auto_on=auto_on, next_text=next_text, state=state,
+            last_text=_get(db, "last_run_text", ""), last_when=_fmt_ts(_float_setting(db, "last_run_ts", 0.0)),
+            interval=_int_setting(db, "interval_min", 60, MIN_INTERVAL_MIN, 10080),
+            gap=_int_setting(db, "gap_sec", 12, MIN_GAP_SEC, 3600),
+            auto_message=_get(db, "auto_message", ""),
+            min_interval=MIN_INTERVAL_MIN, min_gap=MIN_GAP_SEC)
 
     @app.post("/telethon/save-api")
     def telethon_save_api():
         if not _owner_only():
-            flash("Owner access required.", "err"); return redirect(url_for("dashboard"))
+            return _deny()
         try:
             api_id = int((request.form.get("api_id") or "").strip())
             api_hash = (request.form.get("api_hash") or "").strip()
@@ -122,129 +469,195 @@ def register(app, render_str, db):
             _set(db, "api_hash_enc", encrypt(api_hash))
             flash("Telegram API credentials saved securely. No need to edit Railway Variables.")
         except Exception as e:
-            flash(str(e)[:240], "err")
-        return redirect(url_for("telethon_admin_home"))
+            flash(_errtext(e), "err")
+        return _home()
 
     @app.post("/telethon/send-code")
     def telethon_send_code():
         if not _owner_only():
-            flash("Owner access required.", "err"); return redirect(url_for("dashboard"))
+            return _deny()
         phone = (request.form.get("phone") or "").strip()
         try:
             if not phone.startswith("+") or len(phone) < 8 or len(phone) > 18:
                 raise ValueError("Enter phone number in international format, e.g. +91...")
-            client = _client(db)
-            client.connect()
-            sent = client.send_code_request(phone)
+            api_id, api_hash = _api_credentials(db)
+            if not api_id or not api_hash:
+                raise RuntimeError("Save Telegram API ID and API Hash once in the owner dashboard first.")
+            client, code_hash = _call(_a_send_code(api_id, api_hash, phone))
             with _pending_lock:
                 old = _pending.pop("owner", None)
-                if old:
-                    try: old["client"].disconnect()
-                    except Exception: pass
-                _pending["owner"] = {"client": client, "phone": phone, "phone_code_hash": sent.phone_code_hash, "created": time.time()}
+                _pending["owner"] = {"client": client, "phone": phone, "phone_code_hash": code_hash,
+                                     "created": time.time(), "need_password": False}
+            if old:
+                try:
+                    _call(_a_disconnect(old["client"]), 20)
+                except Exception:
+                    pass
             flash("Login code sent in Telegram. Enter it below.")
         except Exception as e:
-            flash(str(e)[:240], "err")
-        return redirect(url_for("telethon_admin_home"))
+            flash(_errtext(e), "err")
+        return _home()
 
     @app.post("/telethon/verify-code")
     def telethon_verify_code():
         if not _owner_only():
-            flash("Owner access required.", "err"); return redirect(url_for("dashboard"))
+            return _deny()
         with _pending_lock:
             pending = _pending.get("owner")
         if not pending or time.time() - pending["created"] > 600:
-            flash("Login request expired. Send a new code.", "err"); return redirect(url_for("telethon_admin_home"))
+            flash("Login request expired. Send a new code.", "err")
+            return _home()
         try:
-            from telethon.errors import SessionPasswordNeededError
-            try:
-                pending["client"].sign_in(phone=pending["phone"], code=(request.form.get("code") or "").strip(), phone_code_hash=pending["phone_code_hash"])
-            except SessionPasswordNeededError:
-                password = request.form.get("password") or ""
-                if not password:
-                    flash("Telegram requires your 2-step password. Enter it and submit again.", "err")
-                    return redirect(url_for("telethon_admin_home"))
-                pending["client"].sign_in(password=password)
-            session_string = pending["client"].session.save()
+            code = (request.form.get("code") or "").strip()
+            password = request.form.get("password") or ""
+            status, session_string = _call(_a_sign_in(
+                pending["client"], pending["phone"], code, pending["phone_code_hash"],
+                password, pending.get("need_password", False)))
+            if status == "need_password":
+                pending["need_password"] = True
+                flash("Telegram requires your 2-step password. Enter it and submit again.", "err")
+                return _home()
             _set(db, "session_enc", encrypt(session_string))
-            try: pending["client"].disconnect()
-            except Exception: pass
-            with _pending_lock: _pending.pop("owner", None)
+            with _pending_lock:
+                _pending.pop("owner", None)
             flash("Telegram account connected. Session encrypted and saved.")
         except Exception as e:
-            flash(str(e)[:240], "err")
-        return redirect(url_for("telethon_admin_home"))
+            flash(_errtext(e), "err")
+        return _home()
 
     @app.post("/telethon/disconnect")
     def telethon_disconnect():
         if not _owner_only():
-            flash("Owner access required.", "err"); return redirect(url_for("dashboard"))
+            return _deny()
         db.del_settings([PREFIX + "session_enc"])
-        flash("Telegram session disconnected.")
-        return redirect(url_for("telethon_admin_home"))
+        _set(db, "auto_enabled", "0")
+        flash("Telegram session disconnected. Auto-post switched off.")
+        return _home()
 
     @app.post("/telethon/targets/add")
     def telethon_add_target():
         if not _owner_only():
-            flash("Owner access required.", "err"); return redirect(url_for("dashboard"))
-        try:
-            if request.form.get("permission") != "yes":
-                raise ValueError("Confirm group promotion permission first.")
-            target = _safe_target(request.form.get("target"))
-            targets = _targets(db)
-            if target not in targets:
-                if len(targets) >= 5: raise ValueError("Maximum 5 approved groups for this first version.")
-                targets.append(target); _set(db, "targets", json.dumps(targets))
-            flash("Approved group added.")
-        except Exception as e: flash(str(e), "err")
-        return redirect(url_for("telethon_admin_home"))
+            return _deny()
+        if request.form.get("permission") != "yes":
+            flash("Confirm group promotion permission first.", "err")
+            return _home()
+        raw = re.split(r"[\s,;]+", request.form.get("targets") or "")
+        targets = _targets(db)
+        added, skipped, bad = 0, 0, []
+        for item in raw:
+            if not item:
+                continue
+            try:
+                target = _safe_target(item)
+            except Exception:
+                bad.append(item[:30])
+                continue
+            if target in targets:
+                skipped += 1
+            else:
+                targets.append(target)
+                added += 1
+        _save_targets(db, targets)
+        msg = f"{added} group(s) added."
+        if skipped:
+            msg += f" {skipped} already in the list."
+        if bad:
+            msg += " Invalid: " + ", ".join(bad[:5])
+        flash(msg, "err" if bad and not added else None)
+        return _home()
 
     @app.post("/telethon/targets/remove")
     def telethon_remove_target():
         if not _owner_only():
-            flash("Owner access required.", "err"); return redirect(url_for("dashboard"))
+            return _deny()
         target = request.form.get("target", "")
-        targets = [x for x in _targets(db) if x != target]
-        _set(db, "targets", json.dumps(targets))
+        _save_targets(db, [x for x in _targets(db) if x != target])
         flash("Group removed.")
-        return redirect(url_for("telethon_admin_home"))
+        return _home()
+
+    @app.post("/telethon/targets/clear")
+    def telethon_clear_targets():
+        if not _owner_only():
+            return _deny()
+        _save_targets(db, [])
+        flash("All groups removed.")
+        return _home()
+
+    @app.post("/telethon/auto/save")
+    def telethon_auto_save():
+        if not _owner_only():
+            return _deny()
+        try:
+            interval = int(float(request.form.get("interval") or 0))
+            gap = int(float(request.form.get("gap") or 0))
+        except ValueError:
+            flash("Interval and gap must be numbers.", "err")
+            return _home()
+        if interval < MIN_INTERVAL_MIN:
+            flash(f"Interval must be at least {MIN_INTERVAL_MIN} minutes.", "err")
+            return _home()
+        if gap < MIN_GAP_SEC:
+            flash(f"Gap must be at least {MIN_GAP_SEC} seconds.", "err")
+            return _home()
+        message = (request.form.get("message") or "").strip()
+        if len(message) > MAX_MSG:
+            flash(f"Message is too long (max {MAX_MSG} characters).", "err")
+            return _home()
+        enable = request.form.get("enabled") == "1"
+        was_on = _get(db, "auto_enabled", "0") == "1"
+        if enable:
+            if request.form.get("confirm") != "yes":
+                flash("Tick the confirmation box to turn auto-post ON.", "err")
+                return _home()
+            if not message:
+                flash("Write the auto message first.", "err")
+                return _home()
+            if not _saved_session(db):
+                flash("Connect the Telegram account first.", "err")
+                return _home()
+            if not _targets(db):
+                flash("Add at least one group first.", "err")
+                return _home()
+        _set(db, "interval_min", str(min(interval, 10080)))
+        _set(db, "gap_sec", str(min(gap, 3600)))
+        _set(db, "auto_message", message)
+        _set(db, "auto_enabled", "1" if enable else "0")
+        now = time.time()
+        if enable:
+            limit = now + interval * 60
+            current = _float_setting(db, "next_run", 0.0)
+            if not was_on or current <= 0 or current > limit:
+                _set(db, "next_run", str(limit))
+            flash(f"Auto-post is ON: every {interval} min, {gap}s between groups.")
+        else:
+            flash("Auto-post settings saved. Auto-post is OFF.")
+        return _home()
+
+    @app.post("/telethon/auto/run-now")
+    def telethon_auto_run_now():
+        if not _owner_only():
+            return _deny()
+        ok, info = _start_campaign(db, _get(db, "auto_message", ""), "manual")
+        flash(info, None if ok else "err")
+        return _home()
+
+    @app.post("/telethon/stop")
+    def telethon_stop():
+        if not _owner_only():
+            return _deny()
+        with _state_lock:
+            if _state["running"]:
+                _state["stop"] = True
+        flash("Stopping after the current group.")
+        return _home()
 
     @app.post("/telethon/send")
     def telethon_send_message():
         if not _owner_only():
-            flash("Owner access required.", "err"); return redirect(url_for("dashboard"))
-        message = (request.form.get("message") or "").strip()
-        if request.form.get("confirm") != "yes" or not message:
-            flash("Message and group permission confirmation are required.", "err"); return redirect(url_for("telethon_admin_home"))
-        if len(message) > 3500:
-            flash("Message is too long (max 3500 characters).", "err"); return redirect(url_for("telethon_admin_home"))
-        targets = _targets(db)
-        session_string = _saved_session(db)
-        if not session_string or not targets:
-            flash("Connect Telegram and add approved groups first.", "err"); return redirect(url_for("telethon_admin_home"))
-        client = None
-        sent, failed = 0, []
-        try:
-            client = _client(db, session_string)
-            client.connect()
-            if not client.is_user_authorized(): raise RuntimeError("Telegram session expired. Reconnect it.")
-            for target in targets:
-                try:
-                    entity = client.get_entity(target)
-                    awaitable = client.send_message(entity, message, link_preview=False)
-                    # telethon.sync returns completed result in sync context.
-                    if hasattr(awaitable, "__await__"):
-                        import asyncio
-                        asyncio.get_event_loop().run_until_complete(awaitable)
-                    sent += 1
-                    time.sleep(12)
-                except Exception as e:
-                    failed.append(f"{target}: {str(e)[:100]}")
-            flash(f"Campaign finished: sent to {sent} group(s); {len(failed)} failed." + (" Details: " + " | ".join(failed[:3]) if failed else ""), "err" if failed else None)
-        except Exception as e:
-            flash(str(e)[:240], "err")
-        finally:
-            if client:
-                try: client.disconnect()
-                except Exception: pass
-        return redirect(url_for("telethon_admin_home"))
+            return _deny()
+        if request.form.get("confirm") != "yes":
+            flash("Confirm that the message is allowed in every group.", "err")
+            return _home()
+        ok, info = _start_campaign(db, request.form.get("message"), "manual")
+        flash(info, None if ok else "err")
+        return _home()
