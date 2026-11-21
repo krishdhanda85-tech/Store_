@@ -18,6 +18,7 @@ import provider
 import tenancy
 import sellers_web
 from flask import g
+from telethon_admin import register as register_telethon_admin
 
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 
@@ -329,6 +330,7 @@ a:hover{text-decoration:underline}
 {{ nl('admins','Admins','shield') }}
 {{ nl('emojis','Premium emojis','tag') }}
 {{ nl('settings','Settings','sliders') }}
+{% if is_main %}{{ nl('telethon_admin_home','Telethon Marketing','link') }}{% endif %}
 <div class="out"><button type="button" class="themebtn" id="themebtn">{{ ico('sliders') }}<span>Switch theme</span></button><button type="button" class="themebtn" id="palbtn">{{ ico('list') }}<span>Quick jump</span><span class="kbd" style="margin-left:auto">Ctrl K</span></button>{{ nl('logout','Log out','out') }}</div>
 </aside>
 {% endif %}
@@ -1205,6 +1207,9 @@ def render_str(source, **kw):
 
 def render(name, **kw):
     return render_template(name, **_ctx(kw))
+
+
+register_telethon_admin(app, render_str, db)
 
 
 # ------------------------------------------------------------------- auth
