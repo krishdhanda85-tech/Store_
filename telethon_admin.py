@@ -73,7 +73,7 @@ def _safe_target(value):
     return value
 
 
-def register(app, render, db):
+def register(app, render_str, db):
     @app.get("/telethon")
     def telethon_admin_home():
         from tenancy import current_or_none
