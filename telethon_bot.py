@@ -4,6 +4,7 @@ The owner just sends the ad as a normal Telegram message (premium emojis, bold, 
 kept). It is stored as the Telethon "auto message", so the website and the bot share one ad.
 Only the platform owner of the MAIN shop can use it.
 """
+import asyncio
 import html
 import logging
 
@@ -57,13 +58,20 @@ def to_ad_html(text, entities):
 def _panel(db):
     s = ta.bot_status(db)
     lines = ["📢 <b>Telethon Ad</b>", ""]
+    for w in s["warnings"][:4]:
+        lines.append("⚠️ " + html.escape(w[:220]))
+    if s["warnings"]:
+        lines.append("")
     lines.append("Account: " + ("✅ connected" if s["connected"] else "❌ not connected (website → Telethon Marketing)"))
     lines.append(f"Groups: <b>{s['groups']}</b>")
     if s["auto_on"]:
         lines.append(f"Auto-post: ✅ ON · every <b>{s['interval']}</b> min · next in ~{s['next_in_min']} min")
     else:
         lines.append(f"Auto-post: ⏸ OFF · every <b>{s['interval']}</b> min")
-    lines.append(f"Gap between groups: <b>{s['gap']}</b> s")
+    lines.append(f"Gap between groups: <b>{s['gap']}</b> s · window: <b>{html.escape(s['hours'])}</b>")
+    lines.append("Auto-join new groups: " + ("✅ ON" if s["autojoin"] else "⏸ OFF"))
+    if s["paused"]:
+        lines.append(f"⏸ Paused groups (errors): <b>{s['paused']}</b>")
     if s["running"]:
         lines.append(f"🚀 Sending now: {s['sent']}/{s['total']}")
     if s["last"]:
@@ -75,8 +83,13 @@ def _panel(db):
     rows = [[B("➕ Add ad", callback_data="tm:set"), B(f"📋 My ads ({len(s['ads'])})", callback_data="tm:list")],
             [B("🚀 Send now", callback_data="tm:send"),
              B("⏸ Auto OFF" if s["auto_on"] else "▶️ Auto ON", callback_data="tm:off" if s["auto_on"] else "tm:on")],
-            [B("⏱ Interval", callback_data="tm:int"), B("↔️ Gap", callback_data="tm:gap"),
-             B("📊 Daily limit", callback_data="tm:lim")]]
+             [B("⏱ Interval", callback_data="tm:int"), B("↔️ Gap", callback_data="tm:gap"),
+             B("📊 Daily limit", callback_data="tm:lim")],
+            [B("🕒 Hours", callback_data="tm:hrs"),
+             B("🔗 Auto-join " + ("OFF" if s["autojoin"] else "ON"), callback_data="tm:join")],
+            [B("🔍 Check account", callback_data="tm:chk"), B("📄 Last report", callback_data="tm:rep")]]
+    if s["paused"]:
+        rows.append([B("♻️ Retry paused groups", callback_data="tm:reset")])
     if s["running"]:
         rows.append([B("🛑 Stop sending", callback_data="tm:stop")])
     return "\n".join(lines), M(rows), s
@@ -162,6 +175,34 @@ async def ad_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("🛑 Stopping after the current group.")
     elif act == "no":
         await msg.reply_text("Cancelled. /ad")
+    elif act == "hrs":
+        context.user_data["await"] = {"type": "tmhrs"}
+        await msg.reply_text("Send the hours (UTC) when auto-post may start, like 5-20. Send 0 for all day.")
+    elif act == "join":
+        on = ta.bot_toggle_join(db)
+        await msg.reply_text("🔗 Auto-join is now " + ("ON: new groups are joined automatically (max 5 per run)."
+                                                      if on else "OFF: the account must already be in every group."))
+    elif act == "reset":
+        ta.reset_groups(db)
+        await msg.reply_text("♻️ Paused groups will be tried again in the next run.")
+    elif act == "chk":
+        await msg.reply_text("🔍 Checking the Telegram account...")
+        try:
+            info = await asyncio.to_thread(ta.check_account, db)
+        except Exception as e:
+            await msg.reply_text("❌ " + html.escape(str(e))[:300])
+            return
+        if info.get("ok"):
+            await msg.reply_text("✅ " + html.escape(ta.acct_line(info)))
+        else:
+            await msg.reply_text("❌ " + html.escape(str(info.get("error", "problem")))[:400])
+    elif act == "rep":
+        rows_ = ta.bot_report(db)
+        if not rows_:
+            await msg.reply_text("No problems in the last run (or no run yet).")
+        else:
+            txt = "\n".join(f"• {html.escape(r[0])} - {html.escape(r[1])}: {html.escape(r[2])}" for r in rows_[:25])
+            await msg.reply_text("📄 <b>Problem groups, last run</b>\n" + txt[:3800], parse_mode=HTML)
 
 
 async def ad_text(update: Update, context: ContextTypes.DEFAULT_TYPE, st):
@@ -178,6 +219,12 @@ async def ad_text(update: Update, context: ContextTypes.DEFAULT_TYPE, st):
             await msg.reply_text("Please send a number.")
             return
         ok, info = ta.bot_set_limit(db, n)
+        if ok:
+            bot.clear_await(context)
+        await msg.reply_text(("✅ " if ok else "❌ ") + info)
+        return
+    if kind == "tmhrs":
+        ok, info = ta.bot_set_hours(db, msg.text or "")
         if ok:
             bot.clear_await(context)
         await msg.reply_text(("✅ " if ok else "❌ ") + info)

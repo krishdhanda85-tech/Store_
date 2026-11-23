@@ -26,3 +26,19 @@ Buttons: Send now, Auto ON/OFF, Interval, Gap, Stop. Groups and the Telegram log
 ## Ad rotation + daily limit (bot: /ad and website)
 Add up to 10 different real ads with "Add ad"; they are sent one after another each run.
 "Daily limit" = max posts per group in 24h (default 2); groups that reached it are skipped.
+
+## v2 upgrade (advanced)
+- Auto-join: the Telethon account joins groups it is not in (public @name, t.me links, private invite links), max 5 new groups per run, with pauses. Toggle in /ad (Auto-join) or the website.
+- Group formats accepted: `@name`, `name`, `t.me/name`, `https://t.me/name/123`, `https://t.me/+INVITE`, `t.me/joinchat/..`, `t.me/c/ID/..`, numeric ID.
+- Smart lookup: groups the account is already in are read from its chat list (no username lookups, far fewer flood-waits).
+- Dead-group protection: a group that fails 3 runs in a row with a permanent error (banned, no write rights, deleted) is paused for 48 h. "Retry" clears it.
+- Slow-mode groups are skipped (not counted as failures) and retried next run.
+- Random gap jitter (80-140%) and random group order each run.
+- Posting window (UTC hours) so ads only go out at the hours you choose.
+- Check account: shows name, Premium yes/no and how many groups it is in. Website button / `/ad` -> Check account.
+- Reports: per-group reasons for the last run (website + `/ad` -> Last report).
+- Warnings on the website and in `/ad`: telethon missing, session cannot be decrypted (API_KEY_SECRET changed), DB not on a Railway Volume, account without Premium while ads use premium emojis.
+- Owner alert in the store bot when auto-post stops by itself (dead session) or a whole auto run sends 0 posts.
+- Fix: auto-post can now be turned ON from the website when ads exist in the rotation list even if the single "Auto message" box is empty.
+
+Files changed: telethon_admin.py, telethon_bot.py, bot.py (one line). requirements.txt is unchanged.

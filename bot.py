@@ -2617,7 +2617,7 @@ async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if kind in ("admedit", "admicon", "admcat"):
         await admin_text(update, context, st)
         return
-    if kind in ("tmad", "tmint", "tmgap", "tmlim"):
+    if kind in ("tmad", "tmint", "tmgap", "tmlim", "tmhrs"):
         await telethon_bot.ad_text(update, context, st)
         return
     if kind == "emojirule":
