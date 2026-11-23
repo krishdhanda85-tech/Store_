@@ -304,6 +304,7 @@ a:hover{text-decoration:underline}
 {{ nl('alerts_admin.home','Stock alerts','clock') }}
 {{ nl('folders_admin.home','Folders','box') }}
 {{ nl('profit_centre','Profit centre','card') }}
+{{ nl('replace_page','Replace product','sliders') }}
 <div class="grp">Payments</div>
 {{ nl('upipay','UPI payments','card',upi_pending) }}
 {{ nl('upi','UPI setup','qr') }}
@@ -1183,6 +1184,8 @@ mark();
 {% else %}<div class="card">Nothing here.</div>{% endfor %}{% endblock %}""",
 }
 TEMPLATES.update(sellers_web.TEMPLATES)
+import profit_templates
+TEMPLATES.update(profit_templates.TEMPLATES)   # new Profit centre + Replace product pages
 app.jinja_loader = DictLoader(TEMPLATES)
 
 
@@ -1373,6 +1376,15 @@ def dashboard_data(rng, dfrom=None, dto=None):
         d["cost"] = d["bot"]["cost"] + d["api"]["cost"]
         d["nocost"] = d["bot"]["nocost"] + d["api"]["nocost"]
         d["profit"] = d["rev"] - d["cost"]
+        try:                       # DM sales, replacements and manual profit +/- count too
+            import profit_plus as _pp
+            _sm = _pp.summary(c, start, end)
+            d["extra"] = sum(v["profit"] for v in _sm.values())
+            d["rev"] += _sm["dm_sale"]["rev"]
+            d["cost"] += _sm["dm_sale"]["cost"] + _sm["replacement"]["cost"]
+            d["profit"] += d["extra"]
+        except Exception:
+            d["extra"] = 0.0
         d["margin"] = (d["profit"] / d["rev"] * 100) if d["rev"] else 0.0
 
         d["top"] = [dict(r) for r in c.execute(
@@ -1394,12 +1406,17 @@ def dashboard_data(rng, dfrom=None, dto=None):
         got = {r["d"]: r for r in c.execute(
             _SALES + "SELECT substr(ts,1,10) d, SUM(a) rev, SUM(a - q*COALESCE(ucost,0)) profit FROM x "
             "WHERE ts >= ? AND ts < ? GROUP BY d", (start_c, cend))}
+        try:
+            import profit_plus as _pp2
+            exday = _pp2.by_day(c, start_c, cend)
+        except Exception:
+            exday = {}
         days = []
         for i in range(ndays):
             day = cstart + timedelta(days=i)
             r = got.get(day.strftime("%Y-%m-%d"))
             days.append(dict(label=day.strftime("%d %b"), rev=(r["rev"] if r else 0.0),
-                             profit=(r["profit"] if r else 0.0)))
+                             profit=(r["profit"] if r else 0.0) + (exday.get(day.strftime("%Y-%m-%d")) or 0.0)))
         mx = max([x["rev"] for x in days] + [0.01])
         for x in days:
             x["h"] = round(x["rev"] / mx * 100, 1)
@@ -1510,12 +1527,105 @@ def profit_centre():
     try:
         profit.ensure_profit_tracking(c)
         d = profit.profit_data(c, rng, pid, dfrom=dfrom, dto=dto)
-        prods = c.execute("SELECT id, name FROM products ORDER BY name").fetchall()
+        prods = _profit_products(c)
     finally:
         c.close()
     _s, _e, period, rng = profit.window(rng, dfrom, dto)
     return render("profit.html", d=d, rng=rng, ranges=RANGES, pid=pid, prods=prods, period=period,
                   dfrom=dfrom if rng == "custom" else "", dto=dto if rng == "custom" else "")
+
+
+def _profit_products(c):
+    """Products for the Profit centre pickers: price, current cost and unsold stock."""
+    import profit_plus as pp
+    out = []
+    for r in c.execute("SELECT id, name, price, "
+                       "(SELECT COUNT(*) FROM stock s WHERE s.product_id=products.id AND s.sold=0) stock "
+                       "FROM products ORDER BY name"):
+        d = dict(r)
+        d["cost_now"] = pp.current_cost(c, r["id"])
+        out.append(d)
+    return out
+
+
+@app.route("/profit/dm", methods=["POST"])
+def profit_dm():
+    import profit_plus as pp
+    f = request.form
+    c = db.conn()
+    try:
+        pp.ensure(c)
+        _eid, items = pp.add_dm_sale(c, f.get("product"), f.get("title"), f.get("qty") or 1, f.get("price", ""),
+                                     f.get("cost", ""), f.get("day"), f.get("note"), bool(f.get("take_stock")))
+        flash("DM sale saved." + ((" Send this to the customer:  " + "   |   ".join(items)) if items else ""))
+    except ValueError as e:
+        flash(str(e), "err")
+    finally:
+        c.close()
+    return redirect(url_for("profit_centre"))
+
+
+@app.route("/profit/adjust", methods=["POST"])
+def profit_adjust():
+    import profit_plus as pp
+    f = request.form
+    c = db.conn()
+    try:
+        pp.ensure(c)
+        kind = "minus" if f.get("kind") == "minus" else "add"
+        pp.add_adjustment(c, kind, f.get("amount"), f.get("note"), f.get("product"), f.get("day"))
+        flash("Profit %s." % ("removed" if kind == "minus" else "added"))
+    except ValueError as e:
+        flash(str(e), "err")
+    finally:
+        c.close()
+    return redirect(url_for("profit_centre"))
+
+
+@app.route("/profit/entry/<int:eid>/delete", methods=["POST"])
+def profit_entry_delete(eid):
+    import profit_plus as pp
+    c = db.conn()
+    try:
+        pp.ensure(c)
+        flash("Entry removed." if pp.delete_entry(c, eid) else "That entry was not found.")
+    finally:
+        c.close()
+    return redirect(url_for("profit_centre"))
+
+
+@app.route("/replace")
+def replace_page():
+    import profit, profit_plus as pp
+    q = request.args.get("q", "").strip()
+    c = db.conn()
+    try:
+        pp.ensure(c)
+        found = pp.find_orders(c, q) if q else []
+        recent = pp.recent_replacements(c, 30)
+        s, e, _lbl, _r = profit.window("30d")
+        st = pp.summary(c, s, e)["replacement"]
+    finally:
+        c.close()
+    return render("replace.html", q=q, found=found, recent=recent, st=st)
+
+
+@app.route("/replace/do", methods=["POST"])
+def replace_do():
+    import profit_plus as pp
+    f = request.form
+    c = db.conn()
+    try:
+        pp.ensure(c)
+        r = pp.replace_item(c, f.get("item_row", type=int), f.get("manual"), f.get("cost", ""), f.get("reason"),
+                            bool(f.get("notify")))
+        flash("Replaced. New item: %s. Loss booked: $%.2f.%s" % (
+            r["new"], r["cost"], " The customer is being notified on Telegram." if f.get("notify") else ""))
+    except ValueError as e:
+        flash(str(e), "err")
+    finally:
+        c.close()
+    return redirect(url_for("replace_page", q=f.get("q", "")))
 
 
 @app.route("/profit/fill", methods=["POST"])
@@ -1546,12 +1656,12 @@ def profit_export():
         c.close()
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["date", "source", "order", "product", "qty", "sale_price_each", "cost_each_at_sale", "revenue", "profit"])
-    for r in d["ledger"]:
+    w.writerow(["date", "type", "order", "product", "qty", "revenue", "cost", "profit", "note"])
+    for r in d["activity"]:
         w.writerow([_csv_safe(x) for x in (
-            (r["ts"] or "")[:16].replace("T", " "), r["src"], r["oid"], r["name"], r["q"],
-            "%.3f" % (r["unit_price"] or 0), "" if r["uc"] is None else "%.3f" % r["uc"],
-            "%.2f" % (r["a"] or 0), "%.2f" % (r["profit"] or 0))])
+            (r["ts"] or "")[:16].replace("T", " "), r["kind"], r["ref"], r["title"])] + [
+            r["qty"], "%.2f" % (r["rev"] or 0), "%.2f" % (r["cost"] or 0), "%.2f" % (r["profit"] or 0)] + [
+            _csv_safe(r["note"])])
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
     return Response(buf.getvalue(), mimetype="text/csv",
                     headers={"Content-Disposition": "attachment; filename=profit-%s.csv" % stamp})
