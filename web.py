@@ -1228,7 +1228,7 @@ def _blocked(ip):
     return len(_attempts[ip]) >= 5
 
 
-PUBLIC_ENDPOINTS = ("login", "static", "register_seller")
+PUBLIC_ENDPOINTS = ("login", "static", "register_seller", "storefront", "storefront_json")
 
 
 @app.before_request
@@ -1304,6 +1304,8 @@ def logout():
 
 
 sellers_web.register(app, render, render_str)
+import storefront
+storefront.register(app)
 
 
 # ------------------------------------------------------------------ pages

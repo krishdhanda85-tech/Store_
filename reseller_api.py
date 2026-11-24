@@ -684,6 +684,86 @@ a{color:var(--accent)}.wrap{max-width:1080px;margin:auto;padding:28px 18px 70px}
 <div class="endpoint"><span class="method">GET</span><code>/api/v1/orders</code><div class="muted">Your latest orders.</div></div>
 <div class="endpoint"><span class="method">GET</span><code>/api/v1/orders/ORDER_ID</code><div class="muted">Check a single order and its delivery items.</div></div></section>
 <section class="card"><h2>Easy mode for reseller panels</h2><p class="muted">For panels that expect a single endpoint plus a separate key field:</p><pre id="panelUrl">BASE_URL/api/v1/index.php</pre><button class="btn secondary" onclick="copyPanel()">Copy panel URL</button><div class="warning">In your panel, put this endpoint in the URL field and your <code>rs_live_…</code> key in the separate API Key field. If the panel only supports one field, check whether it supports query-string authentication.</div></section>
+<section class="card" style="grid-column:1/-1"><h2>Getting started</h2>
+<ol class="muted"><li>Open our Telegram bot, go to <b>Reseller API</b> and create your key (shown once, copy it). Keys look like <code>rs_live_...</code>.</li>
+<li>Top up your wallet with <b>Add Funds</b> in the bot. Orders are paid from this wallet.</li>
+<li>Test with the box above, then call the endpoints below.</li></ol>
+<p class="muted">If your key leaks, regenerate it in the bot; the old key stops working immediately. Every reply is JSON.</p></section>
+<section class="card" style="grid-column:1/-1"><h2>Easy mode (one URL)</h2>
+<p class="muted"><code>GET</code> or <code>POST</code> to <code>BASE_URL/api/v1/index.php</code> with an <code>action</code> parameter.</p>
+<table><tr><th>action</th><th>Aliases</th><th>Parameters</th><th>Does</th></tr>
+<tr><td><code>products</code></td><td>services, list, stock, items</td><td>none</td><td>Products, price, stock</td></tr>
+<tr><td><code>balance</code></td><td>profile, me</td><td>none</td><td>Wallet balance</td></tr>
+<tr><td><code>buy</code></td><td>create_order, purchase, add</td><td>product_id, quantity, optional customer_ref, idempotency_key</td><td>Place an order</td></tr>
+<tr><td><code>order</code></td><td>status, get_order, check</td><td>order_id</td><td>One order and its items</td></tr>
+<tr><td><code>orders</code></td><td>history</td><td>none</td><td>Your last 100 orders</td></tr>
+<tr><td><code>health</code></td><td></td><td>none</td><td>Server check (no key needed)</td></tr></table></section>
+<section class="card"><h2>Products response</h2><pre>{
+  "ok": true,
+  "currency": "shop_balance_units",
+  "products": [
+    {"id": 1, "name": "Netflix", "description": "...", "category": "...",
+     "kind": "auto", "price": 2.0, "stock": 3, "available": true}
+  ]
+}</pre><p class="muted"><code>price</code> is your price (your discount already applied). Instant-delivery (<code>auto</code>) products can be bought through the API.</p></section>
+<section class="card"><h2>Create order</h2><pre>POST BASE_URL/api/v1/orders
+Authorization: Bearer YOUR_KEY
+Idempotency-Key: order-1001
+Content-Type: application/json
+
+{"product_id": 1, "quantity": 2, "customer_ref": "buyer-55"}</pre>
+<p class="muted">Max quantity per order: <b>20</b>. Reply <code>201</code>:</p><pre>{
+  "ok": true,
+  "order": {"id": "RSL-1A2B3C4D5E6F", "product_id": 1, "product_name": "Netflix",
+    "quantity": 2, "unit_price": 2.0, "amount": 4.0, "status": "paid",
+    "items": ["a@x:1", "b@x:2"], "customer_ref": "buyer-55",
+    "created_at": "2026-10-18T12:27:20+00:00"},
+  "balance": 6.0
+}</pre></section>
+<section class="card"><h2>Idempotency (important)</h2><p class="muted">Send a unique <code>Idempotency-Key</code> header (or <code>idempotency_key</code> field) with every order. If your request times out and you retry with the same key, you get the original order back with <code>"replayed": true</code> and you are <b>not charged twice</b>.</p>
+<h2 style="margin-top:18px">Order status</h2><p class="muted"><code>GET /api/v1/orders/ORDER_ID</code> returns the order and its delivered <code>items</code>.</p></section>
+<section class="card"><h2>Errors</h2><p class="muted">Always <code>{"ok": false, "error": "code"}</code>.</p>
+<table><tr><th>HTTP</th><th>error</th><th>Meaning</th></tr>
+<tr><td>400</td><td>product_id_and_quantity_must_be_integers</td><td>Bad input</td></tr>
+<tr><td>400</td><td>quantity_must_be_between_1_and_20</td><td>Quantity out of range</td></tr>
+<tr><td>400</td><td>unknown_action</td><td>Wrong action</td></tr>
+<tr><td>401</td><td>missing_api_key / invalid_api_key</td><td>No key or wrong key</td></tr>
+<tr><td>402</td><td>insufficient_balance</td><td>Wallet too low (reply has required and balance)</td></tr>
+<tr><td>403</td><td>reseller_disabled</td><td>Access disabled, contact support</td></tr>
+<tr><td>404</td><td>product_not_found / order_not_found / not_found</td><td>Not found or wrong URL</td></tr>
+<tr><td>405</td><td>method_not_allowed</td><td>Wrong HTTP method</td></tr>
+<tr><td>409</td><td>insufficient_stock</td><td>Not enough stock</td></tr>
+<tr><td>409</td><td>manual_products_not_supported_by_api</td><td>Product is not instant-delivery</td></tr>
+<tr><td>500</td><td>server_error</td><td>Retry; contact support if it continues</td></tr></table></section>
+<section class="card"><h2>Code examples</h2><p class="muted">curl</p><pre>curl "BASE_URL/api/v1/index.php?action=products" \
+  -H "Authorization: Bearer YOUR_KEY"
+
+curl -X POST "BASE_URL/api/v1/orders" \
+  -H "Authorization: Bearer YOUR_KEY" \
+  -H "Idempotency-Key: order-1001" \
+  -H "Content-Type: application/json" \
+  -d '{"product_id":1,"quantity":2}'</pre><p class="muted">Python</p><pre>import requests
+BASE = "BASE_URL/api/v1/index.php"
+H = {"Authorization": "Bearer YOUR_KEY"}
+print(requests.get(BASE, params={"action": "products"}, headers=H).json())
+r = requests.post(BASE, headers=H, data={"action": "buy", "product_id": 1,
+                  "quantity": 2, "idempotency_key": "order-1001"})
+print(r.status_code, r.json())</pre><p class="muted">PHP</p><pre>$ch = curl_init("BASE_URL/api/v1/index.php");
+curl_setopt_array($ch, [
+  CURLOPT_POST => true, CURLOPT_RETURNTRANSFER => true,
+  CURLOPT_HTTPHEADER => ["Authorization: Bearer YOUR_KEY"],
+  CURLOPT_POSTFIELDS => http_build_query(["action" => "buy", "product_id" => 1,
+    "quantity" => 2, "idempotency_key" => "order-1001"]),
+]);
+$res = json_decode(curl_exec($ch), true);</pre></section>
+<section class="card"><h2>Made-to-order OTP flow</h2><ol class="muted">
+<li>The seller opens the admin panel, <b>Resellers API</b>, and taps <b>I'm Online</b>. If the page stops heartbeating for 3 minutes, the API reports the seller offline.</li>
+<li>Your bot calls <code>GET /api/v1/seller-status</code>. Show "Request OTP" only when online.</li>
+<li>On customer request, call <code>POST /api/v1/orders/ORDER_ID/request-otp</code>. Offline seller returns <code>409 seller_offline</code>.</li>
+<li>Poll <code>GET /api/v1/orders/ORDER_ID</code>. When status is <code>otp_ready</code>, send the <code>otp</code> field to the matching customer.</li>
+<li>When status is <code>completed</code>, send <code>profile</code> and <code>pin</code> to that same customer.</li></ol>
+<p class="muted">Statuses: processing, otp_requested, otp_ready, completed. Keep OTP/PIN private and never log them.</p></section>
+<section class="card"><h2>Tips</h2><ul class="muted"><li>Check <code>balance</code> before big orders.</li><li>Cache <code>products</code> only briefly; stock changes with every sale.</li><li>Always send an idempotency key on <code>buy</code>.</li><li>Use <code>https://</code> and the full path <code>/api/v1/index.php</code> in reseller panels (not only the domain).</li></ul></section>
 </div><footer>Reseller API · Keep keys private · Use an idempotency key when creating orders to avoid duplicate charges.</footer></div>
 <script>
 const base = location.origin;
