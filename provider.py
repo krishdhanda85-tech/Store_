@@ -209,24 +209,37 @@ def _gcfg(s):
 def _g_req(s, section, params=None, body=None, idem=None, path=None):
     cfg = _gcfg(s)
     sec = cfg[section]
-    params = {**(sec.get("params") or {}), **(params or {})}     # fixed query params from the config
-    headers = {cfg["auth_header"]: f"{cfg['auth_prefix']}{s['key']}"}
+    params = {**(sec.get("params") or {}), **(params or {})}
+    method = str(sec.get("method", "GET")).upper()
+    headers = {}
+    # Generic suppliers may authenticate with a header, a query parameter, or
+    # a JSON-body field. Do not emit an invalid empty header name.
+    auth_header = str(cfg.get("auth_header") or "").strip()
+    if auth_header:
+        headers[auth_header] = f"{cfg.get('auth_prefix') or ''}{s['key']}"
     if idem and sec.get("idem_header"):
         headers[sec["idem_header"]] = idem
     use_path = sec["path"] if path is None else path
     url = s["base_url"].rstrip("/") + (("/" + str(use_path).lstrip("/")) if str(use_path) else "")
     kw = {"headers": headers, "timeout": 20}
     send = sec.get("send", "json")
-    if body is not None:
+    request_body = dict(body or {})
+    query_key = str(cfg.get("auth_query_param") or "").strip()
+    body_key = str(cfg.get("auth_body_param") or "").strip()
+    if query_key and method in ("GET", "DELETE"):
+        params[query_key] = s["key"]
+    if body_key and method not in ("GET", "DELETE"):
+        request_body[body_key] = s["key"]
+    if body is not None or (body_key and method not in ("GET", "DELETE")):
         if send == "form":
-            kw["data"] = body
+            kw["data"] = request_body
         elif send == "query":
-            params = {**(params or {}), **body}
+            params = {**(params or {}), **request_body}
         else:
-            kw["json"] = body
+            kw["json"] = request_body
     if params:
         kw["params"] = params
-    r = requests.request(sec.get("method", "GET"), url, **kw)
+    r = requests.request(method, url, **kw)
     try:
         data = r.json()
     except ValueError:
