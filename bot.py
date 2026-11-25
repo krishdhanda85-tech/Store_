@@ -520,6 +520,26 @@ def admin_ids():
     return ids
 
 
+def support_ids():
+    """Extra Telegram IDs that receive support tickets and can reply to them.
+    Set SUPPORT_IDS=123456789,987654321 (Railway variable). Not full admins."""
+    out = set()
+    for part in os.getenv("SUPPORT_IDS", "").replace(";", ",").split(","):
+        part = part.strip()
+        if part.lstrip("-").isdigit():
+            out.add(int(part))
+    return out
+
+
+def support_username() -> str:
+    """Optional public contact, e.g. SUPPORT_USERNAME=@yourname -> shows a 'Chat with support' button."""
+    return os.getenv("SUPPORT_USERNAME", "").strip().lstrip("@").replace("https://t.me/", "")
+
+
+SUPPORT_MAX_OPEN = int(os.getenv("SUPPORT_MAX_OPEN", "3") or 3)      # open tickets one customer may have at once
+SUPPORT_HOURS = os.getenv("SUPPORT_HOURS", "").strip()                # e.g. "10am-10pm IST" -> shown after a ticket is created
+
+
 def esc(x) -> str:
     return html.escape(str(x))
 
@@ -1617,8 +1637,11 @@ def support_view(uid: int, language: str):
         text = tt(language, "support_list", rows=rows)
     else:
         text = tt(language, "support_none")
+    contact = [[Btn("💬 Chat with support", url=f"https://t.me/{support_username()}")]] if support_username() else []
+    my = [[Btn(f"🎫 #{t['id']} · {'🟢' if t['status'] == 'open' else '⚪'} {t['kind'] or ''}", callback_data=f"sup:v:{t['id']}")]
+          for t in tickets]
     return text, Markup([[Btn(tt(language, "btn_new_ticket"), callback_data="sup:new", style="success")]]
-                        + growth_bot.support_rows() + [main_menu_row(language)])
+                        + my + contact + growth_bot.support_rows() + [main_menu_row(language)])
 
 
 def settings_view(uid: int, language: str):
@@ -1653,13 +1676,19 @@ def payment_details(method: str) -> str:
     return f"💳 USDT{net} address:\n<code>{esc(binance.deposit_address)}</code>"
 
 
+def admin_ticket_markup(tid):
+    return Markup([[Btn("📜 History", callback_data=f"tkx:h:{tid}"),
+                    Btn("✅ Close", callback_data=f"tkx:c:{tid}", style="success")]])
+
+
 async def notify_admins(context, text, ticket_id=None, photo_id=None):
-    for cid in admin_ids():
+    markup = admin_ticket_markup(ticket_id) if ticket_id else None
+    for cid in (admin_ids() | support_ids()):
         try:
             if photo_id:
-                m = await context.bot.send_photo(cid, photo_id, caption=text[:1000], parse_mode=HTML)
+                m = await context.bot.send_photo(cid, photo_id, caption=text[:1000], parse_mode=HTML, reply_markup=markup)
             else:
-                m = await context.bot.send_message(cid, text, parse_mode=HTML, disable_web_page_preview=True)
+                m = await context.bot.send_message(cid, text, parse_mode=HTML, disable_web_page_preview=True, reply_markup=markup)
             if ticket_id:
                 db.link_ticket_msg(cid, m.message_id, ticket_id)
         except Exception:
@@ -2238,9 +2267,111 @@ async def cb_support(update, context, arg):
         kind = arg[2:]
         if kind not in ("pay", "gen", "bug"):
             return
+        if db.count_open_tickets(q.from_user.id) >= SUPPORT_MAX_OPEN:
+            await edit(q, f"⚠️ You already have {SUPPORT_MAX_OPEN} open tickets. Please open one of them and reply there, "
+                          "or close the ones that are solved.",
+                       Markup([[Btn("🎧 My tickets", callback_data="menu:support")], main_menu_row(language)]))
+            return
         context.user_data["await"] = {"type": "ticket", "kind": kind}
         await edit(q, tt(language, "ticket_describe"),
                    Markup([[Btn(tt(language, "btn_cancel"), callback_data="cx", style="danger")]]))
+    elif arg.startswith(("v:", "r:", "c:", "rate:")):
+        await _ticket_user_action(q, context, language, arg)
+
+
+def _ticket_thread_text(tid, limit=6):
+    t = db.get_ticket(tid)
+    msgs = db.ticket_msgs(tid)[-limit:]
+    lines = []
+    for m in msgs:
+        who = "🧑 You" if m["sender"] == "user" else "🎧 Support"
+        body = esc((m["text"] or "")[:500]) + (" 📷" if m["photo_id"] else "")
+        lines.append(f"<b>{who}</b>\n{body}")
+    state = "🟢 open" if t["status"] == "open" else "⚪ closed"
+    return f"🎫 <b>Ticket #{tid}</b> · {esc(t['kind'] or '')} · {state}\n\n" + "\n\n".join(lines)
+
+
+def rating_markup(tid):
+    return Markup([[Btn("⭐" * n, callback_data=f"sup:rate:{tid}:{n}") for n in (1, 2, 3)],
+                   [Btn("⭐" * n, callback_data=f"sup:rate:{tid}:{n}") for n in (4, 5)]])
+
+
+async def close_ticket_flow(context, tid, by="admin"):
+    """Close a ticket and ask the customer for a rating (only if it was open)."""
+    t = db.get_ticket(tid)
+    if not t or t["status"] != "open":
+        return False
+    db.set_ticket_status(tid, "closed", by)
+    try:
+        await context.bot.send_message(
+            t["user_id"], f"✅ <b>Ticket #{tid} closed</b>\n\nHow was our support? Tap a rating below.\n"
+                          "<i>Need more help? Just open a new ticket from Support.</i>",
+            parse_mode=HTML, reply_markup=rating_markup(tid))
+    except Exception:
+        log.warning("could not send the rating request for ticket %s", tid)
+    return True
+
+
+async def _ticket_user_action(q, context, language, arg):
+    uid = q.from_user.id
+    kind, _, rest = arg.partition(":")
+    if kind == "rate":
+        tid_s, _, n_s = rest.partition(":")
+        t = db.get_ticket(int(tid_s)) if tid_s.isdigit() else None
+        if t and t["user_id"] == uid and n_s.isdigit() and 1 <= int(n_s) <= 5 and db.set_ticket_rating(t["id"], uid, n_s):
+            await edit(q, f"🙏 Thanks for rating ticket #{t['id']}: {'⭐' * int(n_s)}")
+        else:
+            await edit(q, "🙏 Thanks, your rating was already saved.")
+        return
+    t = db.get_ticket(int(rest)) if rest.isdigit() else None
+    if not t or t["user_id"] != uid:
+        await edit(q, "Ticket not found.", Markup([main_menu_row(language)]))
+        return
+    tid = t["id"]
+    back = [Btn("🎧 My tickets", callback_data="menu:support")]
+    if kind == "v":
+        rows = []
+        if t["status"] == "open":
+            rows.append([Btn("✍️ Reply", callback_data=f"sup:r:{tid}", style="primary"),
+                         Btn("✅ Mark solved", callback_data=f"sup:c:{tid}", style="success")])
+        rows.append(back)
+        await edit(q, _ticket_thread_text(tid), Markup(rows))
+    elif kind == "r":
+        if t["status"] != "open":
+            db.set_ticket_status(tid, "open")           # replying to a closed ticket re-opens it
+        context.user_data["await"] = {"type": "tkreply", "tid": tid}
+        await edit(q, f"✍️ <b>Reply to ticket #{tid}</b>\n\nSend your message now. You can attach a photo.",
+                   Markup([[Btn(tt(language, "btn_cancel"), callback_data="cx", style="danger")]]))
+    elif kind == "c":
+        await close_ticket_flow(context, tid, "user")
+        await edit(q, f"✅ Ticket #{tid} marked as solved.", Markup([back]))
+        who = f"@{esc(q.from_user.username)}" if q.from_user.username else esc(q.from_user.full_name)
+        await notify_admins(context, f"✅ Ticket #{tid} was marked solved by the customer ({who}).")
+
+
+async def cb_ticket_admin(update, context, arg):
+    """Buttons under a ticket notification (owner / admins / support IDs)."""
+    q = update.callback_query
+    uid = q.from_user.id
+    if not (is_admin(uid) or uid in support_ids()):
+        await q.answer("Not allowed.", show_alert=True)
+        return
+    kind, _, tid_s = arg.partition(":")
+    if not tid_s.isdigit() or not db.get_ticket(int(tid_s)):
+        await q.answer("Ticket not found.", show_alert=True)
+        return
+    tid = int(tid_s)
+    if kind == "h":
+        await q.answer()
+        await q.message.reply_text(_ticket_thread_text(tid, limit=10), parse_mode=HTML)
+    elif kind == "c":
+        done = await close_ticket_flow(context, tid, "admin")
+        await q.answer("Ticket closed." if done else "Already closed.")
+        if done:
+            try:
+                await q.edit_message_reply_markup(reply_markup=Markup([[Btn(f"✅ Closed by {esc(q.from_user.first_name)}", callback_data=f"tkx:h:{tid}")]]))
+            except Exception:
+                pass
 
 
 def _api_key_info(uid: int):
@@ -2587,7 +2718,9 @@ async def admin_ticket_reply(update, context, tid):
     db.add_ticket_msg(tid, "admin", text)
     try:
         await context.bot.send_message(ticket["user_id"],
-                                       tt(lang(ticket["user_id"]), "ticket_reply", id=tid, text=esc(text)), parse_mode=HTML)
+                                       tt(lang(ticket["user_id"]), "ticket_reply", id=tid, text=esc(text)), parse_mode=HTML,
+                                       reply_markup=Markup([[Btn("✍️ Reply", callback_data=f"sup:r:{tid}", style="primary"),
+                                                             Btn("🎫 View", callback_data=f"sup:v:{tid}")]]))
         await msg.reply_text(f"✅ Sent to the customer (ticket #{tid}).")
     except Exception:
         log.exception("ticket reply failed")
@@ -2598,7 +2731,7 @@ async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     uid = update.effective_user.id
     # an admin replying to a ticket notification answers the customer
-    if msg.reply_to_message and is_admin(uid):
+    if msg.reply_to_message and (is_admin(uid) or uid in support_ids()):
         tid = db.ticket_from_link(msg.chat_id, msg.reply_to_message.message_id)
         if tid:
             await admin_ticket_reply(update, context, tid)
@@ -2755,12 +2888,18 @@ async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await open_ticket(update, context, st["kind"], text, None)
 
+    elif kind == "tkreply":
+        await customer_ticket_reply(update, context, st["tid"], text, None)
+
 
 async def photo_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if shop_closed_for(update.effective_user.id):
         return
     st = context.user_data.get("await")
-    if st and st["type"] == "ticket":
+    if st and st["type"] == "tkreply":
+        msg = update.message
+        await customer_ticket_reply(update, context, st["tid"], (msg.caption or "").strip(), msg.photo[-1].file_id)
+    elif st and st["type"] == "ticket":
         msg = update.message
         await open_ticket(update, context, st["kind"], (msg.caption or "").strip(), msg.photo[-1].file_id)
     elif st and st["type"] == "wclaim":
@@ -2848,14 +2987,66 @@ async def open_ticket(update, context, kind: str, text: str, photo_id):
     if not text and not photo_id:
         return
     clear_await(context)
+    if db.count_open_tickets(user.id) >= SUPPORT_MAX_OPEN:
+        await update.message.reply_text(f"⚠️ You already have {SUPPORT_MAX_OPEN} open tickets. Open Support and reply "
+                                        "to one of them, or mark the solved ones as closed.")
+        return
     label = tt("en", {"pay": "k_pay", "gen": "k_gen", "bug": "k_bug"}[kind])
     tid = db.create_ticket(user.id, label, text or "(photo)", photo_id)
-    await update.message.reply_text(tt(language, "ticket_created", id=tid), parse_mode=HTML)
+    hours = f"\n🕒 Support hours: {esc(SUPPORT_HOURS)}" if SUPPORT_HOURS else ""
+    await update.message.reply_text(tt(language, "ticket_created", id=tid) + hours, parse_mode=HTML,
+                                    reply_markup=Markup([[Btn(f"🎫 View ticket #{tid}", callback_data=f"sup:v:{tid}")]]))
     who = f"@{esc(user.username)}" if user.username else esc(user.full_name)
     await notify_admins(
         context,
         f"🎫 <b>Ticket #{tid}</b> · {esc(label)}\n👤 {who} ({user.id})\n\n{esc(text or '(photo)')}\n\n<i>Reply to this message to answer the customer.</i>",
         ticket_id=tid, photo_id=photo_id)
+
+
+async def customer_ticket_reply(update, context, tid, text, photo_id):
+    """A customer adds a message to one of their own tickets (re-opens it if it was closed)."""
+    user = update.effective_user
+    t = db.get_ticket(tid)
+    if not t or t["user_id"] != user.id:
+        clear_await(context)
+        return
+    if not text and not photo_id:
+        return
+    clear_await(context)
+    db.add_ticket_msg(tid, "user", text or "(photo)")
+    if photo_id:
+        c = db.conn()
+        c.execute("UPDATE ticket_msgs SET photo_id=? WHERE id=(SELECT MAX(id) FROM ticket_msgs WHERE ticket_id=?)", (photo_id, tid))
+        c.commit(); c.close()
+    if t["status"] != "open":
+        db.set_ticket_status(tid, "open")
+    await update.message.reply_text(f"✅ Sent to support (ticket #{tid}). We'll reply here.", parse_mode=HTML,
+                                    reply_markup=Markup([[Btn(f"🎫 View ticket #{tid}", callback_data=f"sup:v:{tid}")]]))
+    who = f"@{esc(user.username)}" if user.username else esc(user.full_name)
+    await notify_admins(
+        context,
+        f"💬 <b>New reply on ticket #{tid}</b> · {esc(t['kind'] or '')}\n👤 {who} ({user.id})\n\n{esc(text or '(photo)')}\n\n"
+        "<i>Reply to this message to answer the customer.</i>", ticket_id=tid, photo_id=photo_id)
+
+
+async def tickets_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner / admins / support IDs: /tickets = quick overview of tickets waiting for an answer."""
+    uid = update.effective_user.id
+    if not (is_admin(uid) or uid in support_ids()):
+        return
+    cnt = db.ticket_counts()
+    st = db.ticket_stats()
+    avg = f"{st['avg']:.1f}/5 ⭐ ({st['n']} ratings)" if st["n"] else "no ratings yet"
+    lines = [f"🎫 #{r['id']} · {('@' + esc(r['username'])) if r['username'] else r['user_id']} · {esc((r['last_text'] or '')[:60])}"
+             for r in st["waiting"]]
+    body = "\n".join(lines) if lines else "Nothing waiting. All caught up! 🎉"
+    await update.message.reply_text(
+        f"🛟 <b>Support overview</b>\n\n🟢 Open: <b>{cnt['open']}</b> · ⏳ Waiting for you: <b>{cnt['waiting']}</b> · "
+        f"⚪ Closed: {cnt['closed']}\n⭐ Average rating: {avg}\n\n<b>Waiting for a reply</b>\n{body}\n\n"
+        "<i>Reply to a ticket message to answer. Use /tickets any time.</i>", parse_mode=HTML)
+
+
+CALLBACKS["tkx"] = cb_ticket_admin
 
 
 # ---------------------------------------------------------------- background jobs
@@ -2912,6 +3103,13 @@ async def outbox_job(context: ContextTypes.DEFAULT_TYPE):
                 rows.append([Btn(_t("btn_claim", lg), callback_data=f"pmx:{pcode}", style="primary")])
             if pid:
                 rows.append([Btn(_t("btn_buy", lg), callback_data=f"prod:{pid}", style="success")])
+            tk_id = m["ticket_id"] if "ticket_id" in ks else None
+            tk_rate = m["ticket_rate"] if "ticket_rate" in ks else None
+            if tk_id:
+                rows.append([Btn("✍️ Reply", callback_data=f"sup:r:{tk_id}", style="primary"),
+                             Btn("🎫 View", callback_data=f"sup:v:{tk_id}")])
+            if tk_rate:
+                rows += list(rating_markup(tk_rate).inline_keyboard)
             markup = Markup(rows) if rows else None
             await context.bot.send_message(m["user_id"], m["text"], parse_mode=HTML,
                                            disable_web_page_preview=True, reply_markup=markup)
@@ -4195,6 +4393,7 @@ def build_application(tenant):
     app.add_handler(CommandHandler("setrate", setrate))
     app.add_handler(CommandHandler("paymentcenter", paymentcenter))
     app.add_handler(CommandHandler("reopen", reopen))
+    app.add_handler(CommandHandler("tickets", tickets_cmd))
     app.add_handler(CommandHandler("apitest", apitest))
     app.add_handler(CommandHandler("backup", backup_cmd))
     app.add_handler(CommandHandler("maintenance", maintenance_cmd))

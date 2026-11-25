@@ -149,6 +149,8 @@ class Database(GrowthMixin):
                          ("category", "TEXT"), ("old_price", "REAL"), ("kind", "TEXT DEFAULT 'auto'"),
                          ("prompt", "TEXT"), ("cost", "REAL")],
             "orders": [("paid_with", "TEXT DEFAULT 'crypto'"), ("contact", "TEXT"), ("admin_note", "TEXT"), ("group_id", "TEXT")] + _GROWTH_ORDER_COLUMNS,
+            "outbox": [("ticket_id", "INTEGER"), ("ticket_rate", "INTEGER")],
+            "tickets": [("rating", "INTEGER"), ("closed_at", "TEXT"), ("closed_by", "TEXT")],
             "deposits": [("inr_amount", "REAL"), ("rate", "REAL"), ("upi_id", "TEXT"), ("utr", "TEXT"),
                          ("utr_at", "TEXT"), ("reviewed_by", "TEXT")],
         }
@@ -827,9 +829,10 @@ class Database(GrowthMixin):
         c.commit(); c.close(); return o
 
     # ------------------------------------------------------------ outbox (site -> customer, sent once)
-    def queue_message(self, uid, text):
+    def queue_message(self, uid, text, ticket_id=None, ticket_rate=None):
         c=self.conn()
-        c.execute("INSERT INTO outbox(user_id,text,created_at) VALUES(?,?,?)", (uid, text, self._now()))
+        c.execute("INSERT INTO outbox(user_id,text,created_at,ticket_id,ticket_rate) VALUES(?,?,?,?,?)",
+                  (uid, text, self._now(), ticket_id, ticket_rate))
         c.commit(); c.close()
 
     def outbox_claim(self, limit=25):
@@ -939,5 +942,28 @@ class Database(GrowthMixin):
             (SELECT sender FROM ticket_msgs m WHERE m.ticket_id=t.id ORDER BY m.id DESC LIMIT 1)='user'""").fetchone()["n"]
         c.close(); return dict(open=r["open_n"], closed=r["closed_n"], all=r["all_n"], waiting=waiting)
 
-    def set_ticket_status(self, tid, status):
-        c=self.conn(); c.execute("UPDATE tickets SET status=? WHERE id=?", (status, tid)); c.commit(); c.close()
+    def set_ticket_status(self, tid, status, by=None):
+        c=self.conn()
+        if status == "closed":
+            c.execute("UPDATE tickets SET status='closed', closed_at=?, closed_by=? WHERE id=?", (self._now(), by or "admin", tid))
+        else:
+            c.execute("UPDATE tickets SET status='open', closed_at=NULL, closed_by=NULL WHERE id=?", (tid,))
+        c.commit(); c.close()
+
+    def count_open_tickets(self, uid):
+        c=self.conn(); n=c.execute("SELECT COUNT(*) n FROM tickets WHERE user_id=? AND status='open'", (uid,)).fetchone()["n"]; c.close(); return n
+
+    def set_ticket_rating(self, tid, uid, rating):
+        c=self.conn()
+        cur=c.execute("UPDATE tickets SET rating=? WHERE id=? AND user_id=? AND rating IS NULL", (int(rating), tid, uid))
+        c.commit(); ok=cur.rowcount>0; c.close(); return ok
+
+    def ticket_stats(self):
+        c=self.conn()
+        r=c.execute("SELECT AVG(rating) avg_r, COUNT(rating) n_r FROM tickets WHERE rating IS NOT NULL").fetchone()
+        waiting=c.execute("""SELECT t.id, t.kind, t.user_id, u.username,
+            (SELECT text FROM ticket_msgs m WHERE m.ticket_id=t.id ORDER BY m.id DESC LIMIT 1) last_text
+            FROM tickets t LEFT JOIN users u ON u.user_id=t.user_id
+            WHERE t.status='open' AND (SELECT sender FROM ticket_msgs m WHERE m.ticket_id=t.id ORDER BY m.id DESC LIMIT 1)='user'
+            ORDER BY t.id LIMIT 15""").fetchall()
+        c.close(); return dict(avg=r["avg_r"], n=r["n_r"], waiting=waiting)

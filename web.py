@@ -2027,8 +2027,14 @@ def _note(note):
     return f"\n\n💬 {htmllib.escape(note)}" if note else ""
 
 
-def _msg(uid, en, zh):
-    db.queue_message(uid, zh if db.get_user_language(uid) == "zh" else en)
+def _msg(uid, en, zh, ticket_id=None, ticket_rate=None):
+    db.queue_message(uid, zh if db.get_user_language(uid) == "zh" else en, ticket_id, ticket_rate)
+
+
+def _msg_rating(uid, tid):
+    """Ticket closed from the site: tell the customer and ask for a 1-5 star rating."""
+    _msg(uid, f"✅ <b>Ticket #{tid} closed</b>\n\nHow was our support? Tap a rating below.",
+         f"✅ <b>工单 #{tid} 已关闭</b>\n\n请为本次服务评分。", ticket_rate=tid)
 
 
 # ------------------------------------------------- made-to-order orders
@@ -2238,9 +2244,10 @@ def ticket_reply(tid):
     db.add_ticket_msg(tid, "admin", text)
     _msg(t["user_id"],
          f"💬 <b>Support reply</b> · ticket #{tid}\n\n{htmllib.escape(text)}",
-         f"💬 <b>客服回复</b> · 工单 #{tid}\n\n{htmllib.escape(text)}")
+         f"💬 <b>客服回复</b> · 工单 #{tid}\n\n{htmllib.escape(text)}", ticket_id=tid)
     if request.form.get("close"):
-        db.set_ticket_status(tid, "closed")
+        db.set_ticket_status(tid, "closed", "admin")
+        _msg_rating(t["user_id"], tid)
         flash("Reply sent and ticket closed.")
         return redirect(url_for("tickets"))
     flash("Reply sent to the customer.")
@@ -2250,7 +2257,10 @@ def ticket_reply(tid):
 @app.route("/tickets/<int:tid>/status", methods=["POST"])
 def ticket_status(tid):
     status = request.form.get("status", "closed")
-    db.set_ticket_status(tid, "open" if status == "open" else "closed")
+    t = db.get_ticket(tid)
+    db.set_ticket_status(tid, "open" if status == "open" else "closed", "admin")
+    if t and status != "open" and t["status"] == "open":
+        _msg_rating(t["user_id"], tid)
     return redirect(url_for("ticket", tid=tid))
 
 
