@@ -11,9 +11,9 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
 from telegram import (Update, InlineKeyboardButton as _Btn, InlineKeyboardMarkup as Markup,
-                      KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove)
+                      KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove, BotCommand)
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Forbidden, RetryAfter
 from telegram.ext import (
     Application, ApplicationHandlerStop, CommandHandler, CallbackQueryHandler, MessageHandler,
     ContextTypes, TypeHandler, filters
@@ -3698,6 +3698,137 @@ async def _bind(update, context):
         raise
     except Exception:
         log.exception("maintenance check failed")
+    try:
+        await _push_new_menu(update, context)
+    except Exception:
+        log.exception("menu refresh failed")
+
+
+# Customers who still have the old bottom keyboard get the new one automatically the first time they
+# use the bot after an update. Change MENU_VERSION (Railway variable) to push the keyboard to everyone again.
+MENU_VERSION = os.getenv("MENU_VERSION", "3").strip() or "3"
+MENU_REFRESH = os.getenv("MENU_REFRESH", "1").strip() != "0"
+
+
+async def _push_new_menu(update, context):
+    if not (MENU_REFRESH and BOTTOM_MENU):
+        return
+    chat, user, msg = update.effective_chat, update.effective_user, update.effective_message
+    if not (chat and user and msg) or chat.type != "private" or user.is_bot:
+        return
+    if update.message and (update.message.text or "").startswith("/start"):
+        db.set_setting(f"menu_v:{user.id}", MENU_VERSION)     # /start sends the new menu by itself
+        return
+    seen = context.application.bot_data.setdefault("menu_seen", {})
+    key = (context.application.bot_data.get("tenant_id"), user.id)
+    if seen.get(key) == MENU_VERSION:
+        return
+    if db.get_setting(f"menu_v:{user.id}", "") == MENU_VERSION:
+        seen[key] = MENU_VERSION
+        return
+    seen[key] = MENU_VERSION
+    db.set_setting(f"menu_v:{user.id}", MENU_VERSION)
+    try:
+        await _send_menu(context.bot, chat.id)
+    except Exception:
+        pass
+
+PUSH_MENU_TEXT = "✨ <b>Menu updated!</b> Tap <b>Products</b> to see the new list."
+PUSH_MENU_VISIBLE = os.getenv("PUSH_MENU_VISIBLE", "0").strip() == "1"   # 0 (default) = silent + deleted at once, the customer sees nothing
+
+
+async def _send_menu(bot, chat_id):
+    """Gives a customer the new bottom keyboard. Default: silent message that is deleted at once,
+    so there is no notification and no text in the chat - only the menu changes."""
+    kw = {"parse_mode": HTML, "disable_notification": not PUSH_MENU_VISIBLE}
+    text = PUSH_MENU_TEXT if PUSH_MENU_VISIBLE else "✨"
+    try:
+        m = await bot.send_message(chat_id, text, reply_markup=main_keyboard(), **kw)
+    except BadRequest:                 # Telegram refused the premium icons -> plain menu
+        m = await bot.send_message(chat_id, text, reply_markup=main_keyboard(icons=False), **kw)
+    if not PUSH_MENU_VISIBLE:
+        try:
+            await m.delete()
+        except Exception:
+            pass
+
+
+def _mark_menu_sent(ids):
+    """Remember that these customers already got this MENU_VERSION (they will not be notified again)."""
+    c = db.conn()
+    c.executemany("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                  [(f"menu_v:{i}", MENU_VERSION) for i in ids])
+    c.commit()
+    c.close()
+
+
+async def _push_menu_all(bot, ids, report_chat=None):
+    """Sends the new bottom menu to every customer id, paced, then reports to report_chat."""
+    ok = blocked = failed = 0
+    for i in ids:
+        for attempt in range(3):
+            try:
+                await _send_menu(bot, i)
+                ok += 1
+                break
+            except RetryAfter as e:
+                await asyncio.sleep(float(e.retry_after) + 1)
+            except Forbidden:
+                blocked += 1                 # the customer blocked the bot
+                break
+            except Exception:
+                failed += 1
+                break
+        await asyncio.sleep(0.06)            # stays under Telegram's sending limit
+    log.info("new menu pushed: ok=%s blocked=%s failed=%s", ok, blocked, failed)
+    if report_chat:
+        try:
+            await bot.send_message(report_chat, f"✅ New menu sent to all customers.\nDelivered: <b>{ok}</b>\n"
+                                                f"Blocked the bot: {blocked}\nFailed: {failed}", parse_mode=HTML)
+        except Exception:
+            pass
+
+
+async def pushmenu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/pushmenu (owner + admins): sends the new bottom menu to EVERY customer right now."""
+    if not is_admin(update.effective_user.id):
+        return
+    c = db.conn()
+    ids = [r["user_id"] for r in c.execute("SELECT user_id FROM users").fetchall()]
+    c.close()
+    _mark_menu_sent(ids)
+    await update.message.reply_text(f"📤 Sending the new menu to <b>{len(ids)}</b> customer(s). I will tell you when it is done.",
+                                    parse_mode=HTML)
+    context.application.create_task(_push_menu_all(context.bot, ids, update.effective_chat.id))
+
+
+AUTO_PUSH_MENU = os.getenv("AUTO_PUSH_MENU", "1").strip() != "0"
+
+
+async def menu_autopush_job(context):
+    """Runs once ~30 s after the bot starts: when MENU_VERSION is new, every customer gets the new menu
+    automatically (no command, no /start). Restarts with the same MENU_VERSION do nothing."""
+    if not (AUTO_PUSH_MENU and BOTTOM_MENU):
+        return
+    if db.get_setting("menu_pushed", "") == MENU_VERSION:
+        return
+    db.set_setting("menu_pushed", MENU_VERSION)          # set first, so a restart never sends it twice
+    c = db.conn()
+    ids = [r["user_id"] for r in c.execute("SELECT user_id FROM users").fetchall()]
+    c.close()
+    _mark_menu_sent(ids)
+    log.info("auto-pushing menu version %s to %s customers", MENU_VERSION, len(ids))
+    owner = owner_id()
+    await _push_menu_all(context.bot, ids, owner if owner else None)
+
+
+async def _set_commands(app):
+    """The blue 'Menu' button next to the text field lists /start for every customer."""
+    try:
+        await app.bot.set_my_commands([BotCommand("start", "🔄 Start / refresh menu")])
+    except Exception:
+        log.exception("could not set bot commands")
+
 
 
 async def chatid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4466,7 +4597,7 @@ def _in_shop(fn):
 
 
 def build_application(tenant):
-    app = Application.builder().token(tenant.bot_token).build()
+    app = Application.builder().token(tenant.bot_token).post_init(_set_commands).build()
     app.bot_data["tenant_id"] = tenant.id
     app.add_handler(TypeHandler(Update, _bind), group=-1)
     app.add_handler(CommandHandler("start", start))
@@ -4502,6 +4633,7 @@ def build_application(tenant):
     app.add_handler(CommandHandler("promo", growth_bot.promo_cmd))
     app.add_handler(CommandHandler("faq", growth_bot.faq_cmd))
     app.add_handler(CommandHandler("broadcast", growth_bot.broadcast_cmd))
+    app.add_handler(CommandHandler("pushmenu", pushmenu_cmd))
     app.add_handler(CommandHandler("apiproducts", apiproducts))
     app.add_handler(CommandHandler("linkapi", linkapi))
     app.add_handler(CommandHandler("unlinkapi", unlinkapi))
@@ -4514,6 +4646,7 @@ def build_application(tenant):
     app.add_handler(MessageHandler(filters.Regex("^" + re.escape(plain_label(netflix_otp.BTN_LABEL)) + "$"), netflix_otp.otp_msg))
     app.add_handler(MessageHandler(filters.PHOTO, photo_msg))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_msg))
+    app.job_queue.run_once(_in_shop(menu_autopush_job), when=30)
     app.job_queue.run_repeating(_in_shop(expiry_job), interval=20, first=10)
     app.job_queue.run_repeating(_in_shop(outbox_job), interval=5, first=5)
     app.job_queue.run_repeating(_in_shop(growth_bot.growth_job), interval=120, first=45)
