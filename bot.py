@@ -1296,6 +1296,61 @@ FLAT_GRID = os.getenv("FLAT_GRID", "1").strip() != "0"     # 1 = only the 3-colu
 GRID_COLS = 2
 GRID_PAGE_SIZE = 90            # 45 rows x 2 columns = one long page (Telegram max 100 buttons per message)
 SHORT_NAME = 20
+CAPS_LABELS = os.getenv("CAPS_LABELS", "1").strip() != "0"           # 1 = product / folder button names in CAPITAL LETTERS
+FOLDERS_FIRST = os.getenv("FOLDERS_FIRST", "0").strip() == "1"       # 0 = folders and products mixed in one A-Z list; 1 = folders on top
+
+
+SHORT_TITLES = os.getenv("SHORT_TITLES", "1").strip() != "0"         # 1 = home grid shows only the name: "Avira VPN 3 Month" -> "AVIRA VPN"
+SHOW_STOCK = os.getenv("SHOW_STOCK", "0").strip() == "1"             # 1 = show "· 7" (stock left) after the name on the home grid
+
+
+def _short_title(name: str) -> str:
+    """Name up to the first word that has a digit (plan length / quantity): 'Avira VPN 3 Month' -> 'Avira VPN'."""
+    if not SHORT_TITLES:
+        return name
+    out = []
+    for w in name.split():
+        if re.search(r"\d", w):
+            break
+        out.append(w)
+    t = " ".join(out).rstrip(" -|–—(:,/").strip()
+    return t or name
+
+
+def _caps(t: str) -> str:
+    return t.upper() if CAPS_LABELS else t
+
+
+# Best sellers: shown first (in this order) with a star. Railway: BEST_SELLERS="Netflix,Spotify,Amazon Prime|Prime Video"
+# (comma = next item, | = other names for the same item). Empty = no best sellers.
+BEST_SELLERS = [[re.sub(r"[^a-z0-9]", "", a.casefold()) for a in g.split("|") if a.strip()]
+                for g in os.getenv("BEST_SELLERS", "Netflix,Spotify,Amazon Prime|Prime Video").split(",") if g.strip()]
+STAR = os.getenv("BEST_SELLER_STAR", "⭐")
+
+
+def _pin_rank(name: str):
+    """0, 1, 2 ... = position in BEST_SELLERS, None = not a best seller."""
+    sq = re.sub(r"[^a-z0-9]", "", (name or "").split(CAT_SEP)[-1].casefold())
+    for i, group in enumerate(BEST_SELLERS):
+        if any(a and a in sq for a in group):
+            return i
+    return None
+
+
+def _star(name: str) -> str:
+    return (STAR + " ") if STAR and _pin_rank(name) is not None else ""
+
+
+def _sort_key(x):
+    """Best sellers first, then A-Z (ignores leading emoji / symbols)."""
+    name = x if isinstance(x, str) else (x["name"] or "")
+    rank = _pin_rank(name)
+    name = name.split(CAT_SEP)[-1]
+    return (rank if rank is not None else 999, re.sub(r"^[^0-9A-Za-z]+", "", name).casefold())
+
+
+def _cell(uid: int, x, full: bool = False):
+    return category_button(x) if isinstance(x, str) else grid_button(uid, x, full=full)
 
 
 CAT_PAGE_SIZE = 15             # inside a category: one full-width button per row
@@ -1304,7 +1359,7 @@ CAT_PAGE_SIZE = 15             # inside a category: one full-width button per ro
 def grid_button(uid: int, p, full: bool = False):
     """Product button: premium icon + name (red = sold out). full=True keeps the whole name
     (used inside a category, one button per row, so the plan length e.g. '1 Month' stays visible)."""
-    name = (p["name"] or "").strip()
+    name = _caps((p["name"] or "").strip())
     if full:
         try:                                    # inside a category: show the price after the name
             tail = f" | ${money(db.get_effective_price(uid, p['id'], p['price']))}"
@@ -1313,8 +1368,10 @@ def grid_button(uid: int, p, full: bool = False):
         room = 60 - len(tail)
         label = (name if len(name) <= room else name[:room - 1].rstrip() + "…") + tail
     else:
+        name = _short_title(name)
         label = name if len(name) <= SHORT_NAME else name[:SHORT_NAME - 1].rstrip() + "…"
-        if is_available(p) and not is_manual(p):
+        label = _star(name) + label
+        if SHOW_STOCK and is_available(p) and not is_manual(p):
             label += f" · {p['stock']}"          # how many are left
     icon = product_icon_for(p)
     if p["id"] in growth_bot.live_flash_ids():
@@ -1327,8 +1384,10 @@ def grid_button(uid: int, p, full: bool = False):
 def category_button(c: str):
     """Category button styled exactly like the product grid buttons (dark, premium icon + name)."""
     name = (c or "").split(CAT_SEP)[-1].strip()     # button shows the last part: "OTT / Netflix" -> "Netflix"
+    icon = product_icon_id(name)                    # icon lookup uses the original spelling
+    name = _caps(name)
     label = name if len(name) <= SHORT_NAME else name[:SHORT_NAME - 1].rstrip() + "…"
-    icon = product_icon_id(name)
+    label = _star(name) + label
     if not icon:
         label = "📂 " + label          # no premium icon configured for this name -> plain folder emoji
     return Btn(label, callback_data=f"cat:{cat_key(c)}", icon=icon, keep=True)
@@ -1348,10 +1407,13 @@ def shop_view(uid: int, language: str, category: str = None, page: int = 0):
             # only the brand folders (Netflix, Spotify ...) + a plain grid of every other product
             have = [f for f in FOLDER_NAMES if any(folder_of(p) == f for p in products)]
             have += [f for f in custom_folders() if f not in have]       # folders made with /folders
-            if page == 0:
-                for i in range(0, len(have), GRID_COLS):
-                    rows.append([category_button(c) for c in have[i:i + GRID_COLS]])
             shown = [p for p in products if folder_of(p) is None and custom_folder_of(p) is None]
+            if FOLDERS_FIRST:
+                if page == 0:
+                    for i in range(0, len(have), GRID_COLS):
+                        rows.append([category_button(c) for c in have[i:i + GRID_COLS]])
+            else:
+                shown = shown + have          # folders and products share one A-Z list
         else:
             cats = cat_children(None)
             if cats and page == 0:        # categories (if the admin uses them) are one row of buttons above the grid
@@ -1372,7 +1434,7 @@ def shop_view(uid: int, language: str, category: str = None, page: int = 0):
         if kids and page == 0:         # brands inside this type: one row of buttons above the products
             for i in range(0, len(kids), GRID_COLS):
                 rows.append([category_button(c) for c in kids[i:i + GRID_COLS]])
-    shown.sort(key=lambda p: (p["name"] or "").lower())
+    shown.sort(key=_sort_key)
     in_cat = category is not None
     cols = 1 if in_cat else GRID_COLS
     per_page = CAT_PAGE_SIZE if in_cat else GRID_PAGE_SIZE
@@ -1380,7 +1442,7 @@ def shop_view(uid: int, language: str, category: str = None, page: int = 0):
     page = min(max(page, 0), pages - 1)
     chunk = shown[page * per_page:(page + 1) * per_page]
     for i in range(0, len(chunk), cols):
-        rows.append([grid_button(uid, p, full=in_cat) for p in chunk[i:i + cols]])
+        rows.append([_cell(uid, p, in_cat) for p in chunk[i:i + cols]])
     if pages > 1:
         def target(n):
             return f"shop:{n}" if category is None else f"cat:{cat_key(category)}~{n}"
