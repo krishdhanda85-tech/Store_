@@ -460,20 +460,51 @@ LEGACY_MENU = {
 MENU_BY_LABEL = {v: k for k, v in MENU.items()}
 MENU_BY_LABEL.update({v: k for k, v in EMOJI_MENU.items()})    # keyboards customers already have keep working
 MENU_BY_LABEL.update(LEGACY_MENU)
+MENU_BY_LABEL.update({re.sub(r"^[^\w]+", "", v).strip(): k for k, v in EMOJI_MENU.items()})   # labels when a premium icon replaces the emoji
 MENU_RE = "^(" + "|".join(re.escape(v) for v in MENU_BY_LABEL) + ")$"
 
 
-def _kb(text, style="primary"):
-    if NEUTRAL_BUTTONS or not style:
-        return KeyboardButton(text)
-    return KeyboardButton(text, api_kwargs={"style": style})
+def _kb(text, style="primary", icon=None):
+    extra = {}
+    if style and not NEUTRAL_BUTTONS:
+        extra["style"] = style
+    if icon and BUTTON_ICONS and str(icon).isdigit():
+        extra["icon_custom_emoji_id"] = str(icon)      # premium emoji inside the bottom-menu button
+    return KeyboardButton(text, api_kwargs=extra or None)
 
 
-def main_keyboard():
-    """Bottom keyboard = the main menu (blue, 2 columns). BOTTOM_MENU=0 removes it instead."""
+# Railway variable per bottom-menu button, e.g. EMOJI_BTN_PRODUCTS_ID=5368324170671202286
+MENU_ENV_KEYS = {"shop": "PRODUCTS", "funds": "WALLET", "orders": "ORDERS", "promo": "GIFT",
+                 "profile": "PROFILE", "api": "API", "support": "SUPPORT", "settings": "LANG",
+                 "warranty": "WARRANTY"}
+
+
+def _menu_btn(key, icons=True):
+    """Bottom-menu button. Premium icon comes from the EMOJI_BTN_<NAME>_ID variable or from the
+    admin's /emoji rules (e.g. '🛍 [premium emoji]' or 'Products [premium emoji]')."""
+    label = MENU[key]
+    if not (icons and BUTTON_ICONS):
+        return _kb(label)
+    icon = os.getenv(f"EMOJI_BTN_{MENU_ENV_KEYS[key]}_ID", "").strip()
+    if not icon.isdigit():
+        try:
+            new_label, rule_icon = ui_button_icon(label)
+            if rule_icon and str(rule_icon).isdigit():
+                icon = str(rule_icon)
+        except Exception:
+            icon = ""
+    if icon.isdigit():
+        plain = re.sub(r"^[^\w]+", "", label).strip()
+        return _kb(plain, icon=icon)
+    return _kb(label)
+
+
+def main_keyboard(icons=True):
+    """Bottom keyboard = the main menu (blue, 2 columns). BOTTOM_MENU=0 removes it instead.
+    icons=False builds it without premium icons (fallback when Telegram refuses them)."""
     if not BOTTOM_MENU:
         return ReplyKeyboardRemove()
-    k = lambda key: _kb(MENU[key])
+    k = lambda key: _menu_btn(key, icons)
     rows = [[k("shop"), k("funds")], [k("orders"), k("promo")], [k("profile"), k("api")],
             [k("support"), k("settings")]]
     last = [k("warranty")]
@@ -487,7 +518,11 @@ def main_keyboard():
 async def show_home(message, uid, language):
     """Send the main menu. Without the bottom keyboard, old keyboards are cleared with a message that is deleted at once."""
     if BOTTOM_MENU:
-        await message.reply_text(welcome_text(language), reply_markup=main_keyboard(), parse_mode=HTML)
+        try:
+            await message.reply_text(welcome_text(language), reply_markup=main_keyboard(), parse_mode=HTML)
+        except Exception:      # Telegram refused the premium icons -> send the menu without them
+            log.exception("bottom menu with premium icons failed, retrying plain")
+            await message.reply_text(welcome_text(language), reply_markup=main_keyboard(icons=False), parse_mode=HTML)
         return
     else:
         try:
@@ -1259,7 +1294,7 @@ def folder_of(p):
 
 FLAT_GRID = os.getenv("FLAT_GRID", "1").strip() != "0"     # 1 = only the 3-column product grid (no category folders)
 GRID_COLS = 2
-GRID_PAGE_SIZE = 20            # 10 rows x 2 columns
+GRID_PAGE_SIZE = 90            # 45 rows x 2 columns = one long page (Telegram max 100 buttons per message)
 SHORT_NAME = 20
 
 
