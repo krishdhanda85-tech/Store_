@@ -6,10 +6,12 @@ admin password again + typing "yes", the address format is checked, and it is lo
 only to the fixed WD_ADDRESS and needs the admin password again.
 """
 import csv
+import functools
 import hmac
 import io
 import os
 import time
+import traceback
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -165,8 +167,29 @@ def _start_auto_refill():
         supplier_topup.log.exception("auto-refill watcher could not start")
 
 
+def _show_errors(fn):
+    """If the top-up page crashes, show the owner the real error as plain text (and log it) instead of a blank
+    'Internal Server Error'. Other users still get the normal error page."""
+    @functools.wraps(fn)
+    def wrapper(*a, **k):
+        try:
+            return fn(*a, **k)
+        except Exception:
+            tb = traceback.format_exc()
+            supplier_topup.log.error("top-up page crashed:\n%s", tb)
+            try:
+                is_main = tenancy.cur().is_main
+            except Exception:
+                is_main = False
+            if is_main:
+                return Response("Top-up page error. Send the last 15 lines to your developer:\n\n" + tb, 500, mimetype="text/plain")
+            raise
+    return wrapper
+
+
 def register(app, db):
     @admin_topup.route("/topup", methods=["GET", "POST"])
+    @_show_errors
     def topup():
         if not tenancy.cur().is_main:               # sellers never see money-moving pages
             return redirect(url_for("dashboard"))
@@ -325,6 +348,7 @@ def register(app, db):
                               addr=(addr[:6] + "..." + addr[-6:]) if len(addr) > 14 else "not set")
 
     @admin_topup.route("/topup/export.csv")
+    @_show_errors
     def topup_csv():
         if not tenancy.cur().is_main:
             return redirect(url_for("dashboard"))
