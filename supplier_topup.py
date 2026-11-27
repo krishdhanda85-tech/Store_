@@ -442,7 +442,7 @@ def judge_reply(reply):
 
 
 # ----------------------------------------------------------------- state table
-_NEW_COLS = {"oid": "TEXT", "reply": "TEXT", "attempts": "INTEGER", "source": "TEXT",
+_NEW_COLS = {"order_ref": "TEXT", "reply": "TEXT", "attempts": "INTEGER", "source": "TEXT",
              "bal_before": "REAL", "bal_after": "REAL"}
 
 
@@ -455,6 +455,11 @@ def _table(db):
     for col, typ in _NEW_COLS.items():
         if col not in have:
             c.execute(f"ALTER TABLE topups ADD COLUMN {col} {typ}")
+    if "oid" in have:                                   # a DB where an older version managed to add "oid": keep its order ids
+        try:
+            c.execute("UPDATE topups SET order_ref=oid WHERE order_ref IS NULL AND oid IS NOT NULL")
+        except Exception:
+            pass
     c.execute("CREATE TABLE IF NOT EXISTS topup_lock(supplier_id INTEGER PRIMARY KEY, owner TEXT, expires REAL)")
     c.execute("CREATE TABLE IF NOT EXISTS topup_state(k TEXT PRIMARY KEY, v TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS topup_audit(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, actor TEXT, action TEXT, detail TEXT)")
@@ -673,11 +678,11 @@ def _reconcile(db, row, name):
     """Row says 'withdrawing' = request may or may not have reached Binance. Ask Binance by order id.
     Returns the updated row (continue the flow) or None (it failed: a new top-up may start)."""
     tid = row["id"]
-    if not row.get("oid"):
+    if not row.get("order_ref"):
         raise TopupError(f"top-up #{tid} is unresolved (old row without order id). "
                          "Check Binance history, then resolve it on the Top-up page.")
     try:
-        h = binance_withdraw.find_by_order_id(row["oid"])
+        h = binance_withdraw.find_by_order_id(row["order_ref"])
     except RuntimeError as e:
         raise TopupError(f"top-up #{tid}: cannot check Binance yet ({e})")
     if h:
@@ -797,7 +802,7 @@ def _ensure(db, s, cfg, need, get_balance):
                         (sid, float(amount), "withdrawing", _now(), _now(), cfg.get("mode", "fixed"), bal))
         tid = cur.lastrowid
         oid = f"tu{tid}"
-        c.execute("UPDATE topups SET oid=? WHERE id=?", (oid, tid))
+        c.execute("UPDATE topups SET order_ref=? WHERE id=?", (oid, tid))
         c.commit()
         c.close()
         try:

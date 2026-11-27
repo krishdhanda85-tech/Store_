@@ -280,7 +280,7 @@ def register(app, db):
                                     (float(amt), "withdrawing", supplier_topup._now(), supplier_topup._now())).lastrowid
                     c.commit(); c.close()
                     try:
-                        c = db.conn(); c.execute("UPDATE topups SET oid=? WHERE id=?", (f"tu{tid}", tid)); c.commit(); c.close()
+                        c = db.conn(); c.execute("UPDATE topups SET order_ref=? WHERE id=?", (f"tu{tid}", tid)); c.commit(); c.close()
                         wid = binance_withdraw.withdraw(amt, order_id=f"tu{tid}")
                     except ValueError as e:
                         supplier_topup._set(db, tid, "failed", error=str(e)); raise
@@ -356,7 +356,7 @@ def register(app, db):
         c = db.conn()
         rows = [dict(r) for r in c.execute("SELECT * FROM topups ORDER BY id DESC").fetchall()]
         c.close()
-        cols = ["id", "supplier_id", "amount", "status", "bal_before", "bal_after", "source", "oid", "wid", "txid",
+        cols = ["id", "supplier_id", "amount", "status", "bal_before", "bal_after", "source", "order_ref", "wid", "txid",
                 "attempts", "error", "reply", "created", "updated"]
 
         def safe(v):                                # stop spreadsheet formula injection from supplier-bot replies

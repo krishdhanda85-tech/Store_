@@ -28,3 +28,6 @@ TOPUP_DRY_RUN, TOPUP_WALLET_COOLDOWN_H
 
 ## Tested
 Logic tested with mocks (normal flow, pause, dry-run, velocity, wallet lock, backoff, stats, retry/time-sync) and the admin page with Flask test client. NOT tested against real Binance / Telegram: do a small real top-up first (min amount), with Health check green.
+
+## Fix (first deploy)
+"sqlite3.OperationalError: cannot add rowid alias: oid" -> the DB column was renamed from `oid` (reserved SQLite name) to `order_ref`. Old tables upgrade automatically.
