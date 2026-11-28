@@ -162,6 +162,13 @@ def withdraw_fee(network=None):
     raise RuntimeError(f"Binance fee for {coin} on {net} not found")
 
 
+def recent_withdrawals(hours=24):
+    """All withdrawals of the account in the last `hours` (any coin, any origin). Used to spot withdrawals this bot did not make."""
+    start = int((time.time() - hours * 3600) * 1000) + _offset
+    data = _signed("GET", "/sapi/v1/capital/withdraw/history", {"startTime": start, "limit": 1000})
+    return data if isinstance(data, list) else []
+
+
 def find_by_order_id(order_id):
     """The Binance withdrawal sent with this order_id, or None if Binance has no such withdrawal."""
     rows = _signed("GET", "/sapi/v1/capital/withdraw/history",

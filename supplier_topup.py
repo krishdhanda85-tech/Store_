@@ -1,5 +1,5 @@
 """
-Auto top-up of a supplier's API balance  (v3 - advanced).
+Auto top-up of a supplier's API balance  (v5 - advanced).
 
 Flow (runs when the supplier's API balance is lower than needed):
   1. bot withdraws USDT from Binance to THAT supplier's wallet  (binance_withdraw.py)
@@ -20,7 +20,22 @@ What is new in v2
   * Reply verification - supplier bot's reply is saved in the `topups` table and judged ok / fail / unknown.
   * Telethon           - auto-reconnect if the connection dropped.
 
-What is new in v3
+What is new in v5
+  * On-chain check     - after Binance gives the hash, the bot reads the transaction from the blockchain (public RPC) and
+                         confirms that THIS transaction pays the supplier's address exactly the intended USDT amount,
+                         and waits for 2 confirmations before the hash goes to the supplier. USDT on BSC, ETH, MATIC,
+                         ARBITRUM, OPTIMISM. Own RPC: env TOPUP_RPC_BSC (etc). If the RPC is down it never blocks a top-up.
+  * Rules card         - the admin page shows every active limit and switch in one place.
+
+What was new in v4
+  * Approval gate      - TOPUP_APPROVE_ABOVE=50 : a top-up above 50 USDT waits until you press Approve on the admin
+                         site (password + yes). The approval is single-use and valid 30 min.
+  * Reconciliation     - every 30 min the bot reads Binance's withdrawal history. A withdrawal that this bot did not
+                         make = alert (possible leaked API key). TOPUP_AUTOPAUSE_ON_UNKNOWN=1 also pauses top-ups.
+  * Daily report       - one Telegram summary per day (TOPUP_REPORT_HOUR, UTC, default 18; -1 = off).
+  * Spend anomaly      - alert when a supplier's last-24h top-ups are more than 3x its 7-day daily average.
+
+What was new in v3
   * Emergency pause    - one click on the admin site stops all NEW withdrawals (orders + auto-refill).
   * Wallet change lock - if a supplier's saved address is CHANGED, top-ups to it stay locked for
                          TOPUP_WALLET_COOLDOWN_H hours (default 6): protects against a hijacked admin login.
@@ -46,6 +61,7 @@ or SUPPLIER_PAY below; a withdrawal is never repeated; a hash is only re-sent wh
 error or stayed silent AND the balance has still not arrived.
 """
 import asyncio
+import json
 import logging
 import os
 import re
@@ -68,11 +84,14 @@ SUPPLIER_PAY = {
         "bot": "@PASTE_SUPPLIER_BOT",                 # Telegram bot where the hash is sent
         "hash_msg": "{hash}",                         # exact text sent, e.g. "/deposit {hash}"
         "min_topup": 5.0,                             # never withdraw less than this
-        "fee_buffer": 0.5,                            # extra to cover the Binance withdrawal fee (fixed mode)
+        "fee_buffer": 0.0,                            # extra added on top of the amount (0 = exactly what is needed)
         # invoice mode instead of a fixed wallet:  "mode": "invoice", "menu_text": "Wallet", "net_button": "BEP20"
     },
 }
-ADD_BINANCE_FEE = False                              # invoice mode: False = withdraw exactly the invoice amount
+ADD_BINANCE_FEE = os.getenv("TOPUP_ADD_BINANCE_FEE", "0").strip().lower() in ("1", "true", "yes", "on")
+# False (default): withdraw exactly the amount (product amount - balance + fee_buffer); Binance's tiny BEP20 fee comes out of it.
+# True (TOPUP_ADD_BINANCE_FEE=1): withdraw amount + live fee, so the supplier receives EXACTLY the amount on-chain.
+CREDIT_TOLERANCE = 0.001                              # a balance this much short still counts as credited (covers the Binance fee)
 INVOICE_TOLERANCE = 1.0                               # invoice amount may be at most this much above what we asked
 DAILY_CAP = 100.0                                     # max USDT this module may withdraw per UTC day (all suppliers)
 SUPPLIER_DAILY_CAP = 60.0                             # default max per supplier per UTC day (override on admin site)
@@ -96,6 +115,10 @@ FAIL_WORDS = ("invalid", "not found", "error", "fail", "wrong", "unknown", "pend
 
 class TopupError(RuntimeError):
     """Top-up could not finish. Nothing was bought from the supplier, so another supplier is safe."""
+
+
+class ApprovalNeeded(TopupError):
+    """The amount is above TOPUP_APPROVE_ABOVE: waiting for the admin to approve. Not a failure, so no backoff."""
 
 
 def _tg(name):
@@ -204,7 +227,7 @@ def _db_wallet(db, sid):
             return None
         return {"address": r[0] or "", "network": r[1], "bot": r[2], "hash_msg": r[3], "mode": r[4] or "fixed",
                 "menu_text": r[5] or "", "net_button": r[6] or "", "locked_until": r[7] or "",
-                "min_topup": 5.0, "fee_buffer": 0.5}
+                "min_topup": 5.0, "fee_buffer": 0.0}
     except Exception:
         log.warning("topup_wallets read failed", exc_info=True)
         return None
@@ -284,7 +307,7 @@ def save_settings(db, sid, **v):
     """Save settings from the admin site. Missing keys keep their old value."""
     _cfg_table(db)
     old = _overrides(db, sid)
-    new = {"min_topup": 5.0, "fee_buffer": 0.5, **old, **{k: x for k, x in v.items() if x is not None}}
+    new = {"min_topup": 5.0, "fee_buffer": 0.0, **old, **{k: x for k, x in v.items() if x is not None}}
     c = db.conn()
     c.execute("INSERT INTO topup_cfg(supplier_id,min_topup,fee_buffer,low_balance,target_balance,daily_cap,auto) "
               "VALUES(?,?,?,?,?,?,?) ON CONFLICT(supplier_id) DO UPDATE SET min_topup=excluded.min_topup, "
@@ -442,7 +465,7 @@ def judge_reply(reply):
 
 
 # ----------------------------------------------------------------- state table
-_NEW_COLS = {"order_ref": "TEXT", "reply": "TEXT", "attempts": "INTEGER", "source": "TEXT",
+_NEW_COLS = {"order_ref": "TEXT", "recv": "REAL", "to_addr": "TEXT", "verified": "TEXT", "reply": "TEXT", "attempts": "INTEGER", "source": "TEXT",
              "bal_before": "REAL", "bal_after": "REAL"}
 
 
@@ -462,6 +485,8 @@ def _table(db):
             pass
     c.execute("CREATE TABLE IF NOT EXISTS topup_lock(supplier_id INTEGER PRIMARY KEY, owner TEXT, expires REAL)")
     c.execute("CREATE TABLE IF NOT EXISTS topup_state(k TEXT PRIMARY KEY, v TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS topup_approvals(id INTEGER PRIMARY KEY AUTOINCREMENT, supplier_id INTEGER, "
+              "amount REAL, status TEXT, created TEXT, decided TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS topup_audit(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, actor TEXT, action TEXT, detail TEXT)")
     c.commit()
     c.close()
@@ -605,6 +630,308 @@ def stats(db):
     return sorted(res, key=lambda x: -x["d30"])
 
 
+# ----------------------------------------------------------------- approvals, reconciliation, report, anomaly
+APPROVAL_TTL = 1800                                   # an approval is valid for 30 min and for one top-up
+RECON_EVERY = 1800                                    # read Binance's withdrawal history every 30 min
+_last_recon = 0.0
+
+
+def _state_get(db, k, default=""):
+    try:
+        _table(db)
+        c = db.conn()
+        r = c.execute("SELECT v FROM topup_state WHERE k=?", (k,)).fetchone()
+        c.close()
+        return r[0] if r and r[0] is not None else default
+    except Exception:
+        return default
+
+
+def _state_set(db, k, v):
+    c = db.conn()
+    c.execute("INSERT INTO topup_state(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, v))
+    c.commit()
+    c.close()
+
+
+def approve_above():
+    try:
+        return float(os.getenv("TOPUP_APPROVE_ABOVE", "0") or 0)
+    except ValueError:
+        return 0.0
+
+
+def _approval_gate(db, sid, name, amount):
+    """Top-ups above TOPUP_APPROVE_ABOVE need a one-time approval from the admin site. 0 / unset = off."""
+    thr = approve_above()
+    if thr <= 0 or float(amount) <= thr:
+        return
+    since = (datetime.now(timezone.utc) - timedelta(seconds=APPROVAL_TTL)).strftime("%Y-%m-%d %H:%M:%S")
+    c = db.conn()
+    r = c.execute("SELECT id FROM topup_approvals WHERE supplier_id=? AND status='approved' AND decided>=? AND amount+1.0>=? "
+                  "ORDER BY id LIMIT 1", (sid, since, float(amount))).fetchone()
+    if r:
+        c.execute("UPDATE topup_approvals SET status='used' WHERE id=?", (r[0],))
+        c.commit()
+        c.close()
+        audit(db, "approval_used", f"#{r[0]} supplier={sid} amount={amount}", actor="system")
+        return
+    p = c.execute("SELECT id FROM topup_approvals WHERE supplier_id=? AND status='pending' ORDER BY id DESC LIMIT 1", (sid,)).fetchone()
+    if p:
+        aid = p[0]
+        c.execute("UPDATE topup_approvals SET amount=?, created=? WHERE id=?", (float(amount), _now(), aid))
+    else:
+        aid = c.execute("INSERT INTO topup_approvals(supplier_id,amount,status,created) VALUES(?,?,'pending',?)",
+                        (sid, float(amount), _now())).lastrowid
+    c.commit()
+    c.close()
+    notify(f"🔐 Approval needed: top-up of {amount} USDT for {name} is above {thr:g}. "
+           f"Open the admin page > Top-up > Approvals (#{aid}).", key=f"appr-{aid}")
+    raise ApprovalNeeded(f"top-up of {amount} USDT needs admin approval (#{aid})")
+
+
+def approvals_pending(db):
+    try:
+        _table(db)
+        c = db.conn()
+        rows = [dict(r) for r in c.execute("SELECT * FROM topup_approvals WHERE status='pending' ORDER BY id").fetchall()]
+        c.close()
+        return rows
+    except Exception:
+        return []
+
+
+def _decide(db, aid, status, actor):
+    _table(db)
+    c = db.conn()
+    cur = c.execute("UPDATE topup_approvals SET status=?, decided=? WHERE id=? AND status='pending'", (status, _now(), int(aid)))
+    c.commit()
+    n = cur.rowcount
+    c.close()
+    if not n:
+        raise ValueError("Approval not found or already decided.")
+    audit(db, "approval_" + status, f"#{aid}", actor)
+    notify(f"Approval #{aid} {status}.")
+
+
+def approve(db, aid, actor="admin"):
+    _decide(db, aid, "approved", actor)
+
+
+def reject(db, aid, actor="admin"):
+    _decide(db, aid, "rejected", actor)
+
+
+def reconcile(db, notify_new=True):
+    """Withdrawals on Binance (last 24 h) that this bot did not make. Returns them all; alerts once per withdrawal.
+    A withdrawal done by hand in the Binance app shows up here too: ignore the alert if that was you."""
+    _table(db)
+    recs = binance_withdraw.recent_withdrawals(24)
+    since = (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S")
+    c = db.conn()
+    known = {r[0] for r in c.execute("SELECT order_ref FROM topups WHERE order_ref IS NOT NULL AND created>=?", (since,)).fetchall()}
+    c.close()
+    unknown = []
+    for r in recs:
+        try:
+            if int(r.get("status", 0)) in (1, 3, 5):    # cancelled / rejected / failed: nothing left the account
+                continue
+        except (TypeError, ValueError):
+            pass
+        if str(r.get("withdrawOrderId") or "") in known:
+            continue
+        unknown.append({"id": str(r.get("id")), "amount": r.get("amount"), "coin": r.get("coin"), "network": r.get("network"),
+                        "address": r.get("address") or "", "time": r.get("applyTime") or ""})
+    if notify_new and unknown:
+        try:
+            seen = list(json.loads(_state_get(db, "recon_seen", "[]")))
+        except ValueError:
+            seen = []
+        new = [u for u in unknown if u["id"] not in seen]
+        for u in new:
+            a = u["address"]
+            notify(f"⚠️ Binance withdrawal NOT made by this bot: {u['amount']} {u['coin']} ({u['network']}) to "
+                   f"{a[:8]}...{a[-6:]} at {u['time']}.\nIf you did it in the Binance app, ignore this. "
+                   f"If not: pause top-ups and replace the API key NOW.", key=f"recon-{u['id']}")
+        if new:
+            _state_set(db, "recon_seen", json.dumps((seen + [u["id"] for u in new])[-200:]))
+            audit(db, "unknown_withdrawal", ", ".join(f"{u['amount']} {u['coin']}" for u in new), actor="reconcile")
+            if os.getenv("TOPUP_AUTOPAUSE_ON_UNKNOWN", "").strip().lower() in ("1", "true", "yes", "on") and not is_paused(db):
+                set_paused(db, True, actor="reconcile")
+    return unknown
+
+
+def _maybe_reconcile(db):
+    global _last_recon
+    if time.time() - _last_recon < RECON_EVERY or not binance_withdraw.keys_ready():
+        return
+    _last_recon = time.time()
+    try:
+        reconcile(db)
+    except Exception:
+        log.warning("reconcile failed", exc_info=True)
+
+
+def daily_report(db, list_suppliers, get_supplier, get_balance, force=False):
+    """One Telegram summary per day after TOPUP_REPORT_HOUR (UTC, default 18; -1 = off)."""
+    try:
+        hour = int(os.getenv("TOPUP_REPORT_HOUR", "18"))
+    except ValueError:
+        hour = 18
+    now = datetime.now(timezone.utc)
+    today = now.strftime("%Y-%m-%d")
+    if not force and (hour < 0 or now.hour < hour or _state_get(db, "report_date") == today):
+        return False
+    _table(db)
+    c = db.conn()
+    rows = [dict(r) for r in c.execute("SELECT supplier_id, amount, status FROM topups WHERE created>=? AND supplier_id>0",
+                                       (today + " 00:00:00",)).fetchall()]
+    c.close()
+    spent = sum(float(r["amount"] or 0) for r in rows if r["status"] != "failed")
+    ok = sum(1 for r in rows if r["status"] == "credited")
+    bad = sum(1 for r in rows if r["status"] == "failed")
+    lines = [f"📊 Top-up report {today}", f"Top-ups: {ok} credited, {bad} failed, {spent:.2f} USDT spent"]
+    try:
+        lines.append(f"Binance balance: {binance_withdraw.spot_balance()} USDT")
+    except Exception:
+        pass
+    for s0 in list_suppliers():
+        try:
+            if _pay_cfg(s0["name"], s0["id"], db):
+                lines.append(f"{s0['name']}: {float(get_balance(get_supplier(s0['id']))):.2f} USDT")
+        except Exception:
+            lines.append(f"{s0.get('name')}: balance unavailable")
+    if is_paused(db):
+        lines.append("⏸ Top-ups are PAUSED")
+    notify("\n".join(lines))
+    _state_set(db, "report_date", today)
+    return True
+
+
+def _check_anomaly(db, sid, name):
+    """Alert if the last 24 h of top-ups for a supplier are > 3x its normal daily amount (and > 20 USDT)."""
+    try:
+        now = datetime.now(timezone.utc)
+        d1 = (now - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+        d8 = (now - timedelta(days=8)).strftime("%Y-%m-%d %H:%M:%S")
+        c = db.conn()
+        last = c.execute("SELECT COALESCE(SUM(amount),0) FROM topups WHERE supplier_id=? AND created>=? AND status!='failed'", (sid, d1)).fetchone()[0]
+        prev = c.execute("SELECT COALESCE(SUM(amount),0) FROM topups WHERE supplier_id=? AND created>=? AND created<? AND status!='failed'",
+                         (sid, d8, d1)).fetchone()[0]
+        c.close()
+        if last > 20 and last > 3 * max(prev / 7.0, 1.0):
+            notify(f"📈 Unusual spend: {name} got {last:.2f} USDT in 24 h (normal about {prev / 7.0:.2f}/day). Check the orders.",
+                   key=f"anom-{sid}")
+    except Exception:
+        log.warning("anomaly check failed", exc_info=True)
+
+
+# ----------------------------------------------------------------- on-chain check of the transaction
+_TOKENS = {                                           # network -> (USDT contract, decimals, public RPC)
+    "BSC": ("0x55d398326f99059fF775485246999027B3197955", 18, "https://bsc-dataseed.binance.org"),
+    "ETH": ("0xdAC17F958D2ee523a2206206994597C13D831ec7", 6, "https://cloudflare-eth.com"),
+    "MATIC": ("0xc2132D05D31c914a87C6611C10748AEb04B58e8F", 6, "https://polygon-rpc.com"),
+    "ARBITRUM": ("0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9", 6, "https://arb1.arbitrum.io/rpc"),
+    "OPTIMISM": ("0x94b008aA00579c1307B0EF2c499aD98a8ce58e58", 6, "https://mainnet.optimism.io"),
+}
+_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+VERIFY_TRIES, VERIFY_DELAY, MIN_CONFIRMATIONS = 8, 6, 2
+
+
+def _rpc(url, method, params):
+    import requests
+    r = requests.post(url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}, timeout=12)
+    return r.json().get("result")
+
+
+def verify_transfer(network, txid, to_addr, expected, min_conf=None):
+    """Read the transaction from the blockchain. Returns (True|False|None, detail):
+    True = it paid `to_addr` the expected USDT with enough confirmations; False = it did not (wrong amount/address/failed);
+    None = cannot tell yet (not mined, too few confirmations, RPC down, network not supported)."""
+    min_conf = MIN_CONFIRMATIONS if min_conf is None else min_conf
+    tok = _TOKENS.get(network)
+    if not tok or not to_addr or binance_withdraw.cfg("WD_COIN").upper() != "USDT":
+        return None, "not supported for this network"
+    contract, dec, default_rpc = tok
+    url = os.getenv(f"TOPUP_RPC_{network}", default_rpc)
+    try:
+        rc = _rpc(url, "eth_getTransactionReceipt", [txid])
+        if not rc:
+            return None, "not mined yet"
+        if rc.get("status") != "0x1":
+            return False, "the transaction failed on-chain"
+        head = int(_rpc(url, "eth_blockNumber", []), 16)
+        conf = head - int(rc["blockNumber"], 16) + 1
+    except Exception as e:
+        return None, f"RPC error: {type(e).__name__}"
+    got = Decimal(0)
+    for lg in rc.get("logs") or []:
+        tp = lg.get("topics") or []
+        if (str(lg.get("address", "")).lower() == contract.lower() and len(tp) >= 3 and tp[0].lower() == _TRANSFER_TOPIC
+                and tp[2][-40:].lower() == str(to_addr)[2:].lower()):
+            got += Decimal(int(lg["data"], 16)) / (Decimal(10) ** dec)
+    if got == 0:
+        return False, "no USDT transfer to the supplier address in this transaction"
+    if abs(got - Decimal(str(expected))) > Decimal("0.001"):
+        return False, f"the transaction pays {got} USDT but {expected} was intended"
+    if conf < min_conf:
+        return None, f"only {conf} confirmation(s) so far"
+    return True, f"{got} USDT, {conf} confirmations"
+
+
+def _verify_onchain(db, tid, name, network, txid, to_addr, recv):
+    """Before the hash goes to the supplier: confirm on-chain that it pays the right address the right amount.
+    Never blocks the top-up (an RPC outage must not stop orders); it only confirms or warns."""
+    try:
+        ok, detail = None, ""
+        for i in range(VERIFY_TRIES):
+            ok, detail = verify_transfer(network, txid, to_addr, recv)
+            if ok is not None or detail.startswith(("not supported", "RPC error")):
+                break
+            time.sleep(VERIFY_DELAY)
+        state = "ok" if ok else ("mismatch" if ok is False else "skipped")
+        c = db.conn()
+        c.execute("UPDATE topups SET verified=? WHERE id=?", (state, tid))
+        c.commit()
+        c.close()
+        if ok:
+            notify(f"On-chain check ✅ top-up #{tid}: {name} receives {detail}.")
+        elif ok is False:
+            notify(f"⚠️ On-chain check FAILED for top-up #{tid} ({name}): {detail}. Hash {txid}", key=f"chain-{tid}")
+        else:
+            log.info("on-chain check skipped for top-up #%s: %s", tid, detail)
+    except Exception:
+        log.warning("on-chain check error", exc_info=True)
+
+
+def effective_config():
+    """All active limits and switches, for the admin page."""
+    try:
+        hrs = float(os.getenv("TOPUP_WALLET_COOLDOWN_H", WALLET_COOLDOWN_H))
+    except ValueError:
+        hrs = WALLET_COOLDOWN_H
+    try:
+        rh = int(os.getenv("TOPUP_REPORT_HOUR", "18"))
+    except ValueError:
+        rh = 18
+    aa = approve_above()
+    on = lambda v: "ON" if v else "off"
+    return [
+        ("Daily cap, all suppliers", f"{DAILY_CAP:g} USDT"),
+        ("Daily cap per supplier (default)", f"{SUPPLIER_DAILY_CAP:g} USDT"),
+        ("Biggest single withdrawal (WD_MAX)", f"{binance_withdraw.cfg('WD_MAX')} {binance_withdraw.cfg('WD_COIN')}"),
+        ("Max top-ups per supplier per hour", str(MAX_TOPUPS_PER_HOUR)),
+        ("Approval needed above", f"{aa:g} USDT" if aa else "off"),
+        ("Wallet change lock", f"{hrs:g} h" if hrs > 0 else "off"),
+        ("Binance fee added on top", "yes: supplier gets the exact amount" if ADD_BINANCE_FEE else "no: the exact amount is withdrawn"),
+        ("Dry run (no real withdrawals)", on(binance_withdraw.dry_run())),
+        ("Pause on unknown withdrawal", on(os.getenv("TOPUP_AUTOPAUSE_ON_UNKNOWN", "").strip().lower() in ("1", "true", "yes", "on"))),
+        ("Daily report", f"{rh}:00 UTC" if rh >= 0 else "off"),
+        ("Binance low-balance alert", f"{BINANCE_LOW_ALERT:g} USDT"),
+        ("On-chain check", ", ".join(_TOKENS)),
+    ]
+
+
 # ----------------------------------------------------------------- locks (thread + DB, so several processes are safe too)
 _tlocks = {}
 _tguard = threading.Lock()
@@ -658,7 +985,7 @@ class _Guard:
 def _wait_balance(get_balance, s, need):
     for _ in range(CREDIT_TRIES):
         try:
-            if get_balance(s) + 1e-9 >= need:
+            if get_balance(s) + CREDIT_TOLERANCE >= need:
                 return True
         except Exception:
             log.warning("balance poll failed", exc_info=True)
@@ -668,7 +995,7 @@ def _wait_balance(get_balance, s, need):
 
 def _enough(get_balance, s, need):
     try:
-        return get_balance(s) + 1e-9 >= need
+        return get_balance(s) + CREDIT_TOLERANCE >= need
     except Exception:
         return False
 
@@ -735,6 +1062,21 @@ def ensure_funds(db, s, need, get_balance):
         return _ensure(db, s, cfg, need, get_balance)
 
 
+def _check_received(name, tid, oid, recv):
+    """Compare what Binance really sends on-chain (requested amount - fee) with what the supplier must receive.
+    Only alerts: a difference means the fee changed between our lookup and the withdrawal."""
+    if not recv or not oid:
+        return
+    try:
+        rec = binance_withdraw.find_by_order_id(oid)
+        got = Decimal(str(rec["amount"])) - Decimal(str(rec.get("transactionFee") or 0))
+    except Exception:
+        return
+    if abs(got - Decimal(str(recv))) > Decimal("0.005"):
+        notify(f"⚠️ Top-up #{tid} for {name}: Binance will deliver {got} USDT but {recv} was intended "
+               f"(the fee probably changed). The supplier may credit a different amount.", key=f"recv-{tid}")
+
+
 def _ensure(db, s, cfg, need, get_balance):
     sid, name = s["id"], s.get("name") or s["id"]
     bal = float(get_balance(s))
@@ -758,7 +1100,7 @@ def _ensure(db, s, cfg, need, get_balance):
         if _recent_count(db, sid) >= MAX_TOPUPS_PER_HOUR:
             notify(f"⚠️ {name}: {MAX_TOPUPS_PER_HOUR} top-ups in the last hour. Stopped to be safe. Check the supplier.", key=f"vel-{sid}")
             raise TopupError(f"too many top-ups for this supplier in the last hour (limit {MAX_TOPUPS_PER_HOUR})")
-        buf = 0 if cfg.get("mode") == "invoice" else cfg.get("fee_buffer", 0.5)   # invoice mode adds the exact Binance fee later
+        buf = 0 if cfg.get("mode") == "invoice" else cfg.get("fee_buffer", 0.0)   # invoice mode adds the exact Binance fee later
         amount = max(Decimal(str(round(need - bal + buf, 6))), Decimal(str(cfg.get("min_topup", 5))))
         amount = amount.quantize(Decimal("0.01"), rounding=ROUND_UP)
         to_addr = cfg.get("address")
@@ -773,12 +1115,14 @@ def _ensure(db, s, cfg, need, get_balance):
                 raise TopupError(f"invoice amount {inv['amount']} is not what we asked ({amount}); nothing sent")
             to_addr = inv["address"]
             amount = inv["amount"]                      # send EXACTLY the invoice amount (BEP20 fee is ~0.0001, far inside the supplier's 0.02 tolerance)
-            if ADD_BINANCE_FEE:                         # optional: add the live Binance fee on top (off by default)
-                try:
-                    amount = amount + binance_withdraw.withdraw_fee(cfg.get("network"))[0]
-                except RuntimeError as e:
-                    raise TopupError(f"could not read the Binance fee: {e}")
-            log.info("invoice from %s: withdraw %s exactly to %s", name, amount, to_addr)
+            log.info("invoice from %s: %s must arrive exactly at %s", name, amount, to_addr)
+        received, fee = amount, Decimal("0")            # received = what the supplier must get on-chain
+        if ADD_BINANCE_FEE:                             # Binance deducts its fee from the withdrawn amount: add it on top
+            try:
+                fee = binance_withdraw.withdraw_fee(cfg.get("network"))[0]
+            except RuntimeError as e:
+                raise TopupError(f"could not read the Binance fee: {e}")
+            amount = received + fee                     # from here on, `amount` = what leaves Binance
         if _spent_today(db) + float(amount) > DAILY_CAP:
             notify(f"Daily top-up cap {DAILY_CAP} USDT reached. Needed {amount} for {name}.", key="cap-all")
             raise TopupError(f"daily top-up cap {DAILY_CAP} reached")
@@ -786,6 +1130,7 @@ def _ensure(db, s, cfg, need, get_balance):
         if _spent_today(db, sid) + float(amount) > scap:
             notify(f"Daily cap for {name} ({scap} USDT) reached. Needed {amount}.", key=f"cap-{sid}")
             raise TopupError(f"daily cap for this supplier ({scap}) reached")
+        _approval_gate(db, sid, name, amount)           # big top-ups wait for the admin's approval (if TOPUP_APPROVE_ABOVE is set)
         if binance_withdraw.dry_run():
             notify(f"DRY RUN: would withdraw {amount} USDT for {name} to {str(to_addr)[:8]}...{str(to_addr)[-6:]}. Nothing sent.", key=f"dry-{sid}")
             raise TopupError(f"dry-run mode: would withdraw {amount} USDT, nothing sent")
@@ -798,8 +1143,8 @@ def _ensure(db, s, cfg, need, get_balance):
             notify(f"Binance balance too low: {have} USDT, need {amount} for {name}. Add funds.", key="binance-low")
             raise TopupError(f"Binance balance too low ({have} < {amount})")
         c = db.conn()
-        cur = c.execute("INSERT INTO topups(supplier_id,amount,status,created,updated,source,bal_before) VALUES(?,?,?,?,?,?,?)",
-                        (sid, float(amount), "withdrawing", _now(), _now(), cfg.get("mode", "fixed"), bal))
+        cur = c.execute("INSERT INTO topups(supplier_id,amount,status,created,updated,source,bal_before,recv,to_addr) VALUES(?,?,?,?,?,?,?,?,?)",
+                        (sid, float(amount), "withdrawing", _now(), _now(), cfg.get("mode", "fixed"), bal, float(received), str(to_addr)))
         tid = cur.lastrowid
         oid = f"tu{tid}"
         c.execute("UPDATE topups SET order_ref=? WHERE id=?", (oid, tid))
@@ -817,9 +1162,11 @@ def _ensure(db, s, cfg, need, get_balance):
                 notify(f"Top-up #{tid} for {name} refused by Binance: {msg[:200]}", key="binance-refused")
             raise TopupError(msg)                        # network error: stays 'withdrawing', reconciled next time
         _set(db, tid, "withdrawn", wid=str(wid))
-        row = {"id": tid, "status": "withdrawn", "wid": str(wid), "txid": None}
+        row = {"id": tid, "status": "withdrawn", "wid": str(wid), "txid": None, "order_ref": oid, "recv": float(received), "to_addr": str(to_addr), "network": cfg.get("network")}
         log.info("top-up #%s: withdrew %s to supplier %s (wid %s)", tid, amount, sid, wid)
-        notify(f"Top-up #{tid}: withdrew {amount} USDT to {name} ({to_addr[:8]}...{to_addr[-6:]}). Waiting for the hash.")
+        notify(f"Top-up #{tid}: {name} will receive exactly {received} USDT (withdrew {amount} incl. Binance fee {fee}) "
+               f"to {to_addr[:8]}...{to_addr[-6:]}. Waiting for the hash.")
+        _check_anomaly(db, sid, name)
 
     tid = row["id"]
     if row["status"] == "withdrawn":
@@ -831,8 +1178,10 @@ def _ensure(db, s, cfg, need, get_balance):
             raise TopupError(str(e))
         if not txid:
             raise TopupError(f"top-up #{tid}: hash not ready yet, will resume on the next order")
+        _check_received(name, tid, row.get("order_ref"), row.get("recv"))
         _set(db, tid, "hash_ready", txid=txid)
         row["status"], row["txid"] = "hash_ready", txid
+        _verify_onchain(db, tid, name, cfg.get("network"), txid, row.get("to_addr"), row.get("recv"))
 
     if row["status"] == "hash_ready":
         _deliver_hash(db, tid, cfg, row["txid"], s, need, get_balance)
@@ -872,6 +1221,11 @@ def refill_once(db, list_suppliers, get_supplier, get_balance):
     if is_paused(db):
         return
     _watch_binance()
+    _maybe_reconcile(db)
+    try:
+        daily_report(db, list_suppliers, get_supplier, get_balance)
+    except Exception:
+        log.warning("daily report failed", exc_info=True)
     for s0 in list_suppliers():
         sid = s0["id"]
         try:
@@ -891,6 +1245,8 @@ def refill_once(db, list_suppliers, get_supplier, get_balance):
             log.info("auto-refill: %s below %.2f, topping up to %.2f", s0["name"], low, tgt)
             ensure_funds(db, s, tgt, get_balance)
             _fail.pop(sid, None)
+        except ApprovalNeeded as e:
+            log.info("auto-refill for %s waits for approval: %s", s0.get("name"), e)
         except TopupError as e:
             n = _fail.get(sid, (0, 0))[0] + 1
             wait = min(BACKOFF_MAX, BACKOFF_BASE * 2 ** (n - 1))
